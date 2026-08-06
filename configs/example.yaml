@@ -1,0 +1,39 @@
+# Operating mode: sink | api | all
+mode: all
+# TigerBeetle cluster connection
+tigerbeetle:
+  cluster_id: 0
+  addresses: ["3000"]
+# Batching behaviour for TigerBeetle writes
+batcher:
+  max_batch_size: 8189
+  linger: 5ms
+  max_queue: 1000
+# Kafka consumer/producer settings
+kafka:
+  brokers: ["localhost:9092"]
+  group: kafkatb
+  topics:
+    - {name: ledger.transfers, codec: json}
+  dlq_topic: ledger.transfers.dlq
+  results_topic: ledger.results
+# Message size and shape limits
+limits:
+  max_message_bytes: 1048576
+  max_events_per_message: 8189
+  max_json_depth: 32
+# API server listen addresses
+api:
+  grpc_addr: ":9090"
+  http_addr: ":8080"
+  max_page_size: 1000
+# Ledger name -> TigerBeetle ledger id/scale mapping
+ledgers:
+  USD: {id: 1, scale: 2}
+# Transfer code name -> TigerBeetle code mapping
+codes:
+  payment: 1
+# Retry policy for TigerBeetle operations
+retry: {initial: 100ms, max: 30s, jitter: true}
+# Graceful shutdown timeout
+shutdown_timeout: 30s

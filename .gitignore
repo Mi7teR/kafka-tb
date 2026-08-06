@@ -1,0 +1,4 @@
+.superpowers/
+bin/
+*.tigerbeetle
+docs/benchmarks/*.raw
