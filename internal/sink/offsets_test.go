@@ -168,3 +168,79 @@ func TestConcurrentTrackDoneAcrossPartitions(t *testing.T) {
 		require.Equal(t, int32(7), eo.Epoch, "partition %d epoch", p)
 	}
 }
+
+// F1 regression: out-of-order Track must not permanently exclude an
+// earlier offset from ever becoming commitable.
+func TestOutOfOrderTrackDoesNotLoseEarlierOffset(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(5))
+	o.Track(rec(3))
+	o.Done(rec(5))
+	_, ok := commitOffset(t, o)
+	require.False(t, ok, "offset 3 is still pending; nothing must be commitable")
+
+	o.Done(rec(3))
+	got, ok := commitOffset(t, o)
+	require.True(t, ok)
+	require.Equal(t, int64(6), got)
+}
+
+// F2 regression: Forget must tombstone the partition so a late Done (or
+// Track) from a worker still running at revoke time cannot resurrect it.
+func TestForgetTombstonesAgainstLateActivity(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(0))
+	o.Track(rec(1))
+	o.Forget("t", 0)
+
+	o.Done(rec(0)) // late completion from a worker still running at revoke time
+	_, ok := commitOffset(t, o)
+	require.False(t, ok, "forgotten partition must not become commitable again")
+	require.Zero(t, o.InFlight())
+
+	o.Track(rec(2)) // a late Track must not resurrect it either
+	_, ok = commitOffset(t, o)
+	require.False(t, ok, "forgotten partition must stay gone even after a late Track")
+}
+
+// F3 regression: a duplicate Done for the same offset must not double-count
+// against inflight state that other genuinely in-flight records rely on.
+func TestDuplicateDoneDoesNotDoubleDecrementInFlight(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(0))
+	o.Track(rec(1))
+	o.Done(rec(0))
+	o.Done(rec(0)) // duplicate
+
+	require.Equal(t, 1, o.InFlight())
+}
+
+// F4 regression: the committed epoch must belong to the boundary record
+// actually being committed, not whichever Done happened to run last.
+func TestCommittedEpochMatchesBoundaryRecord(t *testing.T) {
+	o := NewOffsets()
+	o.Track(&kgo.Record{Topic: "t", Partition: 0, Offset: 0, LeaderEpoch: 5})
+	o.Track(&kgo.Record{Topic: "t", Partition: 0, Offset: 1, LeaderEpoch: 6})
+	o.Done(&kgo.Record{Topic: "t", Partition: 0, Offset: 1, LeaderEpoch: 6})
+	o.Done(&kgo.Record{Topic: "t", Partition: 0, Offset: 0, LeaderEpoch: 5})
+
+	eo := o.Commitable()["t"][0]
+	require.Equal(t, int64(2), eo.Offset)
+	require.Equal(t, int32(6), eo.Epoch, "epoch must belong to offset 1, the boundary record")
+}
+
+// TestMarkCommittedDropsDoneEntries proves done entries below the new
+// committed watermark are pruned so the map cannot grow without bound.
+func TestMarkCommittedDropsDoneEntries(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(0))
+	o.Track(rec(1))
+	o.Done(rec(0))
+	o.Done(rec(1))
+
+	m := o.Commitable()
+	o.MarkCommitted(m)
+
+	st := o.p[partitionKey{"t", 0}]
+	require.Empty(t, st.done, "done entries below the new committed watermark must be dropped")
+}

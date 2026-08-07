@@ -12,22 +12,21 @@ type partitionKey struct {
 }
 
 type partitionState struct {
-	// anchor — первый офсет, когда-либо увиденный по этой партиции
-	// (устанавливается один раз). Пока next == anchor, ничего ещё не
-	// завершено — next просто указывает на границу, а не на прогресс.
-	anchor int64
-	// next — первый ещё не завершённый офсет; всё до него готово к коммиту.
-	next    int64
-	hasNext bool
-	// done — завершённые офсеты выше next, ждущие закрытия дырки.
-	done  map[int64]struct{}
-	epoch int32
-	// inflight — сколько записей взято в работу и ещё не завершено.
-	inflight int
-	// committed — последний офсет, уже отправленный в MarkCommitted;
-	// -1 означает "ещё ничего не коммитили", чтобы не спутать с
-	// легитимным первым коммитом на офсете 0.
+	// pending — офсеты, зарегистрированные Track, но ещё не завершённые.
+	// Отсутствие предположений о порядке: любой офсет может появиться и
+	// завершиться в любом порядке относительно остальных.
+	pending map[int64]struct{}
+	// done — завершённые офсеты, отображённые на leader epoch той записи.
+	done map[int64]int32
+	// committed — последний офсет, отданный Commitable и подтверждённый
+	// MarkCommitted; -1 означает "ещё ничего не коммитили", чтобы не
+	// спутать с легитимным первым коммитом на офсете 0.
 	committed int64
+	// forgotten помечает партицию, отозванную через Forget. После этого
+	// Track ничего не делает (не может воскресить партицию), а Done тоже
+	// ничего не делает, так как pending/done очищены, а Done никогда не
+	// создаёт состояние сам.
+	forgotten bool
 }
 
 // Offsets отслеживает завершённость записей и отдаёт для коммита
@@ -41,56 +40,69 @@ func NewOffsets() *Offsets {
 	return &Offsets{p: make(map[partitionKey]*partitionState)}
 }
 
-// Track регистрирует запись как «в работе». Для каждой партиции вызовы
-// Track должны идти в порядке возрастания офсета (как и гарантирует Kafka
-// при последовательном чтении партиции) — это устанавливает нижнюю границу,
-// с которой Done() отсчитывает непрерывный завершённый префикс.
+// Track регистрирует запись как «в работе». Порядок вызовов Track для
+// партиции не имеет значения — офсеты могут приходить в любом порядке.
 func (o *Offsets) Track(rec *kgo.Record) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	st := o.state(rec)
-	if !st.hasNext {
-		st.next, st.anchor, st.hasNext = rec.Offset, rec.Offset, true
+	k := partitionKey{rec.Topic, rec.Partition}
+	st, ok := o.p[k]
+	if !ok {
+		st = &partitionState{
+			pending:   make(map[int64]struct{}),
+			done:      make(map[int64]int32),
+			committed: -1,
+		}
+		o.p[k] = st
 	}
-	st.inflight++
+	if st.forgotten {
+		return
+	}
+	st.pending[rec.Offset] = struct{}{}
 }
 
+// Done переносит офсет из pending в done. Если офсета нет в pending
+// (повторный Done, Done без Track, либо партиция забыта/не существует),
+// вызов игнорируется — никакой счётчик не портится.
 func (o *Offsets) Done(rec *kgo.Record) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	st := o.state(rec)
-	st.epoch = rec.LeaderEpoch
-	if st.inflight > 0 {
-		st.inflight--
+	st, ok := o.p[partitionKey{rec.Topic, rec.Partition}]
+	if !ok || st.forgotten {
+		return
 	}
-	if !st.hasNext {
-		st.next, st.anchor, st.hasNext = rec.Offset, rec.Offset, true
+	if _, pending := st.pending[rec.Offset]; !pending {
+		return
 	}
-	if rec.Offset < st.next {
-		return // уже учтён
-	}
-	st.done[rec.Offset] = struct{}{}
-	for {
-		if _, ok := st.done[st.next]; !ok {
-			return
-		}
-		delete(st.done, st.next)
-		st.next++
-	}
+	delete(st.pending, rec.Offset)
+	st.done[rec.Offset] = rec.LeaderEpoch
 }
 
 // Commitable отдаёт офсет следующей необработанной записи — ровно то,
-// что Kafka ожидает в OffsetCommit.
+// что Kafka ожидает в OffsetCommit. Ватермарк — это min(pending), если
+// есть незавершённые записи (всё ниже безопасно, само pending — нет), а
+// если pending пуст — max(done)+1. Epoch берётся у записи на границе
+// (watermark-1) — именно она реально коммитится.
 func (o *Offsets) Commitable() map[string]map[int32]kgo.EpochOffset {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	out := make(map[string]map[int32]kgo.EpochOffset)
 	for k, st := range o.p {
-		// next == anchor means nothing has completed yet for this
-		// partition — next is just the low-water mark from Track,
-		// not a sign of progress. Only next > anchor proves the
-		// anchor offset itself (and possibly more) is done.
-		if !st.hasNext || st.next <= st.anchor || st.committed == st.next {
+		var watermark int64
+		switch {
+		case len(st.pending) > 0:
+			watermark = minOffset(st.pending)
+		case len(st.done) > 0:
+			watermark = maxOffset(st.done) + 1
+		default:
+			continue
+		}
+		if watermark <= st.committed {
+			continue
+		}
+		epoch, ok := st.done[watermark-1]
+		if !ok {
+			// Граничная запись ещё не завершена — коммитить нечего.
 			continue
 		}
 		tp, ok := out[k.topic]
@@ -98,29 +110,39 @@ func (o *Offsets) Commitable() map[string]map[int32]kgo.EpochOffset {
 			tp = make(map[int32]kgo.EpochOffset)
 			out[k.topic] = tp
 		}
-		tp[k.partition] = kgo.EpochOffset{Epoch: st.epoch, Offset: st.next}
+		tp[k.partition] = kgo.EpochOffset{Epoch: epoch, Offset: watermark}
 	}
 	return out
 }
 
 // MarkCommitted вызывается после успешного коммита, чтобы не слать
-// один и тот же офсет повторно.
+// один и тот же офсет повторно, и чистит done от записей ниже нового
+// ватермарка, чтобы карта не росла бесконечно.
 func (o *Offsets) MarkCommitted(committed map[string]map[int32]kgo.EpochOffset) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	for topic, parts := range committed {
 		for part, eo := range parts {
-			if st, ok := o.p[partitionKey{topic, part}]; ok {
-				st.committed = eo.Offset
+			st, ok := o.p[partitionKey{topic, part}]
+			if !ok || st.forgotten {
+				continue
+			}
+			st.committed = eo.Offset
+			for offset := range st.done {
+				if offset < st.committed {
+					delete(st.done, offset)
+				}
 			}
 		}
 	}
 }
 
+// Forget помечает партицию как отозванную: состояние заменяется тумбстоном,
+// так что последующие Track/Done для неё не смогут его воскресить.
 func (o *Offsets) Forget(topic string, partition int32) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	delete(o.p, partitionKey{topic, partition})
+	o.p[partitionKey{topic, partition}] = &partitionState{forgotten: true}
 }
 
 func (o *Offsets) InFlight() int {
@@ -128,17 +150,27 @@ func (o *Offsets) InFlight() int {
 	defer o.mu.Unlock()
 	n := 0
 	for _, st := range o.p {
-		n += st.inflight
+		n += len(st.pending)
 	}
 	return n
 }
 
-func (o *Offsets) state(rec *kgo.Record) *partitionState {
-	k := partitionKey{rec.Topic, rec.Partition}
-	st, ok := o.p[k]
-	if !ok {
-		st = &partitionState{done: make(map[int64]struct{}), committed: -1}
-		o.p[k] = st
+func minOffset(m map[int64]struct{}) int64 {
+	min, first := int64(0), true
+	for off := range m {
+		if first || off < min {
+			min, first = off, false
+		}
 	}
-	return st
+	return min
+}
+
+func maxOffset(m map[int64]int32) int64 {
+	max, first := int64(0), true
+	for off := range m {
+		if first || off > max {
+			max, first = off, false
+		}
+	}
+	return max
 }
