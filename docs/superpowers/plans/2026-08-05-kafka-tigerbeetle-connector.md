@@ -1527,7 +1527,7 @@ git commit -m "feat(codec): add decoder interface and strict json decoder"
   - `tbx.MapTransferResults(cmd *model.Command, results []types.CreateTransferResult, offset int) ([]Outcome, error)`.
   - `tbx.MapAccountResults(cmd *model.Command, results []types.CreateAccountResult, offset int) ([]Outcome, error)`.
   - `tbx.ErrResultCountMismatch` — ответ TigerBeetle не совпал по длине с отправленным батчем.
-  - `tbx.Client` — интерфейс `CreateTransfers([]types.Transfer) ([]types.TransferEventResult, error)`, `CreateAccounts([]types.Account) ([]types.AccountEventResult, error)`, `LookupAccounts([]types.Uint128) ([]types.Account, error)`, `LookupTransfers([]types.Uint128) ([]types.Transfer, error)`, `GetAccountTransfers(types.AccountFilter) ([]types.Transfer, error)`, `GetAccountBalances(types.AccountFilter) ([]types.AccountBalance, error)`, `QueryAccounts(types.QueryFilter) ([]types.Account, error)`, `QueryTransfers(types.QueryFilter) ([]types.Transfer, error)`, `Close()`.
+  - `tbx.Client` — интерфейс `CreateTransfers([]types.Transfer) ([]types.CreateTransferResult, error)`, `CreateAccounts([]types.Account) ([]types.CreateAccountResult, error)`, `LookupAccounts([]types.Uint128) ([]types.Account, error)`, `LookupTransfers([]types.Uint128) ([]types.Transfer, error)`, `GetAccountTransfers(types.AccountFilter) ([]types.Transfer, error)`, `GetAccountBalances(types.AccountFilter) ([]types.AccountBalance, error)`, `QueryAccounts(types.QueryFilter) ([]types.Account, error)`, `QueryTransfers(types.QueryFilter) ([]types.Transfer, error)`, `Close()`.
   - `tbx.NewClient(cfg config.TigerBeetle) (Client, error)`.
 
 - [ ] **Step 1: Сверить контракт результатов**
@@ -1854,7 +1854,7 @@ func BenchmarkMapResults(b *testing.B) {
 
 ```bash
 git add internal/tbx
-git commit -m "feat(tbx): map sparse tigerbeetle results to per-event outcomes"
+git commit -m "feat(tbx): map tigerbeetle batch results to per-event outcomes"
 ```
 
 ---
