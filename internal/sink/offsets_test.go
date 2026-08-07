@@ -276,6 +276,53 @@ func TestInFlightCountsRevivedPartition(t *testing.T) {
 	require.Equal(t, 1, o.InFlight())
 }
 
+// Pending отдаёт точку перемотки: минимальный незавершённый офсет партиции.
+func TestPendingReportsLowestUnfinishedOffset(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(3))
+	o.Track(rec(5))
+	o.Track(rec(4))
+	o.Done(rec(3))
+
+	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
+		"t": {0: {Epoch: 5, Offset: 4}},
+	}, o.Pending())
+}
+
+// Epoch обязан принадлежать той записи, с которой перечитываем, а не
+// какой-нибудь другой из партиции.
+func TestPendingCarriesEpochOfThatRecord(t *testing.T) {
+	o := NewOffsets()
+	o.Track(&kgo.Record{Topic: "t", Partition: 0, Offset: 9, LeaderEpoch: 2})
+	o.Track(&kgo.Record{Topic: "t", Partition: 0, Offset: 10, LeaderEpoch: 4})
+
+	require.Equal(t, kgo.EpochOffset{Epoch: 2, Offset: 9}, o.Pending()["t"][0])
+}
+
+// Партиции без незавершённых записей и тумбстоны перематывать нечего.
+func TestPendingSkipsFinishedAndForgottenPartitions(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(0))
+	o.Done(rec(0))
+	require.Empty(t, o.Pending(), "всё завершено — перематывать нечего")
+
+	o.Track(rec(1))
+	o.Forget("t", 0)
+	require.Empty(t, o.Pending(), "тумбстон не перематывается")
+}
+
+func TestPendingIsPerPartition(t *testing.T) {
+	o := NewOffsets()
+	o.Track(&kgo.Record{Topic: "t", Partition: 0, Offset: 8, LeaderEpoch: 1})
+	o.Track(&kgo.Record{Topic: "t", Partition: 1, Offset: 2, LeaderEpoch: 1})
+	o.Track(&kgo.Record{Topic: "u", Partition: 0, Offset: 5, LeaderEpoch: 1})
+
+	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
+		"t": {0: {Epoch: 1, Offset: 8}, 1: {Epoch: 1, Offset: 2}},
+		"u": {0: {Epoch: 1, Offset: 5}},
+	}, o.Pending())
+}
+
 // TestMarkCommittedDropsDoneEntries proves done entries below the new
 // committed watermark are pruned so the map cannot grow without bound.
 func TestMarkCommittedDropsDoneEntries(t *testing.T) {

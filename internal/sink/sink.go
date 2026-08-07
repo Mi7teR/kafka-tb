@@ -24,8 +24,14 @@ type (
 )
 
 const (
-	defaultCommitPeriod = time.Second
-	defaultRetryPeriod  = time.Second
+	defaultCommitPeriod    = time.Second
+	defaultRetryPeriod     = time.Second
+	defaultShutdownTimeout = 10 * time.Second
+	// defaultBatchBudget ограничивает время, на которое обработка одной
+	// пачки держит блокировку ребаланса. Дефолтный rebalance timeout
+	// franz-go — 60s; запас нужен, потому что бюджет проверяется только
+	// между попытками, а сама попытка тоже занимает время.
+	defaultBatchBudget = 30 * time.Second
 )
 
 // Submitter — то, что умеет применять команду. В проде это *tbx.Batcher.
@@ -33,17 +39,35 @@ type Submitter interface {
 	Submit(ctx context.Context, cmd *model.Command) ([]tbx.Outcome, error)
 }
 
+// offsetClient — та часть клиента Kafka, которой синк двигает офсеты.
+// Выделена интерфейсом ради тестируемости processBatch/commit/OnRevoked:
+// без неё эти пути невозможно прогнать без живого брокера.
+// *kgo.Client реализует её как есть.
+type offsetClient interface {
+	CommitOffsetsSync(
+		ctx context.Context,
+		uncommitted map[string]map[int32]kgo.EpochOffset,
+		onDone func(*kgo.Client, *kmsg.OffsetCommitRequest, *kmsg.OffsetCommitResponse, error),
+	)
+	SetOffsets(setOffsets map[string]map[int32]kgo.EpochOffset)
+}
+
+var _ offsetClient = (*kgo.Client)(nil)
+
 type Sink struct {
 	cl       *kgo.Client
+	oc       offsetClient
 	decoders codec.Registry
 	sub      Submitter
 	em       emitterIface
 	offsets  *Offsets
 	log      *slog.Logger
 
-	pollSize     int
-	commitPeriod time.Duration
-	retryPeriod  time.Duration
+	pollSize        int
+	commitPeriod    time.Duration
+	retryPeriod     time.Duration
+	batchBudget     time.Duration
+	shutdownTimeout time.Duration
 
 	// commitMu сериализует коммит. Run и OnRevoked — разные горутины, а
 	// Commitable/MarkCommitted обязаны идти парой: между ними нельзя вклинить
@@ -61,56 +85,83 @@ func New(
 	log *slog.Logger,
 ) *Sink {
 	return &Sink{
-		cl:           cl,
-		decoders:     decoders,
-		sub:          sub,
-		em:           em,
-		offsets:      NewOffsets(),
-		log:          log,
-		pollSize:     cfg.Batcher.MaxBatchSize,
-		commitPeriod: defaultCommitPeriod,
-		retryPeriod:  defaultRetryPeriod,
+		cl:              cl,
+		oc:              cl,
+		decoders:        decoders,
+		sub:             sub,
+		em:              em,
+		offsets:         NewOffsets(),
+		log:             log,
+		pollSize:        cfg.Batcher.MaxBatchSize,
+		commitPeriod:    defaultCommitPeriod,
+		retryPeriod:     defaultRetryPeriod,
+		batchBudget:     defaultBatchBudget,
+		shutdownTimeout: cfg.ShutdownTimeout,
 	}
 }
 
-// newForTest собирает синк без клиента Kafka: тесты покрывают классификацию
-// записи, а не цикл polling'а (он проверяется интеграционно).
-func newForTest(decoders codec.Registry, sub Submitter, em emitterIface, log *slog.Logger) (*Sink, error) {
+// newForTest собирает синк без polling-клиента: цикл Run проверяется
+// интеграционно, а всё, что двигает офсеты, ходит через offsetClient.
+func newForTest(
+	decoders codec.Registry, sub Submitter, em emitterIface, oc offsetClient, log *slog.Logger,
+) (*Sink, error) {
 	return &Sink{
-		decoders:     decoders,
-		sub:          sub,
-		em:           em,
-		offsets:      NewOffsets(),
-		log:          log,
-		commitPeriod: defaultCommitPeriod,
-		retryPeriod:  defaultRetryPeriod,
+		oc:              oc,
+		decoders:        decoders,
+		sub:             sub,
+		em:              em,
+		offsets:         NewOffsets(),
+		log:             log,
+		commitPeriod:    defaultCommitPeriod,
+		retryPeriod:     defaultRetryPeriod,
+		batchBudget:     defaultBatchBudget,
+		shutdownTimeout: defaultShutdownTimeout,
 	}, nil
 }
 
 // Run крутит цикл до отмены контекста.
-func (s *Sink) Run(ctx context.Context) error {
+func (s *Sink) Run(ctx context.Context) {
 	commitTicker := time.NewTicker(s.commitPeriod)
 	defer commitTicker.Stop()
 
 	for {
-		// PollRecords сам возвращается при отмене контекста, поэтому
-		// отдельного select с ctx.Done() перед ним не нужно: он бы всё равно
-		// не прервал блокировку внутри Poll.
-		fetches := s.cl.PollRecords(ctx, s.pollSize)
+		// Опрос ограничен по времени: с бесконечным Poll на тихом топике
+		// периодический коммит не наступал бы до следующей пачки, и
+		// последняя обработанная запись висела бы незакоммиченной.
+		// Коммитить из отдельной горутины нельзя: SetOffsets в abandon
+		// нельзя звать одновременно с коммитом (см. go doc SetOffsets).
+		pollCtx, cancel := context.WithTimeout(ctx, s.commitPeriod)
+		fetches := s.cl.PollRecords(pollCtx, s.pollSize)
+		cancel()
 		if fetches.IsClientClosed() {
-			return nil
+			return
 		}
 		fetches.EachError(func(t string, p int32, err error) {
+			// Отмена — это наш собственный дедлайн опроса или штатное
+			// завершение, а не сбой fetch'а.
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
 			s.log.Error("fetch error", slog.String("topic", t),
 				slog.Int("partition", int(p)), slog.String("error", err.Error()))
 		})
 
-		s.processBatch(ctx, fetches)
+		// AllowRebalance снимается всегда: клиент собран с
+		// BlockRebalanceOnPoll, и пропущенный вызов — хоть на успешном
+		// пути, хоть на панике — навсегда подвешивает группу.
+		func() {
+			defer s.cl.AllowRebalance()
+			s.processBatch(ctx, fetches.Records())
+		}()
 
 		if ctx.Err() != nil {
-			// Финальный коммит уже отменённым контекстом не пройдёт.
-			s.commit(context.WithoutCancel(ctx))
-			return nil
+			// Финальный коммит уже отменённым контекстом не пройдёт, но и
+			// висеть на недоступном брокере до бесконечности не должен.
+			shutCtx, cancelShut := context.WithTimeout(
+				context.WithoutCancel(ctx), s.shutdownTimeout)
+			s.commit(shutCtx)
+			cancelShut()
+			return
 		}
 		select {
 		case <-commitTicker.C:
@@ -120,34 +171,74 @@ func (s *Sink) Run(ctx context.Context) error {
 	}
 }
 
-// processBatch обрабатывает одну пачку записей и всегда снимает блокировку
-// ребаланса: клиент собран с BlockRebalanceOnPoll, и пропущенный
-// AllowRebalance — хоть на успешном пути, хоть на ошибочном — навсегда
-// подвешивает группу.
-func (s *Sink) processBatch(ctx context.Context, fetches kgo.Fetches) {
-	defer s.cl.AllowRebalance()
-
-	records := fetches.Records()
+// processBatch обрабатывает пачку записей по порядку, повторяя каждую до
+// успеха. Записи одной партиции обязаны применяться строго по порядку:
+// применить N+1, пропустив упавшую N, значит опубликовать в results и DLQ
+// исход, которого при реплее уже не будет.
+func (s *Sink) processBatch(ctx context.Context, records []*kgo.Record) {
 	for _, rec := range records {
 		s.offsets.Track(rec)
 	}
-	// Записи одной партиции обрабатываются строго по порядку,
-	// поэтому идём последовательно.
+	deadline := time.Now().Add(s.batchBudget)
 	for _, rec := range records {
+		if s.applyRecord(ctx, rec, deadline) {
+			continue
+		}
+		if ctx.Err() == nil {
+			// Бюджет пачки исчерпан: дальше держать ребаланс нельзя.
+			s.abandonBatch()
+		}
+		// При отмене контекста перематывать нечего: процесс уходит, а
+		// незавершённые офсеты и так упираются в ватермарк и не коммитятся.
+		return
+	}
+}
+
+// applyRecord доводит одну запись до конца, повторяя её при инфраструктурной
+// ошибке. Возвращает false, если запись пришлось бросить: контекст отменён
+// или бюджет пачки не даёт ждать следующей попытки.
+func (s *Sink) applyRecord(ctx context.Context, rec *kgo.Record, deadline time.Time) bool {
+	for {
 		done, err := s.handle(ctx, rec)
-		switch {
-		case err != nil:
-			// Инфраструктура: запись остаётся в pending, ватермарк партиции
-			// упирается в неё, и ни она, ни всё, что за ней, не коммитится.
-			// Она будет перечитана после ребаланса или рестарта.
-			s.log.Error("record blocked", slog.String("topic", rec.Topic),
-				slog.Int("partition", int(rec.Partition)),
-				slog.Int64("offset", rec.Offset), slog.String("error", err.Error()))
-			if !s.backoff(ctx) {
-				return
+		if err == nil {
+			if done {
+				s.offsets.Done(rec)
 			}
-		case done:
-			s.offsets.Done(rec)
+			return true
+		}
+		// Инфраструктура: та же запись повторяется, следующие ждут её.
+		s.log.Error("record failed, retrying", slog.String("topic", rec.Topic),
+			slog.Int("partition", int(rec.Partition)),
+			slog.Int64("offset", rec.Offset), slog.String("error", err.Error()))
+		if !time.Now().Add(s.retryPeriod).Before(deadline) {
+			return false
+		}
+		if !s.backoff(ctx) {
+			return false
+		}
+	}
+}
+
+// abandonBatch бросает недоработанную пачку и перематывает партиции назад.
+// Уже вычитанные записи сами по себе больше не придут, поэтому без
+// перемотки брошенный офсет остался бы в pending навсегда: партиция не
+// коммитилась бы до конца жизни процесса, а память под done росла бы.
+// Forget ставит тумбстон, следующий Track ту же партицию оживит.
+func (s *Sink) abandonBatch() {
+	pending := s.offsets.Pending()
+	if len(pending) == 0 {
+		return
+	}
+	// SetOffsets безопасен именно здесь: ребаланс ещё заблокирован Poll'ом,
+	// а коммит идёт из этой же горутины и сейчас не выполняется.
+	s.oc.SetOffsets(pending)
+	for topic, parts := range pending {
+		for partition, eo := range parts {
+			s.offsets.Forget(topic, partition)
+			s.log.Warn("batch budget exceeded, partition rewound",
+				slog.String("topic", topic), slog.Int("partition", int(partition)),
+				slog.Int64("offset", eo.Offset),
+				slog.Duration("budget", s.batchBudget))
 		}
 	}
 }
@@ -193,9 +284,8 @@ func (s *Sink) handle(ctx context.Context, rec *kgo.Record) (done bool, err erro
 
 	cmd, derr := dec.Decode(rec.Value)
 	if derr != nil {
-		if !codec.IsPoison(derr) {
-			return false, derr
-		}
+		// Контракт codec.Decoder: любая ошибка декодинга — poison. Считать
+		// её инфраструктурной значило бы повторять запись вечно.
 		if e := s.em.DLQ(ctx, rec, emit.ReasonPoison, "decode", derr.Error()); e != nil {
 			return false, e
 		}
@@ -243,12 +333,15 @@ func (s *Sink) commit(ctx context.Context) {
 		s.log.Error("flush before commit failed", slog.String("error", err.Error()))
 		return
 	}
+	// Провал коммита логируется как warn, а не error: данные не теряются —
+	// тот же офсет уедет следующим тиком, а при revoke на закрытии клиента
+	// (контекст клиента уже отменён) коммит и вовсе штатно не проходит.
 	var failed bool
-	s.cl.CommitOffsetsSync(ctx, offsets,
+	s.oc.CommitOffsetsSync(ctx, offsets,
 		func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest, resp *kmsg.OffsetCommitResponse, err error) {
 			if err != nil {
 				failed = true
-				s.log.Error("commit failed", slog.String("error", err.Error()))
+				s.log.Warn("commit failed", slog.String("error", err.Error()))
 				return
 			}
 			// Ошибка уровня партиции не поднимается в err: без этой проверки
@@ -260,7 +353,7 @@ func (s *Sink) commit(ctx context.Context) {
 						continue
 					}
 					failed = true
-					s.log.Error("commit failed", slog.String("topic", t.Topic),
+					s.log.Warn("commit failed", slog.String("topic", t.Topic),
 						slog.Int("partition", int(p.Partition)),
 						slog.String("error", perr.Error()))
 				}
