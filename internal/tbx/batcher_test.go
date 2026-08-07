@@ -255,6 +255,62 @@ func TestBatcherSubmitAfterContextCancelFails(t *testing.T) {
 	}
 }
 
+// F1: Close() во время уже летящего батча не имеет права соврать отправителю.
+// TigerBeetle применил события — значит Submit обязан вернуть настоящие исходы,
+// а не ErrClosed. Для синхронного API это единственный источник правды:
+// его HTTP-клиент не хранит offset и не обязан повторять запрос с тем же id.
+func TestBatcherCloseDeliversOutcomeForInFlightBatch(t *testing.T) {
+	fc := &fakeClient{
+		enterTransfers:   make(chan struct{}),
+		releaseTransfers: make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := NewBatcher(fc, config.Batcher{MaxBatchSize: 10, Linger: 5 * time.Millisecond, MaxQueue: 8},
+		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger())
+	b.Start(ctx)
+
+	type result struct {
+		out []Outcome
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := b.Submit(context.Background(), transferCmd(2, "c"))
+		done <- result{out, err}
+	}()
+
+	// Батч дошёл до клиента и застрял внутри вызова.
+	select {
+	case <-fc.enterTransfers:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client call never started")
+	}
+
+	closed := make(chan struct{})
+	go func() { b.Close(); close(closed) }()
+	time.Sleep(50 * time.Millisecond) // дать Close закрыть stop и уйти в wg.Wait
+
+	fc.releaseTransfers <- struct{}{} // TigerBeetle ответил: события применены
+
+	select {
+	case r := <-done:
+		require.NoError(t, r.err, "Submit must report the real outcome of applied work, not ErrClosed")
+		require.Len(t, r.out, 2)
+		for i, o := range r.out {
+			require.Equal(t, StatusOK, o.Status, "outcome %d", i)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Submit hung across Close()")
+	}
+
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() did not return")
+	}
+}
+
 func TestBatcherAccountsGoToSeparateBatches(t *testing.T) {
 	fc := &fakeClient{}
 	b, _ := startBatcher(t, fc, 100, 5*time.Millisecond)

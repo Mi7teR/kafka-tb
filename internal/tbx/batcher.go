@@ -52,9 +52,18 @@ type Batcher struct {
 	// поэтому у отправителя всегда есть выход из блокирующего select.
 	stopOnce sync.Once
 	stop     chan struct{}
+
+	// finished — «циклы вышли», а не «остановку запросили». Разница
+	// принципиальна: пока цикл жив, он ещё может ответить уже поставленной
+	// в очередь команде, и отправитель обязан этого ответа дождаться.
+	// Отправитель, ждущий исход, выходит только по finished — тогда
+	// «никто уже не ответит» — гарантия, а не догадка.
+	finishedOnce sync.Once
+	finished     chan struct{}
+
 	// unwatch снимает подписку на отмену контекста Start.
-	// Устанавливается в Start, читается в Close: обе — вызовы жизненного цикла,
-	// они не пересекаются во времени.
+	// Пишется в Start, читается в Close; контракт жизненного цикла
+	// (ровно один Start, Close строго после него) описан в их доккоментариях.
 	unwatch func() bool
 	wg      sync.WaitGroup
 }
@@ -68,15 +77,21 @@ func NewBatcher(c Client, cfg config.Batcher, retry config.Retry, log *slog.Logg
 		transfers: make(chan *job, cfg.MaxQueue),
 		accounts:  make(chan *job, cfg.MaxQueue),
 		stop:      make(chan struct{}),
+		finished:  make(chan struct{}),
 	}
 }
 
+// Start запускает циклы отправки. Вызывается ровно один раз и строго до Close;
+// повторный или конкурентный с Close вызов не поддерживается.
 func (b *Batcher) Start(ctx context.Context) {
 	// Отмена контекста — это тот же shutdown, что и Close().
 	b.unwatch = context.AfterFunc(ctx, b.signalStop)
 	b.wg.Add(2)
 	go func() { defer b.wg.Done(); b.loop(b.transfers, b.sendTransfers) }()
 	go func() { defer b.wg.Done(); b.loop(b.accounts, b.sendAccounts) }()
+	// Наблюдатель живёт здесь, а не в Close: путь остановки по отмене контекста
+	// не проходит через Close, но отправителей отпускать обязан так же.
+	go func() { b.wg.Wait(); b.signalFinished() }()
 }
 
 // Submit ставит команду в очередь и ждёт исход.
@@ -124,30 +139,51 @@ func (b *Batcher) Submit(ctx context.Context, cmd *model.Command) ([]Outcome, er
 		// трактуют их как StatusOK. Это работает только потому, что id
 		// приходят от вызывающего и стабильны между попытками.
 		return nil, ctx.Err()
-	case <-b.stop:
-		// Исход мог быть доставлен ровно в момент остановки — не выбрасываем его.
+	case <-b.finished:
+		// Здесь ждём именно finished, а не stop. stop означает лишь «начали
+		// останавливаться»: батч этой команды может быть уже в TigerBeetle и
+		// вот-вот вернуть исход. Ответить в этот момент ErrClosed — соврать
+		// про применённую работу; для синхронного API это неисправимо, его
+		// клиент не обязан повторять запрос с тем же id.
+		// finished же закрывается после выхода обоих циклов, то есть когда
+		// ответить этой команде уже некому.
+		//
+		// Гонка «исход доставлен ровно в момент выхода циклов» реальна:
+		// оба канала готовы, и select выбрал бы случайно. Приоритет исхода
+		// восстанавливаем явной непустой проверкой.
 		select {
 		case res := <-j.done:
 			return res.outcomes, res.err
 		default:
 		}
-		// Тот же расчёт на идемпотентность, что и в ветке ctx.Done() выше.
+		// Команда попала в очередь так поздно, что ни один цикл её не увидел.
+		// Отвечаем ошибкой, а не виснем; дальше — тот же расчёт на
+		// идемпотентность по id, что и в ветке ctx.Done() выше.
 		return nil, ErrClosed
 	}
 }
 
 // Close закрывает приём и дожидается, пока циклы разгребут очереди.
+// Вызывается строго после Start и не конкурентно с ним.
 func (b *Batcher) Close() {
 	b.signalStop()
 	if b.unwatch != nil {
 		b.unwatch()
 	}
 	b.wg.Wait()
+	// Подстраховка на случай, когда Start не вызывали: наблюдателя нет,
+	// а отправитель без finished ждал бы исход вечно.
+	b.signalFinished()
 }
 
 // signalStop закрывает stop ровно один раз, откуда бы ни пришёл сигнал.
 func (b *Batcher) signalStop() {
 	b.stopOnce.Do(func() { close(b.stop) })
+}
+
+// signalFinished закрывает finished ровно один раз.
+func (b *Batcher) signalFinished() {
+	b.finishedOnce.Do(func() { close(b.finished) })
 }
 
 // loop собирает батч по правилу «max_batch_size или linger, что раньше».

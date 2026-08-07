@@ -20,9 +20,19 @@ type fakeClient struct {
 
 	// resultsFor вызывается на каждый батч трансферов.
 	resultsFor func(batch []types.Transfer) []types.CreateTransferResult
+
+	// enterTransfers/releaseTransfers позволяют тесту остановить клиент внутри
+	// вызова: он сообщает о входе и ждёт разрешения продолжить. Оба поля
+	// выставляются до Start и дальше только читаются.
+	enterTransfers   chan struct{}
+	releaseTransfers chan struct{}
 }
 
 func (f *fakeClient) CreateTransfers(ts []types.Transfer) ([]types.CreateTransferResult, error) {
+	if f.enterTransfers != nil {
+		f.enterTransfers <- struct{}{}
+		<-f.releaseTransfers
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failTimes > 0 {
