@@ -16,8 +16,10 @@
 - Go 1.23 или новее. `CGO_ENABLED=1` — клиент TigerBeetle использует cgo, чистая кросс-компиляция невозможна.
 - TigerBeetle client v0.17.9. Максимум событий в одном `create_accounts`/`create_transfers` — **8189**.
 - **macOS:** предсобранная статическая библиотека TigerBeetle не проходит линковку новым `ld` (`64-bit mach-o member 'libtb_client.a.o' not 8-byte aligned`). Сборка и тесты идут только через `make` — Makefile подставляет `-ldflags=-extldflags=-Wl,-ld_classic` на Darwin. Голый `go test ./...` на macOS падает на линковке; это не дефект кода.
-- Результаты `CreateAccounts`/`CreateTransfers` **sparse**: возвращаются только неуспешные события, каждое с полем `Index`. Отсутствие индекса в ответе означает успех.
-- `TransferOK` и `TransferExists` (и их account-аналоги) трактуются как успех. Всё остальное — reject.
+- **Проверено на установленном v0.17.9:** все типы лежат в корневом пакете `github.com/tigerbeetle/tigerbeetle-go` (импортировать как `types "github.com/tigerbeetle/tigerbeetle-go"`), подпакета `pkg/types` не существует.
+- `CreateTransfers` возвращает `[]CreateTransferResult`, где `CreateTransferResult{Timestamp uint64; Status CreateTransferStatus; Reserved uint32}`. Поля `Index` нет: массив **плотный и позиционный** — `results[i]` относится к `transfers[i]`. Аналогично `CreateAccounts` → `[]CreateAccountResult{Timestamp, Status, Reserved}`.
+- Успех — `types.TransferCreated` (значение `0xFFFFFFFF`, не 0) или `types.TransferExists`. Для счетов — `types.AccountCreated`, `types.AccountExists`. Всё остальное — reject.
+- Клиент уже содержит `Nop() error` — отдельно добавлять в интерфейс не нужно.
 - Флаг `linked` не может стоять на последнем элементе батча — снимаем его на последнем элементе каждого сообщения.
 - Суммы — только строки и `big.Int`. Использование `float64` для денег запрещено в любом месте кода.
 - Ошибка данных никогда не завершает процесс. Паника внутри обработки сообщения перехватывается и превращается в poison.
@@ -455,7 +457,7 @@ go get github.com/google/uuid@latest
 
 - [ ] **Step 2: Сверить имена типов клиента TigerBeetle**
 
-Run: `go doc github.com/tigerbeetle/tigerbeetle-go/pkg/types TransferFlags && go doc github.com/tigerbeetle/tigerbeetle-go/pkg/types Uint128`
+Run: `go doc github.com/tigerbeetle/tigerbeetle-go TransferFlags && go doc github.com/tigerbeetle/tigerbeetle-go Uint128`
 Expected: в выводе есть поля `Linked`, `Pending`, `PostPendingTransfer`, `VoidPendingTransfer`, метод `ToUint16()`, и функции `BytesToUint128`, `BigIntToUint128`. Если имена отличаются — правь код ниже под фактические, остальной план не меняется.
 
 - [ ] **Step 3: Написать падающие тесты сумм и id**
@@ -567,7 +569,7 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
-	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
 var ErrZeroID = errors.New("id must not be zero")
@@ -605,7 +607,7 @@ import (
 	"math/big"
 	"strings"
 
-	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
 // maxU128 = 2^128 - 1
@@ -684,7 +686,7 @@ import (
 	"fmt"
 
 	"github.com/Mi7teR/kafka-tb/internal/config"
-	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
 type Registry struct {
@@ -804,7 +806,7 @@ func (r *Registry) AccountFlags(names []string) (types.AccountFlags, error) {
 ```go
 package model
 
-import "github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+import types "github.com/tigerbeetle/tigerbeetle-go"
 
 type Op string
 
@@ -1122,7 +1124,7 @@ import (
 	"github.com/Mi7teR/kafka-tb/internal/codec"
 	"github.com/Mi7teR/kafka-tb/internal/config"
 	"github.com/Mi7teR/kafka-tb/internal/model"
-	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
 type Decoder struct {
@@ -1521,16 +1523,31 @@ git commit -m "feat(codec): add decoder interface and strict json decoder"
 **Interfaces:**
 - Consumes: `model.Command`.
 - Produces:
-  - `tbx.Status` — `StatusOK`, `StatusRejected`; тип `tbx.Outcome{Index int; ID string; Status Status; Error string}`.
-  - `tbx.MapTransferResults(cmd *model.Command, results []types.TransferEventResult, offset int) []Outcome`.
-  - `tbx.MapAccountResults(cmd *model.Command, results []types.AccountEventResult, offset int) []Outcome`.
+  - `tbx.Status` — `StatusOK`, `StatusRejected`; тип `tbx.Outcome{Index int; ID string; Status Status; Error string; Timestamp uint64}`.
+  - `tbx.MapTransferResults(cmd *model.Command, results []types.CreateTransferResult, offset int) ([]Outcome, error)`.
+  - `tbx.MapAccountResults(cmd *model.Command, results []types.CreateAccountResult, offset int) ([]Outcome, error)`.
+  - `tbx.ErrResultCountMismatch` — ответ TigerBeetle не совпал по длине с отправленным батчем.
   - `tbx.Client` — интерфейс `CreateTransfers([]types.Transfer) ([]types.TransferEventResult, error)`, `CreateAccounts([]types.Account) ([]types.AccountEventResult, error)`, `LookupAccounts([]types.Uint128) ([]types.Account, error)`, `LookupTransfers([]types.Uint128) ([]types.Transfer, error)`, `GetAccountTransfers(types.AccountFilter) ([]types.Transfer, error)`, `GetAccountBalances(types.AccountFilter) ([]types.AccountBalance, error)`, `QueryAccounts(types.QueryFilter) ([]types.Account, error)`, `QueryTransfers(types.QueryFilter) ([]types.Transfer, error)`, `Close()`.
   - `tbx.NewClient(cfg config.TigerBeetle) (Client, error)`.
 
-- [ ] **Step 1: Сверить константы результатов**
+- [ ] **Step 1: Сверить контракт результатов**
 
-Run: `go doc github.com/tigerbeetle/tigerbeetle-go/pkg/types CreateTransferResult | head -30 && go doc github.com/tigerbeetle/tigerbeetle-go/pkg/types CreateAccountResult | head -20`
-Expected: в списке есть `TransferOK`, `TransferExists`, `TransferExceedsCredits`, `TransferLinkedEventFailed`, `AccountOK`, `AccountExists`. Если имена другие — подставь фактические в код ниже.
+Run: `go doc github.com/tigerbeetle/tigerbeetle-go CreateTransferResult && go doc github.com/tigerbeetle/tigerbeetle-go CreateTransferStatus | head -5`
+
+Ожидается (уже проверено на v0.17.9, шаг нужен для подтверждения):
+
+```go
+type CreateTransferResult struct {
+	Timestamp uint64
+	Status    CreateTransferStatus
+	Reserved  uint32
+}
+const TransferCreated CreateTransferStatus = 0xFFFFFFFF
+```
+
+Ключевое: поля `Index` нет. Массив результатов **плотный и позиционный** — `results[i]` относится к `transfers[i]`, длина совпадает с длиной запроса. Успех — `TransferCreated` или `TransferExists`; для счетов `AccountCreated`, `AccountExists`.
+
+Открытый вопрос, который закроет интеграционный тест (Task 9): возвращает ли TigerBeetle пустой массив, когда **все** события успешны (в клиенте есть ветка `if reply == nil { return make([]CreateTransferResult, 0), nil }`). Код ниже обрабатывает оба случая: пустой ответ = всё успешно, ответ длиной с батч = позиционный разбор, любая другая длина = `ErrResultCountMismatch`.
 
 - [ ] **Step 2: Написать падающий тест маппинга**
 
@@ -1544,7 +1561,7 @@ import (
 
 	"github.com/Mi7teR/kafka-tb/internal/model"
 	"github.com/stretchr/testify/require"
-	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
 func cmd3() *model.Command {
@@ -1555,13 +1572,17 @@ func cmd3() *model.Command {
 	}
 }
 
-// Результаты sparse: отсутствие индекса в ответе означает успех.
-func TestMapTransferResultsSparse(t *testing.T) {
-	got := MapTransferResults(cmd3(), []types.TransferEventResult{
-		{Index: 1, Result: types.TransferExceedsCredits},
+// Ответ плотный: results[i] относится к событию i батча.
+func TestMapTransferResultsPositional(t *testing.T) {
+	got, err := MapTransferResults(cmd3(), []types.CreateTransferResult{
+		{Status: types.TransferCreated, Timestamp: 100},
+		{Status: types.TransferExceedsCredits},
+		{Status: types.TransferCreated, Timestamp: 102},
 	}, 0)
+	require.NoError(t, err)
 	require.Len(t, got, 3)
 	require.Equal(t, StatusOK, got[0].Status)
+	require.Equal(t, uint64(100), got[0].Timestamp)
 	require.Equal(t, StatusRejected, got[1].Status)
 	require.Equal(t, "exceeds_credits", got[1].Error)
 	require.Equal(t, "id-1", got[1].ID)
@@ -1570,30 +1591,47 @@ func TestMapTransferResultsSparse(t *testing.T) {
 
 // exists — идемпотентный повтор, а не отказ.
 func TestMapTransferResultsExistsIsSuccess(t *testing.T) {
-	got := MapTransferResults(cmd3(), []types.TransferEventResult{
-		{Index: 0, Result: types.TransferExists},
+	got, err := MapTransferResults(cmd3(), []types.CreateTransferResult{
+		{Status: types.TransferExists},
+		{Status: types.TransferCreated},
+		{Status: types.TransferCreated},
 	}, 0)
+	require.NoError(t, err)
 	require.Equal(t, StatusOK, got[0].Status)
 	require.Empty(t, got[0].Error)
 }
 
-// Индексы в ответе — от начала батча, а не от начала команды.
+// Команда занимает окно [offset, offset+Len) внутри общего батча.
 func TestMapTransferResultsHonoursOffset(t *testing.T) {
-	got := MapTransferResults(cmd3(), []types.TransferEventResult{
-		{Index: 11, Result: types.TransferExceedsCredits},
-	}, 10)
-	require.Equal(t, StatusRejected, got[1].Status)
+	results := make([]types.CreateTransferResult, 13)
+	for i := range results {
+		results[i].Status = types.TransferCreated
+	}
+	results[11].Status = types.TransferExceedsCredits
+
+	got, err := MapTransferResults(cmd3(), results, 10)
+	require.NoError(t, err)
 	require.Equal(t, StatusOK, got[0].Status)
+	require.Equal(t, StatusRejected, got[1].Status)
+	require.Equal(t, StatusOK, got[2].Status)
 }
 
-// Чужие индексы игнорируются, а не паникуют и не сдвигают чужие исходы.
-func TestMapTransferResultsIgnoresForeignIndexes(t *testing.T) {
-	got := MapTransferResults(cmd3(), []types.TransferEventResult{
-		{Index: 99, Result: types.TransferExceedsCredits},
-	}, 0)
+// Пустой ответ означает, что успешны все события.
+func TestMapTransferResultsEmptyMeansAllOK(t *testing.T) {
+	got, err := MapTransferResults(cmd3(), nil, 0)
+	require.NoError(t, err)
+	require.Len(t, got, 3)
 	for _, o := range got {
 		require.Equal(t, StatusOK, o.Status)
 	}
+}
+
+// Ответ не той длины — нарушение контракта: молча разъезжаться нельзя.
+func TestMapTransferResultsCountMismatch(t *testing.T) {
+	_, err := MapTransferResults(cmd3(), []types.CreateTransferResult{
+		{Status: types.TransferCreated},
+	}, 0)
+	require.ErrorIs(t, err, ErrResultCountMismatch)
 }
 
 func TestMapAccountResults(t *testing.T) {
@@ -1602,10 +1640,11 @@ func TestMapAccountResults(t *testing.T) {
 		Accounts: make([]types.Account, 2),
 		IDs:      []string{"a-0", "a-1"},
 	}
-	got := MapAccountResults(c, []types.AccountEventResult{
-		{Index: 0, Result: types.AccountExists},
-		{Index: 1, Result: types.AccountLinkedEventFailed},
+	got, err := MapAccountResults(c, []types.CreateAccountResult{
+		{Status: types.AccountExists},
+		{Status: types.AccountLinkedEventFailed},
 	}, 0)
+	require.NoError(t, err)
 	require.Equal(t, StatusOK, got[0].Status)
 	require.Equal(t, StatusRejected, got[1].Status)
 	require.Equal(t, "linked_event_failed", got[1].Error)
@@ -1628,7 +1667,7 @@ import (
 	"strings"
 
 	"github.com/Mi7teR/kafka-tb/internal/model"
-	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
 type Status string
@@ -1638,46 +1677,62 @@ const (
 	StatusRejected Status = "rejected"
 )
 
+// ErrResultCountMismatch — TigerBeetle вернул ответ, не соответствующий батчу.
+// Разбирать его позиционно нельзя: исходы уедут не тем командам.
+var ErrResultCountMismatch = errors.New("tigerbeetle result count does not match batch size")
+
 // Outcome — исход одного события внутри команды.
 type Outcome struct {
-	Index  int
-	ID     string
-	Status Status
-	Error  string // машиночитаемое имя кода TigerBeetle, пусто при успехе
+	Index     int
+	ID        string
+	Status    Status
+	Error     string // машиночитаемое имя статуса TigerBeetle, пусто при успехе
+	Timestamp uint64
 }
 
-// MapTransferResults разводит sparse-результаты батча по событиям одной команды.
-// offset — позиция первого события команды внутри отправленного батча.
-func MapTransferResults(cmd *model.Command, results []types.TransferEventResult, offset int) []Outcome {
+// MapTransferResults вырезает окно команды из плотного ответа батча.
+// offset — позиция первого события команды внутри отправленного батча,
+// batchSize — сколько событий было отправлено всего.
+func MapTransferResults(cmd *model.Command, results []types.CreateTransferResult, offset int) ([]Outcome, error) {
 	out := newOutcomes(cmd)
-	for _, r := range results {
-		i := int(r.Index) - offset
-		if i < 0 || i >= len(out) {
-			continue // событие чужой команды в том же батче
-		}
-		if r.Result == types.TransferOK || r.Result == types.TransferExists {
+	if len(results) == 0 {
+		return out, nil // пустой ответ = все события применены
+	}
+	if offset+len(out) > len(results) {
+		return nil, fmt.Errorf("%w: got %d results, command needs [%d,%d)",
+			ErrResultCountMismatch, len(results), offset, offset+len(out))
+	}
+	for i := range out {
+		r := results[offset+i]
+		out[i].Timestamp = r.Timestamp
+		if r.Status == types.TransferCreated || r.Status == types.TransferExists {
 			continue
 		}
 		out[i].Status = StatusRejected
-		out[i].Error = errorName(r.Result.String(), "Transfer")
+		out[i].Error = errorName(r.Status.String(), "Transfer")
 	}
-	return out
+	return out, nil
 }
 
-func MapAccountResults(cmd *model.Command, results []types.AccountEventResult, offset int) []Outcome {
+func MapAccountResults(cmd *model.Command, results []types.CreateAccountResult, offset int) ([]Outcome, error) {
 	out := newOutcomes(cmd)
-	for _, r := range results {
-		i := int(r.Index) - offset
-		if i < 0 || i >= len(out) {
-			continue
-		}
-		if r.Result == types.AccountOK || r.Result == types.AccountExists {
+	if len(results) == 0 {
+		return out, nil
+	}
+	if offset+len(out) > len(results) {
+		return nil, fmt.Errorf("%w: got %d results, command needs [%d,%d)",
+			ErrResultCountMismatch, len(results), offset, offset+len(out))
+	}
+	for i := range out {
+		r := results[offset+i]
+		out[i].Timestamp = r.Timestamp
+		if r.Status == types.AccountCreated || r.Status == types.AccountExists {
 			continue
 		}
 		out[i].Status = StatusRejected
-		out[i].Error = errorName(r.Result.String(), "Account")
+		out[i].Error = errorName(r.Status.String(), "Account")
 	}
-	return out
+	return out, nil
 }
 
 func newOutcomes(cmd *model.Command) []Outcome {
@@ -1708,6 +1763,10 @@ func errorName(s, prefix string) string {
 }
 ```
 
+Импорты файла: `errors`, `fmt`, `strings`, `model`, `types`.
+
+Проверь фактический вывод `Status.String()`: если он даёт не `"TransferExceedsCredits"`, а что-то иное, поправь `errorName` под реальный формат — тест `TestMapTransferResultsPositional` это поймает.
+
 - [ ] **Step 5: Прогнать**
 
 Run: `go test ./internal/tbx/ -v -race`
@@ -1724,7 +1783,7 @@ import (
 	"fmt"
 
 	tb "github.com/tigerbeetle/tigerbeetle-go"
-	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+	types "github.com/tigerbeetle/tigerbeetle-go"
 
 	"github.com/Mi7teR/kafka-tb/internal/config"
 )
@@ -1732,14 +1791,15 @@ import (
 // Client — узкий интерфейс поверх клиента TigerBeetle.
 // Существует ради подмены в тестах: настоящий клиент требует живого кластера.
 type Client interface {
-	CreateAccounts([]types.Account) ([]types.AccountEventResult, error)
-	CreateTransfers([]types.Transfer) ([]types.TransferEventResult, error)
+	CreateAccounts([]types.Account) ([]types.CreateAccountResult, error)
+	CreateTransfers([]types.Transfer) ([]types.CreateTransferResult, error)
 	LookupAccounts([]types.Uint128) ([]types.Account, error)
 	LookupTransfers([]types.Uint128) ([]types.Transfer, error)
 	GetAccountTransfers(types.AccountFilter) ([]types.Transfer, error)
 	GetAccountBalances(types.AccountFilter) ([]types.AccountBalance, error)
 	QueryAccounts(types.QueryFilter) ([]types.Account, error)
 	QueryTransfers(types.QueryFilter) ([]types.Transfer, error)
+	Nop() error
 	Close()
 }
 
@@ -1764,7 +1824,7 @@ import (
 	"testing"
 
 	"github.com/Mi7teR/kafka-tb/internal/model"
-	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
 func BenchmarkMapResults(b *testing.B) {
@@ -1773,14 +1833,19 @@ func BenchmarkMapResults(b *testing.B) {
 	for i := range c.IDs {
 		c.IDs[i] = strconv.Itoa(i)
 	}
-	res := make([]types.TransferEventResult, 0, n/100)
-	for i := 0; i < n; i += 100 {
-		res = append(res, types.TransferEventResult{Index: uint32(i), Result: types.TransferExceedsCredits})
+	res := make([]types.CreateTransferResult, n)
+	for i := range res {
+		res[i].Status = types.TransferCreated
+		if i%100 == 0 {
+			res[i].Status = types.TransferExceedsCredits
+		}
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = MapTransferResults(c, res, 0)
+		if _, err := MapTransferResults(c, res, 0); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 ```
@@ -1826,7 +1891,7 @@ package tbx
 import (
 	"sync"
 
-	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
 // fakeClient записывает батчи как они пришли и умеет отдавать
@@ -1842,10 +1907,10 @@ type fakeClient struct {
 	err       error
 
 	// resultsFor вызывается на каждый батч трансферов.
-	resultsFor func(batch []types.Transfer) []types.TransferEventResult
+	resultsFor func(batch []types.Transfer) []types.CreateTransferResult
 }
 
-func (f *fakeClient) CreateTransfers(ts []types.Transfer) ([]types.TransferEventResult, error) {
+func (f *fakeClient) CreateTransfers(ts []types.Transfer) ([]types.CreateTransferResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failTimes > 0 {
@@ -1861,7 +1926,7 @@ func (f *fakeClient) CreateTransfers(ts []types.Transfer) ([]types.TransferEvent
 	return nil, nil
 }
 
-func (f *fakeClient) CreateAccounts(as []types.Account) ([]types.AccountEventResult, error) {
+func (f *fakeClient) CreateAccounts(as []types.Account) ([]types.CreateAccountResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	cp := make([]types.Account, len(as))
@@ -1888,6 +1953,7 @@ func (f *fakeClient) GetAccountBalances(types.AccountFilter) ([]types.AccountBal
 }
 func (f *fakeClient) QueryAccounts(types.QueryFilter) ([]types.Account, error)   { return nil, nil }
 func (f *fakeClient) QueryTransfers(types.QueryFilter) ([]types.Transfer, error) { return nil, nil }
+func (f *fakeClient) Nop() error                                                 { return nil }
 func (f *fakeClient) Close()                                                     {}
 ```
 
@@ -1911,7 +1977,7 @@ import (
 	"github.com/Mi7teR/kafka-tb/internal/config"
 	"github.com/Mi7teR/kafka-tb/internal/model"
 	"github.com/stretchr/testify/require"
-	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -1986,11 +2052,12 @@ func TestBatcherRespectsMaxBatchSize(t *testing.T) {
 func TestBatcherRoutesResultsToOwner(t *testing.T) {
 	// Отклоняем каждое событие, у которого Amount == 7: так проверяем,
 	// что исход попал именно в ту команду, где это событие лежало.
-	fc := &fakeClient{resultsFor: func(batch []types.Transfer) []types.TransferEventResult {
-		var out []types.TransferEventResult
+	fc := &fakeClient{resultsFor: func(batch []types.Transfer) []types.CreateTransferResult {
+		out := make([]types.CreateTransferResult, len(batch))
 		for i, tr := range batch {
+			out[i].Status = types.TransferCreated
 			if tr.Amount == types.ToUint128(7) {
-				out = append(out, types.TransferEventResult{Index: uint32(i), Result: types.TransferExceedsCredits})
+				out[i].Status = types.TransferExceedsCredits
 			}
 		}
 		return out
@@ -2083,7 +2150,7 @@ import (
 
 	"github.com/Mi7teR/kafka-tb/internal/config"
 	"github.com/Mi7teR/kafka-tb/internal/model"
-	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
 var (
@@ -2262,9 +2329,10 @@ func (b *Batcher) sendTransfers(jobs []*job) error {
 	if err != nil {
 		return err
 	}
-	typed, _ := results.([]types.TransferEventResult)
+	typed, _ := results.([]types.CreateTransferResult)
 	for i, j := range jobs {
-		j.done <- submitResult{outcomes: MapTransferResults(j.cmd, typed, offsets[i])}
+		outcomes, mapErr := MapTransferResults(j.cmd, typed, offsets[i])
+		j.done <- submitResult{outcomes: outcomes, err: mapErr}
 	}
 	return nil
 }
@@ -2282,9 +2350,10 @@ func (b *Batcher) sendAccounts(jobs []*job) error {
 	if err != nil {
 		return err
 	}
-	typed, _ := results.([]types.AccountEventResult)
+	typed, _ := results.([]types.CreateAccountResult)
 	for i, j := range jobs {
-		j.done <- submitResult{outcomes: MapAccountResults(j.cmd, typed, offsets[i])}
+		outcomes, mapErr := MapAccountResults(j.cmd, typed, offsets[i])
+		j.done <- submitResult{outcomes: outcomes, err: mapErr}
 	}
 	return nil
 }
@@ -3045,7 +3114,7 @@ import (
 	"github.com/Mi7teR/kafka-tb/internal/model"
 	"github.com/Mi7teR/kafka-tb/internal/tbx"
 	"github.com/stretchr/testify/require"
-	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+	types "github.com/tigerbeetle/tigerbeetle-go"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -3851,7 +3920,7 @@ import (
 	"github.com/Mi7teR/kafka-tb/internal/config"
 	"github.com/Mi7teR/kafka-tb/internal/model"
 	"github.com/stretchr/testify/require"
-	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
+	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
 func testRegistry() *model.Registry {
@@ -4129,18 +4198,9 @@ git commit -m "feat(api): add write handlers and http gateway"
   - `obs.NewMetrics(reg prometheus.Registerer) *Metrics`.
   - `obs.Serve(ctx context.Context, addr string, ready func() error) error` — `/metrics`, `/healthz`, `/readyz`.
 
-- [ ] **Step 1: Расширить tbx.Client методом Nop**
+- [ ] **Step 1: Написать тест метрик**
 
-`/readyz` должен дёшево проверять живость TigerBeetle. Добавь в интерфейс `tbx.Client` (Task 4) строку `Nop() error` и такой же метод-заглушку в `fakeClient` из `internal/tbx/fake_test.go`:
-
-```go
-func (f *fakeClient) Nop() error { return nil }
-```
-
-Run: `go build ./... && go test ./internal/tbx/ -count=1`
-Expected: сборка проходит, тесты зелёные. Настоящий клиент TigerBeetle уже реализует `Nop()`, менять `NewClient` не надо.
-
-- [ ] **Step 2: Написать тест метрик**
+`/readyz` использует `tbx.Client.Nop()` — метод уже есть и в интерфейсе (Task 4), и в настоящем клиенте, добавлять ничего не нужно.
 
 `internal/obs/metrics_test.go`:
 
@@ -4172,7 +4232,7 @@ func TestNewMetricsTwiceOnSameRegistryPanicsNot(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: Реализовать метрики и health**
+- [ ] **Step 2: Реализовать метрики и health**
 
 ```bash
 go get github.com/prometheus/client_golang@latest
@@ -4182,16 +4242,16 @@ go get github.com/prometheus/client_golang@latest
 
 `internal/obs/health.go` — HTTP-сервер с тремя ручками. `/readyz` вызывает переданный `ready func() error`; в проде это `client.Nop()` для TigerBeetle плюс проверка, что консьюмер в группе.
 
-- [ ] **Step 4: Прогнать**
+- [ ] **Step 3: Прогнать**
 
 Run: `go test ./internal/obs/ -race -count=1 -v`
 Expected: PASS.
 
-- [ ] **Step 5: Проставить метрики в sink и batcher**
+- [ ] **Step 4: Проставить метрики в sink и batcher**
 
 В `sink.handle` — инкремент `RecordsTotal` по исходу и `DLQTotal` при записи в DLQ. В `Batcher.sendTransfers`/`sendAccounts` — `BatchSize.Observe(float64(len(events)))` и замер длительности вызова в `TBLatency`. Метрики передаются конструкторами; при `nil` код работает без учёта (для тестов).
 
-- [ ] **Step 6: Написать main**
+- [ ] **Step 5: Написать main**
 
 `cmd/kafkatb/main.go`:
 
@@ -4226,12 +4286,12 @@ func main() {
 
 `run` собирает граф зависимостей: `tbx.NewClient` → `tbx.NewBatcher` + `Start` → по режиму поднимает sink и/или API → `errgroup`. Останов: по контексту гасим consumer (`cl.Close()` после финального коммита), затем `batcher.Close()`, затем `emitter.Flush` + `Close`, затем `tbClient.Close()`. Дедлайн — `cfg.ShutdownTimeout`, по истечении выходим без коммита: at-least-once это допускает.
 
-- [ ] **Step 7: Проверить сборку и запуск**
+- [ ] **Step 6: Проверить сборку и запуск**
 
 Run: `make build && ./bin/kafkatb -config configs/example.yaml -mode api & sleep 2 && curl -sf localhost:8080/healthz && kill %1`
 Expected: `make build` без ошибок, `/healthz` отвечает 200.
 
-- [ ] **Step 8: Коммит**
+- [ ] **Step 7: Коммит**
 
 ```bash
 git add internal/obs cmd internal/sink internal/tbx
