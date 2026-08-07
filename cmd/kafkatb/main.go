@@ -156,7 +156,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	var apiSrv *api.Server
 	if cfg.Mode != config.ModeSink {
-		apiSrv = api.NewServer(tbClient, batcher, reg, cfg.API)
+		apiSrv = api.NewServer(tbClient, batcher, reg, cfg.API, cfg.Limits)
 	}
 
 	ready := func() error {

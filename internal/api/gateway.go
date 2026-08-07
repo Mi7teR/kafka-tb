@@ -15,6 +15,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // shutdownTimeout bounds how long Serve waits, once ctx is cancelled or
@@ -48,12 +49,34 @@ func (s *Server) Serve(ctx context.Context, cfg config.API) (err error) {
 		}
 	}()
 
-	mux := runtime.NewServeMux()
+	// grpc-gateway's default marshaler sets UnmarshalOptions.DiscardUnknown,
+	// silently dropping unrecognized JSON fields instead of rejecting the
+	// request. That contradicts internal/codec/jsonc.Decoder, which sets
+	// DisallowUnknownFields so a misspelled field (e.g. "user_data128" for
+	// user_data_128) is poison on the Kafka door — on a money path a typo
+	// must fail loudly, not silently apply a zeroed field. Leaving
+	// UnmarshalOptions at its zero value keeps DiscardUnknown false, so REST
+	// rejects the same request Kafka would dead-letter.
+	//
+	// The two doors can never be fully symmetric: gRPC's binary protobuf
+	// wire format has no concept of a misspelled field name (an unknown
+	// field number is just skipped per the protobuf spec, and there is no
+	// gRPC-level equivalent of DisallowUnknownFields to turn that off) — this
+	// marshaler option only closes the gap for the REST/JSON door, which is
+	// the one that has JSON field names to typo in the first place.
+	mux := runtime.NewServeMux(runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.JSONPb{
+		MarshalOptions: protojson.MarshalOptions{EmitUnpopulated: true},
+	}))
 	if err := kafkatbv1.RegisterLedgerHandlerFromEndpoint(ctx, mux, dialAddr(lis),
 		[]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}); err != nil {
 		return fmt.Errorf("register gateway: %w", err)
 	}
-	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	// http.MaxBytesHandler bounds the REST request body the same way
+	// limits.max_message_bytes bounds the Kafka decoder (internal/codec/
+	// jsonc.Decoder checks it before parsing): without it, protojson buffers
+	// an unbounded POST body whole on a public port.
+	handler := http.MaxBytesHandler(mux, int64(s.lim.MaxMessageBytes))
+	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 
 	httpLis, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {

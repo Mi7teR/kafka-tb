@@ -24,6 +24,12 @@ type partitionState struct {
 	// MarkCommitted; -1 означает "ещё ничего не коммитили", чтобы не
 	// спутать с легитимным первым коммитом на офсете 0.
 	committed int64
+	// highest — наибольший офсет, когда-либо переданный в Track для этой
+	// партиции. В отличие от committed, никогда не уменьшается и не
+	// подчищается: CommitLag не смог бы отличить "партиция полностью
+	// разобрана" от "по ней ничего не читали", опираясь только на
+	// pending/done, — оба пустеют в первом случае так же, как и во втором.
+	highest int64
 	// forgotten помечает партицию, отозванную через Forget. Пока флаг
 	// установлен, Done ничего не делает — это гасит поздний Done от
 	// воркера, ещё работавшего в момент revoke. Track же, наоборот,
@@ -67,6 +73,9 @@ func (o *Offsets) Track(rec *kgo.Record) {
 		o.p[k] = st
 	}
 	st.pending[rec.Offset] = rec.LeaderEpoch
+	if rec.Offset > st.highest {
+		st.highest = rec.Offset
+	}
 }
 
 // Done переносит офсет из pending в done. Если офсета нет в pending
@@ -185,6 +194,41 @@ func (o *Offsets) Forget(topic string, partition int32) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.p[partitionKey{topic, partition}] = &partitionState{forgotten: true}
+}
+
+// CommitLag returns, per partition with tracked state, the number of
+// tracked records at or beyond the committed watermark — i.e. the gap
+// between the highest offset ever tracked and the committed watermark.
+// highest is inclusive (it names an offset actually seen), while committed
+// follows Kafka's OffsetCommit convention of naming the next offset to
+// fetch (exclusive of everything already committed), so the two are
+// reconciled as (highest + 1) - committed rather than a bare subtraction —
+// otherwise a partition that has just fully caught up would report -1
+// instead of 0. Before the first commit, committed is the sentinel -1
+// (nothing committed yet, see partitionState.committed); treated as 0 here,
+// matching a partition whose committed position starts at the beginning.
+// Forgotten (revoked) partitions are excluded — there is nothing left for
+// this consumer to be behind on.
+func (o *Offsets) CommitLag() map[string]map[int32]int64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	out := make(map[string]map[int32]int64)
+	for k, st := range o.p {
+		if st.forgotten {
+			continue
+		}
+		committed := st.committed
+		if committed < 0 {
+			committed = 0
+		}
+		tp, ok := out[k.topic]
+		if !ok {
+			tp = make(map[int32]int64)
+			out[k.topic] = tp
+		}
+		tp[k.partition] = st.highest + 1 - committed
+	}
+	return out
 }
 
 func (o *Offsets) InFlight() int {

@@ -58,7 +58,7 @@ func TestServeServesGRPCAndRESTAndStopsOnCancel(t *testing.T) {
 	sub := &stubSubmitter{outcomes: []tbx.Outcome{
 		{Index: 0, ID: "0193f8a1-7c2e-7000-8000-000000000001", Status: tbx.StatusOK},
 	}}
-	srv := NewServer(nil, sub, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(nil, sub, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -107,6 +107,103 @@ func TestServeServesGRPCAndRESTAndStopsOnCancel(t *testing.T) {
 	}
 }
 
+// TestServeRESTRejectsUnknownField reproduces F1: grpc-gateway's default
+// marshaler discards unrecognized JSON fields, so a misspelled field (e.g.
+// "user_data128" for "user_data_128") would silently apply with a zeroed
+// value over REST while the identical payload is dead-lettered as poison
+// over Kafka (internal/codec/jsonc.Decoder sets DisallowUnknownFields). The
+// marshaler Serve configures must reject it instead, and a well-formed
+// request over the same mux must still succeed.
+func TestServeRESTRejectsUnknownField(t *testing.T) {
+	grpcAddr := freeAddr(t)
+	httpAddr := freeAddr(t)
+
+	sub := &stubSubmitter{outcomes: []tbx.Outcome{
+		{Index: 0, ID: "0193f8a1-7c2e-7000-8000-000000000001", Status: tbx.StatusOK},
+	}}
+	srv := NewServer(nil, sub, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- srv.Serve(ctx, config.API{GRPCAddr: grpcAddr, HTTPAddr: httpAddr, MaxPageSize: 10})
+	}()
+
+	waitForDial(t, grpcAddr)
+	waitForDial(t, httpAddr)
+
+	// "user_data128" is a typo for "user_data_128"; "junk_field" is a
+	// wholly unknown key. Neither must be silently discarded.
+	body := []byte(`{"transfers":[{
+		"id":"0193f8a1-7c2e-7000-8000-000000000001",
+		"debit_account_id":"0193f8a1-0000-7000-8000-000000000010",
+		"credit_account_id":"0193f8a1-0000-7000-8000-000000000020",
+		"amount":"12.34","ledger":"USD","code":"customer",
+		"user_data128":"0193f8a1-0000-7000-8000-0000000000ff",
+		"junk_field":"nonsense"
+	}]}`)
+	badResp, err := http.Post("http://"+httpAddr+"/v1/transfers", "application/json", bytes.NewReader(body))
+	require.NoError(t, err)
+	defer func() { _ = badResp.Body.Close() }()
+	require.Equal(t, http.StatusBadRequest, badResp.StatusCode,
+		"a misspelled/unknown field must be rejected, not silently applied as a zero value")
+
+	reqBody, err := protojson.Marshal(req())
+	require.NoError(t, err)
+	goodResp, err := http.Post("http://"+httpAddr+"/v1/transfers", "application/json", bytes.NewReader(reqBody))
+	require.NoError(t, err)
+	defer func() { _ = goodResp.Body.Close() }()
+	require.Equal(t, http.StatusOK, goodResp.StatusCode, "a well-formed request must still succeed")
+
+	cancel()
+	select {
+	case err := <-serveDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after context cancellation")
+	}
+}
+
+// TestServeRESTRejectsOversizedBody reproduces F2: unlike the Kafka decoder
+// (internal/codec/jsonc.Decoder checks limits.max_message_bytes before
+// parsing), REST had no body size ceiling of its own — protojson would
+// buffer an unbounded POST body whole. http.MaxBytesHandler must enforce the
+// same limit on the public HTTP port.
+func TestServeRESTRejectsOversizedBody(t *testing.T) {
+	grpcAddr := freeAddr(t)
+	httpAddr := freeAddr(t)
+
+	lim := config.Limits{MaxEventsPerMessage: 1000, MaxMessageBytes: 64}
+	srv := NewServer(nil, &stubSubmitter{}, testRegistry(), config.API{MaxPageSize: 10}, lim)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- srv.Serve(ctx, config.API{GRPCAddr: grpcAddr, HTTPAddr: httpAddr, MaxPageSize: 10})
+	}()
+
+	waitForDial(t, grpcAddr)
+	waitForDial(t, httpAddr)
+
+	reqBody, err := protojson.Marshal(req())
+	require.NoError(t, err)
+	require.Greater(t, len(reqBody), 64, "test body must exceed the configured limit for this test to be meaningful")
+	resp, err := http.Post("http://"+httpAddr+"/v1/transfers", "application/json", bytes.NewReader(reqBody))
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode, "an over-sized body must not be accepted")
+
+	cancel()
+	select {
+	case err := <-serveDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after context cancellation")
+	}
+}
+
 // TestServeReleasesGRPCListenerOnHTTPBindFailure reproduces C1: if the HTTP
 // listener fails to bind after the gRPC listener already succeeded, Serve
 // must close the gRPC listener before returning — otherwise the port stays
@@ -120,7 +217,7 @@ func TestServeReleasesGRPCListenerOnHTTPBindFailure(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = blocker.Close() }()
 
-	srv := NewServer(nil, &stubSubmitter{}, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(nil, &stubSubmitter{}, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 	err = srv.Serve(context.Background(), config.API{GRPCAddr: grpcAddr, HTTPAddr: httpAddr, MaxPageSize: 10})
 	require.Error(t, err)
 
@@ -156,7 +253,7 @@ func TestServeShutdownIsBoundedByStuckRPC(t *testing.T) {
 	httpAddr := freeAddr(t)
 
 	sub := &blockingSubmitter{started: make(chan struct{})}
-	srv := NewServer(nil, sub, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(nil, sub, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

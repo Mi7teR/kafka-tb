@@ -626,6 +626,35 @@ func TestCommitMarksCommittedOnSuccess(t *testing.T) {
 	require.Empty(t, s.offsets.Commitable(), "успешный коммит двигает ватермарк")
 }
 
+// F3: commit must publish kafkatb_offset_commit_lag from the offsets
+// tracker's current state — the gauge was previously registered but never
+// written, so it read a permanently misleading 0 no matter how far behind
+// the sink actually was.
+func TestCommitPublishesCommitLagMetric(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := obs.NewMetrics(reg)
+	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, &stubSubmitter{}, &recordingEmitter{})
+	s.metrics = m
+
+	r0 := srcRec(0, 0)
+	r1 := srcRec(0, 1)
+	s.offsets.Track(r0)
+	s.offsets.Track(r1)
+	s.offsets.Done(r0)
+	// offset 1 is tracked but not yet done: the commit below only advances
+	// the watermark through offset 0, leaving a real backlog behind it.
+	s.commit(context.Background(), slog.LevelError)
+
+	require.Equal(t, 1.0, testutil.ToFloat64(m.CommitLag.WithLabelValues("src", "0")),
+		"one record (offset 1) tracked beyond the committed watermark")
+
+	s.offsets.Done(r1)
+	s.commit(context.Background(), slog.LevelError)
+
+	require.Equal(t, 0.0, testutil.ToFloat64(m.CommitLag.WithLabelValues("src", "0")),
+		"fully caught up: lag must return to 0, not go stale at the previous value")
+}
+
 // Forget обнуляет состояние партиции, поэтому коммит обязан идти первым.
 func TestOnRevokedCommitsBeforeForget(t *testing.T) {
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, &stubSubmitter{}, &recordingEmitter{})

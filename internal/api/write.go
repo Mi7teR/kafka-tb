@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	kafkatbv1 "github.com/Mi7teR/kafka-tb/gen/kafkatb/v1"
 	"github.com/Mi7teR/kafka-tb/internal/model"
@@ -164,16 +165,33 @@ func clearLinked(flags *uint16) { *flags &^= linkedBit }
 // writeResults переводит tbx.Outcome в проводной WriteResult. Порядок
 // исходов совпадает с порядком запроса — Batcher/MapTransferResults
 // гарантируют это по построению (newOutcomes индексирует по cmd.IDs).
-func writeResults(outcomes []tbx.Outcome) []*kafkatbv1.WriteResult {
+// kind ("transfer"/"account") feeds rejectionDetail; it is not on
+// tbx.Outcome itself since the same Outcome shape serves both operations.
+func writeResults(outcomes []tbx.Outcome, kind string) []*kafkatbv1.WriteResult {
 	out := make([]*kafkatbv1.WriteResult, len(outcomes))
 	for i, o := range outcomes {
 		out[i] = &kafkatbv1.WriteResult{
 			Id:     o.ID,
 			Status: string(o.Status),
 			Error:  o.Error,
+			Detail: rejectionDetail(kind, o),
 		}
 	}
 	return out
+}
+
+// rejectionDetail turns a rejected outcome's id and machine-readable status
+// (the only two pieces of information tbx.Outcome actually carries) into a
+// short human-readable sentence for WriteResult.detail. Anything richer —
+// e.g. the specific balances TigerBeetle compared — is not available on
+// Outcome and would need an extra TigerBeetle round trip this write path
+// does not make; empty for non-rejected outcomes, since there is nothing to
+// explain.
+func rejectionDetail(kind string, o tbx.Outcome) string {
+	if o.Status != tbx.StatusRejected {
+		return ""
+	}
+	return fmt.Sprintf("%s %s rejected: %s", kind, o.ID, strings.ReplaceAll(o.Error, "_", " "))
 }
 
 // submitErr классифицирует ошибку Submit: слишком большой батч — ошибка
@@ -196,6 +214,14 @@ func (s *Server) CreateTransfers(ctx context.Context, in *kafkatbv1.CreateTransf
 	if len(in.GetTransfers()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "transfers: empty")
 	}
+	// Same ceiling internal/codec/jsonc.Decoder applies to the Kafka door
+	// (limits.max_events_per_message): without it, Batcher.Submit's
+	// MaxBatchSize is the API's only limit, and a tuned-down config could
+	// leave the API accepting a batch size Kafka would reject as poison.
+	if len(in.GetTransfers()) > s.lim.MaxEventsPerMessage {
+		return nil, status.Errorf(codes.InvalidArgument, "too many events: %d, limit %d",
+			len(in.GetTransfers()), s.lim.MaxEventsPerMessage)
+	}
 	cmd, err := s.commandFromTransfers(in.GetTransfers())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -204,13 +230,19 @@ func (s *Server) CreateTransfers(ctx context.Context, in *kafkatbv1.CreateTransf
 	if err != nil {
 		return nil, submitErr(err)
 	}
-	return &kafkatbv1.CreateTransfersResponse{Results: writeResults(outcomes)}, nil
+	return &kafkatbv1.CreateTransfersResponse{Results: writeResults(outcomes, "transfer")}, nil
 }
 
 // CreateAccounts — тот же контракт, что CreateTransfers, для счетов.
 func (s *Server) CreateAccounts(ctx context.Context, in *kafkatbv1.CreateAccountsRequest) (*kafkatbv1.CreateAccountsResponse, error) {
 	if len(in.GetAccounts()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "accounts: empty")
+	}
+	// See CreateTransfers: same limits.max_events_per_message ceiling as the
+	// Kafka door.
+	if len(in.GetAccounts()) > s.lim.MaxEventsPerMessage {
+		return nil, status.Errorf(codes.InvalidArgument, "too many events: %d, limit %d",
+			len(in.GetAccounts()), s.lim.MaxEventsPerMessage)
 	}
 	cmd, err := s.commandFromAccounts(in.GetAccounts())
 	if err != nil {
@@ -220,5 +252,5 @@ func (s *Server) CreateAccounts(ctx context.Context, in *kafkatbv1.CreateAccount
 	if err != nil {
 		return nil, submitErr(err)
 	}
-	return &kafkatbv1.CreateAccountsResponse{Results: writeResults(outcomes)}, nil
+	return &kafkatbv1.CreateAccountsResponse{Results: writeResults(outcomes, "account")}, nil
 }

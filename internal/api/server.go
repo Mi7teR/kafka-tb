@@ -27,8 +27,14 @@ type Server struct {
 	sub Submitter
 	reg *model.Registry
 	cfg config.API
+	lim config.Limits
 }
 
-func NewServer(c tbx.Client, sub Submitter, reg *model.Registry, cfg config.API) *Server {
-	return &Server{c: c, sub: sub, reg: reg, cfg: cfg}
+// NewServer wires the API server. lim is the same limits.* config that
+// gates the Kafka decoder (internal/codec/jsonc.Decoder) — CreateTransfers/
+// CreateAccounts enforce MaxEventsPerMessage and Serve's REST handler
+// enforces MaxMessageBytes, so a tuned-down config cannot make the API
+// accept what Kafka rejects.
+func NewServer(c tbx.Client, sub Submitter, reg *model.Registry, cfg config.API, lim config.Limits) *Server {
+	return &Server{c: c, sub: sub, reg: reg, cfg: cfg, lim: lim}
 }

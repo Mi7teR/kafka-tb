@@ -103,7 +103,7 @@ func TestListAccountTransfersAppliesCursorAndDefaultsLimit(t *testing.T) {
 			}, nil
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 50})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 50}, testLimits())
 
 	resp, err := srv.ListAccountTransfers(context.Background(), &kafkatbv1.ListAccountTransfersRequest{
 		AccountId: model.FormatID(accountID),
@@ -119,7 +119,7 @@ func TestListAccountTransfersAppliesCursorAndDefaultsLimit(t *testing.T) {
 }
 
 func TestListAccountTransfersLimitAboveMaxIsInvalidArgument(t *testing.T) {
-	srv := NewServer(&stubClient{}, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(&stubClient{}, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	_, err := srv.ListAccountTransfers(context.Background(), &kafkatbv1.ListAccountTransfersRequest{
 		AccountId: model.FormatID(types.ToUint128(1)),
@@ -130,7 +130,7 @@ func TestListAccountTransfersLimitAboveMaxIsInvalidArgument(t *testing.T) {
 }
 
 func TestListAccountTransfersInvalidAccountIDIsInvalidArgument(t *testing.T) {
-	srv := NewServer(&stubClient{}, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(&stubClient{}, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	_, err := srv.ListAccountTransfers(context.Background(), &kafkatbv1.ListAccountTransfersRequest{
 		AccountId: "not-a-uuid",
@@ -143,7 +143,7 @@ func TestListAccountTransfersEmptyPageHasZeroCursor(t *testing.T) {
 	stub := &stubClient{
 		getAccountTransfersFn: func(types.AccountFilter) ([]types.Transfer, error) { return nil, nil },
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	resp, err := srv.ListAccountTransfers(context.Background(), &kafkatbv1.ListAccountTransfersRequest{
 		AccountId: model.FormatID(types.ToUint128(1)),
@@ -167,7 +167,7 @@ func TestListAccountBalancesUsesAccountLedgerScale(t *testing.T) {
 			return []types.Account{{ID: accountID, Ledger: 1, Code: 1}}, nil
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	resp, err := srv.ListAccountBalances(context.Background(), &kafkatbv1.ListAccountBalancesRequest{
 		AccountId: model.FormatID(accountID),
@@ -189,7 +189,7 @@ func TestListAccountBalancesEmptyPageSkipsAccountLookup(t *testing.T) {
 			return nil, nil
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	resp, err := srv.ListAccountBalances(context.Background(), &kafkatbv1.ListAccountBalancesRequest{
 		AccountId: model.FormatID(types.ToUint128(1)),
@@ -206,7 +206,7 @@ func TestGetAccountsClientErrorIsUnavailable(t *testing.T) {
 			return nil, errors.New("connection refused")
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	_, err := srv.GetAccounts(context.Background(), &kafkatbv1.GetAccountsRequest{
 		Id: []string{model.FormatID(types.ToUint128(1))},
@@ -216,7 +216,7 @@ func TestGetAccountsClientErrorIsUnavailable(t *testing.T) {
 }
 
 func TestGetAccountsInvalidIDIsInvalidArgument(t *testing.T) {
-	srv := NewServer(&stubClient{}, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(&stubClient{}, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	_, err := srv.GetAccounts(context.Background(), &kafkatbv1.GetAccountsRequest{Id: []string{"nope"}})
 
@@ -236,7 +236,7 @@ func TestGetTransfersReturnsConvertedTransfers(t *testing.T) {
 			}}, nil
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	resp, err := srv.GetTransfers(context.Background(), &kafkatbv1.GetTransfersRequest{
 		Id: []string{model.FormatID(id)},
@@ -257,7 +257,7 @@ func TestQueryTransfersResolvesOptionalLedgerAndCode(t *testing.T) {
 			return nil, nil
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	_, err := srv.QueryTransfers(context.Background(), &kafkatbv1.QueryTransfersRequest{
 		Ledger: "USD",
@@ -277,7 +277,7 @@ func TestQueryTransfersEmptyLedgerAndCodeAreUnfiltered(t *testing.T) {
 			return nil, nil
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	_, err := srv.QueryTransfers(context.Background(), &kafkatbv1.QueryTransfersRequest{})
 
@@ -287,7 +287,7 @@ func TestQueryTransfersEmptyLedgerAndCodeAreUnfiltered(t *testing.T) {
 }
 
 func TestQueryTransfersUnknownLedgerIsInvalidArgument(t *testing.T) {
-	srv := NewServer(&stubClient{}, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(&stubClient{}, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	_, err := srv.QueryTransfers(context.Background(), &kafkatbv1.QueryTransfersRequest{Ledger: "GBP"})
 
@@ -295,7 +295,7 @@ func TestQueryTransfersUnknownLedgerIsInvalidArgument(t *testing.T) {
 }
 
 func TestQueryAccountsUnknownCodeIsInvalidArgument(t *testing.T) {
-	srv := NewServer(&stubClient{}, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(&stubClient{}, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	_, err := srv.QueryAccounts(context.Background(), &kafkatbv1.QueryAccountsRequest{Code: "merchant"})
 
@@ -308,7 +308,7 @@ func TestQueryAccountsClientErrorIsUnavailable(t *testing.T) {
 			return nil, errors.New("timeout")
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	_, err := srv.QueryAccounts(context.Background(), &kafkatbv1.QueryAccountsRequest{})
 
@@ -399,7 +399,7 @@ func TestListAccountTransfersForwardPaginationWalksWithoutDuplicatesOrGaps(t *te
 			return filterByTimestamp(all, func(t types.Transfer) uint64 { return t.Timestamp }, f), nil
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 50})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 50}, testLimits())
 
 	order := walkAccountTransfers(t, srv, accountID, 2, false)
 
@@ -423,7 +423,7 @@ func TestListAccountTransfersReversedPaginationWalksWithoutDuplicatesOrGaps(t *t
 			return filterByTimestamp(all, func(t types.Transfer) uint64 { return t.Timestamp }, f), nil
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 50})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 50}, testLimits())
 
 	order := walkAccountTransfers(t, srv, accountID, 2, true)
 
@@ -479,7 +479,7 @@ func TestListAccountBalancesForwardPaginationWalksWithoutDuplicatesOrGaps(t *tes
 			return []types.Account{{ID: accountID, Ledger: 1, Code: 1}}, nil
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 50})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 50}, testLimits())
 
 	order := walkAccountBalances(t, srv, accountID, 2, false)
 
@@ -500,7 +500,7 @@ func TestListAccountBalancesReversedPaginationWalksWithoutDuplicatesOrGaps(t *te
 			return []types.Account{{ID: accountID, Ledger: 1, Code: 1}}, nil
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 50})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 50}, testLimits())
 
 	order := walkAccountBalances(t, srv, accountID, 2, true)
 
@@ -517,7 +517,7 @@ func TestListAccountTransfersReversedCursorAtZeroDoesNotUnderflow(t *testing.T) 
 			return []types.Transfer{{ID: types.ToUint128(1), Ledger: 1, Code: 1, Amount: types.ToUint128(1), Timestamp: 0}}, nil
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	resp, err := srv.ListAccountTransfers(context.Background(), &kafkatbv1.ListAccountTransfersRequest{
 		AccountId: model.FormatID(types.ToUint128(1)),
@@ -538,7 +538,7 @@ func TestListAccountTransfersForwardCursorAtMaxDoesNotWrap(t *testing.T) {
 			return []types.Transfer{{ID: types.ToUint128(1), Ledger: 1, Code: 1, Amount: types.ToUint128(1), Timestamp: math.MaxUint64}}, nil
 		},
 	}
-	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10})
+	srv := NewServer(stub, nil, testRegistry(), config.API{MaxPageSize: 10}, testLimits())
 
 	resp, err := srv.ListAccountTransfers(context.Background(), &kafkatbv1.ListAccountTransfersRequest{
 		AccountId: model.FormatID(types.ToUint128(1)),

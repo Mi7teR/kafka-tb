@@ -3,6 +3,7 @@
 package obs
 
 import (
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -18,7 +19,7 @@ type Metrics struct {
 	DLQTotal     *prometheus.CounterVec
 	BatchSize    prometheus.Histogram
 	TBLatency    *prometheus.HistogramVec
-	CommitLag    prometheus.Gauge
+	CommitLag    *prometheus.GaugeVec
 }
 
 // NewMetrics registers the connector's metrics against reg and returns them.
@@ -43,10 +44,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help:    "Latency of TigerBeetle calls, by operation.",
 			Buckets: prometheus.ExponentialBuckets(0.001, 2, 14),
 		}, []string{"op"}),
-		CommitLag: f.NewGauge(prometheus.GaugeOpts{
+		CommitLag: f.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "kafkatb_offset_commit_lag",
-			Help: "Offset commit lag.",
-		}),
+			Help: "Offsets between the highest tracked record and the committed watermark, by topic/partition.",
+		}, []string{"topic", "partition"}),
 	}
 }
 
@@ -82,4 +83,14 @@ func (m *Metrics) ObserveTBLatency(op string, d time.Duration) {
 		return
 	}
 	m.TBLatency.WithLabelValues(op).Observe(d.Seconds())
+}
+
+// SetCommitLag records, for topic/partition, the gap between the highest
+// offset the sink has ever tracked and the offset it has actually committed
+// to Kafka. No-op on a nil *Metrics.
+func (m *Metrics) SetCommitLag(topic string, partition int32, lag int64) {
+	if m == nil {
+		return
+	}
+	m.CommitLag.WithLabelValues(topic, strconv.Itoa(int(partition))).Set(float64(lag))
 }

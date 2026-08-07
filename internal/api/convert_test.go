@@ -16,6 +16,13 @@ func testRegistry() *model.Registry {
 	})
 }
 
+// testLimits is a generous limits.* config for tests that don't specifically
+// exercise F2's ceilings — large enough that no test payload trips it by
+// accident.
+func testLimits() config.Limits {
+	return config.Limits{MaxEventsPerMessage: 1000, MaxMessageBytes: 1 << 20}
+}
+
 // Кредитовый счёт: баланс = credits - debits.
 func TestAccountBalanceCreditNormal(t *testing.T) {
 	acc := types.Account{

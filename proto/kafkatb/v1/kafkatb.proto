@@ -42,6 +42,9 @@ message WriteResult {
   string id = 1;
   string status = 2; // ok | rejected
   string error = 3;
+  // Human-readable sentence describing the rejection. Populated only when
+  // status == "rejected"; empty on success, since there is nothing to
+  // explain.
   string detail = 4;
 }
 

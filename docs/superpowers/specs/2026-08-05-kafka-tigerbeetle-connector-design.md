@@ -203,7 +203,7 @@ x-kafkatb-attempt-ts
 - Один TB-клиент на процесс, реконнект внутри клиента, наш ретрай сверху с jitter.
 - Идемпотентный продюсер для DLQ и results, `acks=all`.
 - `/healthz` — процесс жив. `/readyz` — TigerBeetle отвечает и consumer в группе.
-- Метрики: `records_total{result}`, `dlq_total{reason,error}`, `tb_batch_size`, `tb_latency_seconds`, `consumer_lag`, `offset_commit_lag`. Рост `dlq_total{reason="poison"}` — сигнал о сломанном продюсере.
+- Метрики: `records_total{result}`, `dlq_total{reason,error}`, `tb_batch_size`, `tb_latency_seconds`, `offset_commit_lag{topic,partition}`. Рост `dlq_total{reason="poison"}` — сигнал о сломанном продюсере. `offset_commit_lag` — разрыв между самым свежим прочитанным офсетом и закоммиченным ватермарком; не путать с брокерским consumer lag (расстояние до конца партиции на брокере) — тот потребовал бы отдельного запроса к брокеру за log-end-offset и здесь не реализован.
 
 ## API
 

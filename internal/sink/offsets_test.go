@@ -353,3 +353,64 @@ func TestMarkCommittedDropsDoneEntries(t *testing.T) {
 	st := o.p[partitionKey{"t", 0}]
 	require.Empty(t, st.done, "done entries below the new committed watermark must be dropped")
 }
+
+// F3: before any commit, committed's -1 sentinel is treated as 0, so lag
+// reports the whole tracked backlog rather than an inflated or negative
+// number.
+func TestCommitLagBeforeAnyCommit(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(0))
+	o.Track(rec(1))
+	o.Done(rec(0))
+
+	require.Equal(t, map[string]map[int32]int64{
+		"t": {0: 2}, // highest(1)+1 - committed(0)
+	}, o.CommitLag())
+}
+
+// F3: lag shrinks to 0 once the sink has fully caught up and committed
+// through the highest offset it has ever seen — the "highest" field must
+// survive done/pending being fully pruned back to empty, not silently reset
+// to 0 and make a caught-up partition look like it has never been read.
+func TestCommitLagZeroAfterFullCatchUp(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(0))
+	o.Track(rec(1))
+	o.Done(rec(0))
+	o.Done(rec(1))
+	o.MarkCommitted(o.Commitable())
+
+	require.Equal(t, map[string]map[int32]int64{
+		"t": {0: 0},
+	}, o.CommitLag())
+}
+
+// F3: a partition still catching up (some records tracked but not yet
+// committed) reports positive lag equal to its backlog, and that backlog
+// grows as more records are tracked.
+func TestCommitLagReflectsInFlightBacklog(t *testing.T) {
+	o := NewOffsets()
+	o.Track(&kgo.Record{Topic: "t", Partition: 0, Offset: 0})
+	o.Track(&kgo.Record{Topic: "t", Partition: 0, Offset: 1})
+	o.Done(&kgo.Record{Topic: "t", Partition: 0, Offset: 0})
+	o.MarkCommitted(o.Commitable()) // committed advances to 1
+
+	require.Equal(t, map[string]map[int32]int64{
+		"t": {0: 1}, // highest(1)+1 - committed(1): offset 1 tracked but not yet done/committed
+	}, o.CommitLag())
+
+	o.Track(&kgo.Record{Topic: "t", Partition: 0, Offset: 2})
+	require.Equal(t, map[string]map[int32]int64{
+		"t": {0: 2}, // highest(2)+1 - committed(1)
+	}, o.CommitLag())
+}
+
+// F3: a forgotten (revoked) partition must not appear in CommitLag —
+// there is nothing left for this consumer to be behind on.
+func TestCommitLagExcludesForgottenPartitions(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(0))
+	o.Forget("t", 0)
+
+	require.Empty(t, o.CommitLag())
+}

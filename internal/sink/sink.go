@@ -392,6 +392,11 @@ func (s *Sink) handle(ctx context.Context, rec *kgo.Record) (done bool, err erro
 func (s *Sink) commit(ctx context.Context, level slog.Level) {
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
+	// Reported regardless of what follows (even "nothing commitable" or a
+	// failed commit below): an operator alerting on this gauge needs it to
+	// reflect the current gap, not go silent whenever there is nothing new
+	// to commit.
+	defer s.reportCommitLag()
 
 	offsets := s.offsets.Commitable()
 	if len(offsets) == 0 {
@@ -430,6 +435,16 @@ func (s *Sink) commit(ctx context.Context, level slog.Level) {
 		return
 	}
 	s.offsets.MarkCommitted(offsets)
+}
+
+// reportCommitLag publishes kafkatb_offset_commit_lag from the offsets
+// tracker's current state, per topic/partition.
+func (s *Sink) reportCommitLag() {
+	for topic, parts := range s.offsets.CommitLag() {
+		for partition, lag := range parts {
+			s.metrics.SetCommitLag(topic, partition, lag)
+		}
+	}
 }
 
 // OnRevoked коммитит перед отдачей партиций: после Forget состояние партиции —

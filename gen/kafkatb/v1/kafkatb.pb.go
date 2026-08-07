@@ -303,11 +303,14 @@ func (x *Transfer) GetTimestamp() uint64 {
 }
 
 type WriteResult struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Status        string                 `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"` // ok | rejected
-	Error         string                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
-	Detail        string                 `protobuf:"bytes,4,opt,name=detail,proto3" json:"detail,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Id     string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Status string                 `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"` // ok | rejected
+	Error  string                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	// Human-readable sentence describing the rejection. Populated only when
+	// status == "rejected"; empty on success, since there is nothing to
+	// explain.
+	Detail        string `protobuf:"bytes,4,opt,name=detail,proto3" json:"detail,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

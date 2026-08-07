@@ -25,7 +25,7 @@ func (s *stubSubmitter) Submit(_ context.Context, cmd *model.Command) ([]tbx.Out
 }
 
 func newTestServer(sub Submitter) *Server {
-	return NewServer(nil, sub, testRegistry(), config.API{MaxPageSize: 1000})
+	return NewServer(nil, sub, testRegistry(), config.API{MaxPageSize: 1000}, testLimits())
 }
 
 func req() *kafkatbv1.CreateTransfersRequest {
@@ -153,6 +153,77 @@ func TestCreateTransfersTooLargeIsInvalidArgument(t *testing.T) {
 	s := newTestServer(&stubSubmitter{err: tbx.ErrCommandTooLarge})
 	_, err := s.CreateTransfers(context.Background(), req())
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+// F2: limits.max_events_per_message must gate the API's command-building
+// path the same way it gates internal/codec/jsonc.Decoder on the Kafka
+// door — otherwise Batcher.Submit's MaxBatchSize is the API's only ceiling,
+// and a tuned-down limits config could leave the API accepting an event
+// count Kafka would reject as poison.
+func TestCreateTransfersOverEventLimitIsInvalidArgument(t *testing.T) {
+	s := NewServer(nil, &stubSubmitter{}, testRegistry(), config.API{MaxPageSize: 10},
+		config.Limits{MaxEventsPerMessage: 2, MaxMessageBytes: 1 << 20})
+	r := &kafkatbv1.CreateTransfersRequest{Transfers: []*kafkatbv1.Transfer{
+		{
+			Id: "0193f8a1-7c2e-7000-8000-000000000001", DebitAccountId: "0193f8a1-0000-7000-8000-000000000010",
+			CreditAccountId: "0193f8a1-0000-7000-8000-000000000020", Amount: "1.00", Ledger: "USD", Code: "customer",
+		},
+		{
+			Id: "0193f8a1-7c2e-7000-8000-000000000002", DebitAccountId: "0193f8a1-0000-7000-8000-000000000010",
+			CreditAccountId: "0193f8a1-0000-7000-8000-000000000020", Amount: "1.00", Ledger: "USD", Code: "customer",
+		},
+		{
+			Id: "0193f8a1-7c2e-7000-8000-000000000003", DebitAccountId: "0193f8a1-0000-7000-8000-000000000010",
+			CreditAccountId: "0193f8a1-0000-7000-8000-000000000020", Amount: "1.00", Ledger: "USD", Code: "customer",
+		},
+	}}
+
+	_, err := s.CreateTransfers(context.Background(), r)
+
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+// F2 mirror for CreateAccounts.
+func TestCreateAccountsOverEventLimitIsInvalidArgument(t *testing.T) {
+	s := NewServer(nil, &stubSubmitter{}, testRegistry(), config.API{MaxPageSize: 10},
+		config.Limits{MaxEventsPerMessage: 2, MaxMessageBytes: 1 << 20})
+	r := &kafkatbv1.CreateAccountsRequest{Accounts: []*kafkatbv1.Account{
+		{Id: "0193f8a1-7c2e-7000-8000-000000000001", Ledger: "USD", Code: "customer"},
+		{Id: "0193f8a1-7c2e-7000-8000-000000000002", Ledger: "USD", Code: "customer"},
+		{Id: "0193f8a1-7c2e-7000-8000-000000000003", Ledger: "USD", Code: "customer"},
+	}}
+
+	_, err := s.CreateAccounts(context.Background(), r)
+
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+// F4: a rejected outcome must carry a human-readable WriteResult.detail —
+// the field must not ship permanently empty. A successful outcome has
+// nothing to explain, so detail stays empty there.
+func TestCreateTransfersRejectionPopulatesDetail(t *testing.T) {
+	sub := &stubSubmitter{outcomes: []tbx.Outcome{
+		{Index: 0, ID: "0193f8a1-7c2e-7000-8000-000000000001", Status: tbx.StatusOK},
+		{Index: 1, ID: "0193f8a1-7c2e-7000-8000-000000000002", Status: tbx.StatusRejected, Error: "exceeds_credits"},
+	}}
+	s := newTestServer(sub)
+	r := &kafkatbv1.CreateTransfersRequest{Transfers: []*kafkatbv1.Transfer{
+		{
+			Id: "0193f8a1-7c2e-7000-8000-000000000001", DebitAccountId: "0193f8a1-0000-7000-8000-000000000010",
+			CreditAccountId: "0193f8a1-0000-7000-8000-000000000020", Amount: "1.00", Ledger: "USD", Code: "customer",
+		},
+		{
+			Id: "0193f8a1-7c2e-7000-8000-000000000002", DebitAccountId: "0193f8a1-0000-7000-8000-000000000010",
+			CreditAccountId: "0193f8a1-0000-7000-8000-000000000020", Amount: "1.00", Ledger: "USD", Code: "customer",
+		},
+	}}
+
+	resp, err := s.CreateTransfers(context.Background(), r)
+
+	require.NoError(t, err)
+	require.Empty(t, resp.Results[0].Detail, "a successful outcome has nothing to explain")
+	require.Contains(t, resp.Results[1].Detail, "0193f8a1-7c2e-7000-8000-000000000002")
+	require.Contains(t, resp.Results[1].Detail, "exceeds credits")
 }
 
 // TestCreateTransfersPostPendingTransferAllowsOmittedAccountIDs pins parity
