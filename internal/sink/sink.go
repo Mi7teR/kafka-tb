@@ -352,11 +352,14 @@ func (s *Sink) handle(ctx context.Context, rec *kgo.Record) (done bool, err erro
 		s.metrics.IncRecords("blocked")
 		return false, serr
 	}
-	for _, o := range outcomes {
-		s.metrics.IncRecords(string(o.Status))
-	}
 
+	// RecordsTotal is counted here, once the record's handling is actually
+	// final, not right after Submit: Results and the reject-DLQ loop below
+	// can still fail and send this same record back through applyRecord for
+	// a retry. Counting ok/rejected before they succeed would double-count
+	// on that retry and never show the intervening failure as blocked.
 	if e := s.em.Results(ctx, rec, outcomes); e != nil {
+		s.metrics.IncRecords("blocked")
 		return false, e
 	}
 	for _, o := range outcomes {
@@ -365,9 +368,13 @@ func (s *Sink) handle(ctx context.Context, rec *kgo.Record) (done bool, err erro
 		}
 		detail := fmt.Sprintf("event %d (id %s): %s", o.Index, o.ID, o.Error)
 		if e := s.em.DLQ(ctx, rec, emit.ReasonReject, o.Error, detail); e != nil {
+			s.metrics.IncRecords("blocked")
 			return false, e
 		}
 		s.metrics.IncDLQ(string(emit.ReasonReject), o.Error)
+	}
+	for _, o := range outcomes {
+		s.metrics.IncRecords(string(o.Status))
 	}
 	return true, nil
 }

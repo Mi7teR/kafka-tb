@@ -18,10 +18,13 @@ func TestMetricsRegisterAndCount(t *testing.T) {
 	require.Equal(t, 1.0, testutil.ToFloat64(m.DLQTotal.WithLabelValues("poison", "decode")))
 }
 
-func TestNewMetricsTwiceOnSameRegistryPanicsNot(t *testing.T) {
+// M4: registering the same metric names twice against the same registry
+// must panic (promauto's documented behaviour on a duplicate registration) —
+// this pins that NewMetrics does not swallow or dedupe that failure.
+func TestNewMetricsTwiceOnSameRegistryPanics(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	NewMetrics(reg)
-	require.NotPanics(t, func() { NewMetrics(prometheus.NewRegistry()) })
+	require.Panics(t, func() { NewMetrics(reg) })
 }
 
 // TestNilMetricsIsNoOp verifies every helper tolerates a nil *Metrics, which

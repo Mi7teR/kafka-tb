@@ -46,6 +46,7 @@ codes:
   payment: 1
 retry: {initial: 100ms, max: 30s, jitter: true}
 shutdown_timeout: 30s
+metrics_addr: ":9464"
 `
 
 func TestLoadValid(t *testing.T) {
@@ -100,6 +101,15 @@ func TestLoadRejectsHostnameAddress(t *testing.T) {
 	require.ErrorContains(t, err, "tigerbeetle.addresses")
 	require.ErrorContains(t, err, "localhost:3000")
 	require.ErrorContains(t, err, "hostnames are not supported")
+}
+
+// Also do this (Task 12 review): metrics_addr moved from a hardcoded
+// literal in main.go into config, validated like the other listen
+// addresses — must not be empty.
+func TestLoadRejectsEmptyMetricsAddr(t *testing.T) {
+	body := replace(validCfg, `metrics_addr: ":9464"`, `metrics_addr: ""`)
+	_, err := Load(writeCfg(t, body))
+	require.ErrorContains(t, err, "metrics_addr")
 }
 
 func TestEnvOverride(t *testing.T) {

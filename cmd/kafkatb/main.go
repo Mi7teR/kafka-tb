@@ -29,12 +29,6 @@ import (
 	"github.com/Mi7teR/kafka-tb/internal/tbx"
 )
 
-// metricsAddr serves /metrics, /healthz and /readyz. It is deliberately not
-// derived from cfg.API.HTTPAddr: that address is already owned by the
-// grpc-gateway REST mux in api/sink modes, and binding both to the same port
-// would fail at startup.
-const metricsAddr = ":9464"
-
 func main() {
 	var cfgPath string
 	flag.StringVar(&cfgPath, "config", "configs/example.yaml", "path to config file")
@@ -54,6 +48,19 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// batcher.Close() below is deliberately unbounded (it waits out any
+	// in-flight TigerBeetle call by design), so a slow shutdown can take a
+	// while. NotifyContext keeps its signal handler registered until stop is
+	// called, which otherwise wouldn't happen until main returns — a second
+	// SIGTERM during that window would be swallowed and only SIGKILL would
+	// work. Calling stop as soon as the first signal lands restores the
+	// default disposition, so a second SIGTERM terminates the process.
+	go func() {
+		<-ctx.Done()
+		stop()
+		log.Info("shutdown signal received, a second SIGTERM will force exit")
+	}()
 
 	if err := run(ctx, cfg, log); err != nil {
 		log.Error("shutdown with error", slog.String("error", err.Error()))
@@ -87,30 +94,35 @@ func (h *sinkHolder) onRevoked(ctx context.Context, revoked map[string][]int32) 
 }
 
 // run wires every component together and tears them down in order once ctx
-// is cancelled (SIGINT/SIGTERM). Shutdown: stop consuming (cl.Close, which
-// runs the revoke callback's final commit), flush and close the DLQ/results
+// is cancelled (SIGINT/SIGTERM), or as soon as it returns early on a
+// construction error. Shutdown: stop consuming (cl.Close, which runs the
+// revoke callback's final commit), flush and close the DLQ/results
 // producer, close the batcher (waits out any in-flight TigerBeetle call by
 // design — see tbx.Batcher.Close), then close the TigerBeetle client. Each
-// server bounds its own graceful drain by cfg.ShutdownTimeout or a fixed
-// internal timeout; run does not impose an additional one so that a
-// synchronous caller is never told a transfer failed when it may have
-// applied.
+// component is closed via defer, registered right after it is successfully
+// built, which both guarantees a construction error never leaks whatever
+// was already started and reproduces that exact order (defers run last-in,
+// first-out). Each server bounds its own graceful drain by
+// cfg.ShutdownTimeout or a fixed internal timeout; run does not impose an
+// additional one so that a synchronous caller is never told a transfer
+// failed when it may have applied.
 func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	tbClient, err := tbx.NewClient(cfg.TigerBeetle)
 	if err != nil {
 		return fmt.Errorf("tigerbeetle client: %w", err)
 	}
+	defer tbClient.Close()
 
 	metrics := obs.NewMetrics(prometheus.DefaultRegisterer)
 
 	batcher := tbx.NewBatcher(tbClient, cfg.Batcher, cfg.Retry, log, metrics)
 	batcher.Start(ctx)
+	defer batcher.Close()
 
 	reg := model.NewRegistry(cfg)
 
 	var (
 		consumer *kgo.Client
-		producer emit.Emitter
 		s        *sink.Sink
 	)
 	var holder sinkHolder
@@ -129,12 +141,15 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		if err != nil {
 			return fmt.Errorf("kafka producer: %w", err)
 		}
-		producer = emit.New(pcl, cfg.Kafka)
+		producer := emit.New(pcl, cfg.Kafka)
+		defer producer.Close()
 
 		consumer, err = sink.NewKafkaClient(cfg, holder.onRevoked)
 		if err != nil {
 			return fmt.Errorf("kafka consumer: %w", err)
 		}
+		defer consumer.Close()
+
 		s = sink.New(cfg, consumer, decoders, batcher, producer, log, metrics)
 		holder.set(s)
 	}
@@ -155,25 +170,15 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 		return nil
 	}
+	metricsSrv := obs.NewServer(cfg.MetricsAddr, ready, log)
 
 	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() error { return obs.Serve(gctx, metricsAddr, ready) })
+	g.Go(func() error { return metricsSrv.Serve(gctx) })
 	if s != nil {
 		g.Go(func() error { s.Run(gctx); return nil })
 	}
 	if apiSrv != nil {
 		g.Go(func() error { return apiSrv.Serve(gctx, cfg.API) })
 	}
-	runErr := g.Wait()
-
-	if consumer != nil {
-		consumer.Close()
-	}
-	if producer != nil {
-		producer.Close()
-	}
-	batcher.Close()
-	tbClient.Close()
-
-	return runErr
+	return g.Wait()
 }

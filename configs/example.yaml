@@ -40,3 +40,7 @@ codes:
 retry: {initial: 100ms, max: 30s, jitter: true}
 # Graceful shutdown timeout
 shutdown_timeout: 30s
+# Listen address for /metrics, /healthz and /readyz. Must not collide with
+# api.http_addr: that port is already owned by the grpc-gateway REST mux in
+# api/sink modes.
+metrics_addr: ":9464"

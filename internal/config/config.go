@@ -79,6 +79,11 @@ type Config struct {
 	Codes           map[string]uint16 `yaml:"codes"`
 	Retry           Retry             `yaml:"retry"`
 	ShutdownTimeout time.Duration     `yaml:"shutdown_timeout"`
+	// MetricsAddr serves /metrics, /healthz and /readyz. It is separate from
+	// api.http_addr: that address is already owned by the grpc-gateway REST
+	// mux in api/sink modes, and binding both to the same port would fail
+	// at startup.
+	MetricsAddr string `yaml:"metrics_addr"`
 }
 
 func (c *Config) LedgerByName(name string) (Ledger, bool) {
@@ -214,6 +219,9 @@ func (c *Config) validate() error {
 	}
 	if c.ShutdownTimeout <= 0 {
 		return fmt.Errorf("shutdown_timeout: must be > 0")
+	}
+	if c.MetricsAddr == "" {
+		return fmt.Errorf("metrics_addr: must not be empty")
 	}
 	if c.Mode != ModeSink {
 		if c.API.GRPCAddr == "" || c.API.HTTPAddr == "" {

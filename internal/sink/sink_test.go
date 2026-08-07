@@ -424,6 +424,50 @@ func TestHandleMetricsByOutcome(t *testing.T) {
 	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("blocked")))
 }
 
+// I1: a Results-write failure is an infrastructure error like any other
+// early return from handle — it must count as blocked, not as ok, and the
+// record must not be counted twice when it is retried later.
+func TestHandleResultsFailureIncrementsBlockedOnceNotOK(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := obs.NewMetrics(reg)
+
+	em := &recordingEmitter{failResults: errors.New("results topic down")}
+	sub := &stubSubmitter{outcomes: []tbx.Outcome{{Index: 0, ID: "id-0", Status: tbx.StatusOK}}}
+	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
+	s.metrics = m
+
+	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	require.Error(t, err)
+	require.False(t, done)
+	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("blocked")))
+	require.Zero(t, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("ok")))
+}
+
+// I1: a record that fails once (infrastructure error) and succeeds on the
+// retry must count "ok" exactly once in total, not once per attempt —
+// counting has to happen at the point handling is actually final, which for
+// a retried record is only the last, successful call to handle.
+func TestProcessBatchRetriedRecordCountsOKOnce(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := obs.NewMetrics(reg)
+
+	em := &recordingEmitter{}
+	sub := &scriptedSubmitter{
+		outcomes: []tbx.Outcome{{Index: 0, ID: "id-0", Status: tbx.StatusOK}},
+		errs:     []error{errors.New("tigerbeetle unavailable"), nil},
+	}
+	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
+	s.metrics = m
+	s.retryPeriod = time.Millisecond
+
+	s.processBatch(context.Background(), []*kgo.Record{srcRec(0, 0)})
+
+	require.Equal(t, 2, sub.calls, "record must have been retried")
+	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("ok")),
+		"ok must be counted exactly once total, not once per attempt")
+	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("blocked")))
+}
+
 func TestProcessBatchMarksEveryRecordDone(t *testing.T) {
 	em := &recordingEmitter{}
 	sub := &stubSubmitter{outcomes: []tbx.Outcome{{Index: 0, ID: "id-0", Status: tbx.StatusOK}}}
