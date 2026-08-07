@@ -12,6 +12,7 @@ import (
 
 	"github.com/Mi7teR/kafka-tb/internal/config"
 	"github.com/Mi7teR/kafka-tb/internal/model"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	types "github.com/tigerbeetle/tigerbeetle-go"
 )
@@ -22,6 +23,15 @@ func transferCmd(n int, tag string) *model.Command {
 	c := &model.Command{Op: model.OpCreateTransfers, Transfers: make([]types.Transfer, n), IDs: make([]string, n)}
 	for i := 0; i < n; i++ {
 		c.Transfers[i] = types.Transfer{ID: types.ToUint128(uint64(i + 1)), Flags: 1} // linked у всех
+		c.IDs[i] = tag + "-" + strconv.Itoa(i)
+	}
+	return c
+}
+
+func accountCmd(n int, tag string) *model.Command {
+	c := &model.Command{Op: model.OpCreateAccounts, Accounts: make([]types.Account, n), IDs: make([]string, n)}
+	for i := 0; i < n; i++ {
+		c.Accounts[i] = types.Account{ID: types.ToUint128(uint64(i + 1)), Flags: 1}
 		c.IDs[i] = tag + "-" + strconv.Itoa(i)
 	}
 	return c
@@ -47,7 +57,8 @@ func TestBatcherNeverSplitsCommand(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			_, err := b.Submit(context.Background(), transferCmd(n, "c"))
-			require.NoError(t, err)
+			// assert, а не require: FailNow из не-тестовой горутины — UB.
+			assert.NoError(t, err)
 		}(n)
 	}
 	wg.Wait()
@@ -72,16 +83,29 @@ func TestBatcherClearsTrailingLinkedPerCommand(t *testing.T) {
 }
 
 func TestBatcherRespectsMaxBatchSize(t *testing.T) {
+	// Linger заведомо длиннее теста: единственный путь к флашу — порог
+	// max_batch_size. Шесть команд по 2 события при max=6 обязаны дать ровно
+	// два батча, каждый упирающийся в границу точно.
 	fc := &fakeClient{}
-	b, _ := startBatcher(t, fc, 5, 20*time.Millisecond)
+	b, _ := startBatcher(t, fc, 6, time.Hour)
+
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 6; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); _, _ = b.Submit(context.Background(), transferCmd(2, "c")) }()
+		go func() {
+			defer wg.Done()
+			out, err := b.Submit(context.Background(), transferCmd(2, "c"))
+			// assert, а не require: FailNow из не-тестовой горутины — UB.
+			assert.NoError(t, err)
+			assert.Len(t, out, 2)
+		}()
 	}
 	wg.Wait()
-	for _, batch := range fc.batches() {
-		require.LessOrEqual(t, len(batch), 5)
+
+	batches := fc.batches()
+	require.Len(t, batches, 2, "size threshold must have flushed exactly two batches")
+	for i, batch := range batches {
+		require.Len(t, batch, 6, "batch %d must fill max_batch_size exactly", i)
 	}
 }
 
@@ -106,10 +130,13 @@ func TestBatcherRoutesResultsToOwner(t *testing.T) {
 
 	var wg sync.WaitGroup
 	var markOut, plainOut []Outcome
+	var markErr, plainErr error
 	wg.Add(2)
-	go func() { defer wg.Done(); markOut, _ = b.Submit(context.Background(), mark) }()
-	go func() { defer wg.Done(); plainOut, _ = b.Submit(context.Background(), plain) }()
+	go func() { defer wg.Done(); markOut, markErr = b.Submit(context.Background(), mark) }()
+	go func() { defer wg.Done(); plainOut, plainErr = b.Submit(context.Background(), plain) }()
 	wg.Wait()
+	require.NoError(t, markErr)
+	require.NoError(t, plainErr)
 
 	require.Equal(t, StatusOK, markOut[0].Status)
 	require.Equal(t, StatusRejected, markOut[1].Status)
@@ -129,6 +156,19 @@ func TestBatcherRetriesInfraError(t *testing.T) {
 	require.Len(t, fc.batches(), 1, "successful batch must be sent exactly once")
 }
 
+func TestBatcherRetriesInfraErrorOnAccounts(t *testing.T) {
+	fc := &fakeClient{failTimes: 3, err: errors.New("connection refused")}
+	b, _ := startBatcher(t, fc, 100, time.Millisecond)
+	out, err := b.Submit(context.Background(), accountCmd(1, "a"))
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Equal(t, StatusOK, out[0].Status)
+
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	require.Len(t, fc.accountBatches, 1, "successful batch must be sent exactly once")
+}
+
 func TestBatcherRejectsOversizedCommand(t *testing.T) {
 	fc := &fakeClient{}
 	b, _ := startBatcher(t, fc, 4, time.Millisecond)
@@ -146,6 +186,73 @@ func TestBatcherSubmitAfterCloseFails(t *testing.T) {
 	b.Close()
 	_, err := b.Submit(context.Background(), transferCmd(1, "c"))
 	require.ErrorIs(t, err, ErrClosed)
+}
+
+// C1: отмена контекста Start останавливает циклы. Отправители, застрявшие
+// на переполненной очереди, обязаны получить выход, иначе Close() виснет
+// и вместе с ним весь shutdown процесса.
+func TestBatcherCloseReturnsWithBlockedSubmitters(t *testing.T) {
+	fc := &fakeClient{}
+	ctx, cancel := context.WithCancel(context.Background())
+	b := NewBatcher(fc, config.Batcher{MaxBatchSize: 10, Linger: time.Hour, MaxQueue: 2},
+		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger())
+	b.Start(ctx)
+
+	cancel()
+	time.Sleep(50 * time.Millisecond) // дать циклам выйти по отмене
+
+	const submitters = 5
+	errs := make(chan error, submitters)
+	for i := 0; i < submitters; i++ {
+		go func() {
+			_, err := b.Submit(context.Background(), transferCmd(1, "c"))
+			errs <- err
+		}()
+	}
+	time.Sleep(50 * time.Millisecond) // дать отправителям заполнить буфер
+
+	closed := make(chan struct{})
+	go func() { b.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() did not return after Start context cancel with blocked submitters")
+	}
+
+	for i := 0; i < submitters; i++ {
+		select {
+		case err := <-errs:
+			require.ErrorIs(t, err, ErrClosed)
+		case <-time.After(2 * time.Second):
+			t.Fatal("Submit did not return after shutdown")
+		}
+	}
+}
+
+// C2: после отмены контекста Start ни один Submit не должен зависнуть
+// на ожидании исхода — иначе сообщение Kafka теряется без ответа.
+func TestBatcherSubmitAfterContextCancelFails(t *testing.T) {
+	fc := &fakeClient{}
+	ctx, cancel := context.WithCancel(context.Background())
+	b := NewBatcher(fc, config.Batcher{MaxBatchSize: 10, Linger: time.Hour, MaxQueue: 8},
+		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger())
+	b.Start(ctx)
+	t.Cleanup(b.Close)
+
+	cancel()
+	time.Sleep(50 * time.Millisecond) // дать циклам выйти по отмене
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := b.Submit(context.Background(), transferCmd(1, "c"))
+		errs <- err
+	}()
+	select {
+	case err := <-errs:
+		require.ErrorIs(t, err, ErrClosed)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Submit hung after Start context was cancelled")
+	}
 }
 
 func TestBatcherAccountsGoToSeparateBatches(t *testing.T) {

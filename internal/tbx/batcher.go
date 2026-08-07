@@ -44,16 +44,19 @@ type Batcher struct {
 	transfers chan *job
 	accounts  chan *job
 
-	// closeMu guards the transition from "accepting" to "closed" against
-	// concurrent Submit calls. Without it, Submit's enqueue select can race
-	// Close(): both "<-closed" and "queue<-j" become ready at once, and if
-	// the send wins, the job lands in a channel no loop is left to drain,
-	// hanging Submit forever. Close takes the write lock so no enqueue can
-	// be in flight when it flips closed and stops the loops.
-	closeMu   sync.RWMutex
-	closeOnce sync.Once
-	closed    chan struct{}
-	wg        sync.WaitGroup
+	// stop — единственный сигнал остановки, общий для всех участников.
+	// Закрывается ровно один раз: либо из Close(), либо при отмене контекста
+	// Start. Оба пути обязаны сходиться сюда — иначе отмена контекста гасит
+	// циклы, а отправители продолжают считать батчер живым и виснут навсегда.
+	// Протокол намеренно бесlock'овый: закрытый канал одинаково виден всем,
+	// поэтому у отправителя всегда есть выход из блокирующего select.
+	stopOnce sync.Once
+	stop     chan struct{}
+	// unwatch снимает подписку на отмену контекста Start.
+	// Устанавливается в Start, читается в Close: обе — вызовы жизненного цикла,
+	// они не пересекаются во времени.
+	unwatch func() bool
+	wg      sync.WaitGroup
 }
 
 func NewBatcher(c Client, cfg config.Batcher, retry config.Retry, log *slog.Logger) *Batcher {
@@ -64,14 +67,16 @@ func NewBatcher(c Client, cfg config.Batcher, retry config.Retry, log *slog.Logg
 		log:       log,
 		transfers: make(chan *job, cfg.MaxQueue),
 		accounts:  make(chan *job, cfg.MaxQueue),
-		closed:    make(chan struct{}),
+		stop:      make(chan struct{}),
 	}
 }
 
 func (b *Batcher) Start(ctx context.Context) {
+	// Отмена контекста — это тот же shutdown, что и Close().
+	b.unwatch = context.AfterFunc(ctx, b.signalStop)
 	b.wg.Add(2)
-	go func() { defer b.wg.Done(); b.loop(ctx, b.transfers, b.sendTransfers) }()
-	go func() { defer b.wg.Done(); b.loop(ctx, b.accounts, b.sendAccounts) }()
+	go func() { defer b.wg.Done(); b.loop(b.transfers, b.sendTransfers) }()
+	go func() { defer b.wg.Done(); b.loop(b.accounts, b.sendAccounts) }()
 }
 
 // Submit ставит команду в очередь и ждёт исход.
@@ -89,53 +94,64 @@ func (b *Batcher) Submit(ctx context.Context, cmd *model.Command) ([]Outcome, er
 		queue = b.accounts
 	}
 
-	// Hold the read lock across the check-and-enqueue: Close() cannot flip
-	// closed and shut down the loops until every in-flight enqueue holding
-	// this lock has finished, so a job that gets sent here is guaranteed a
-	// live loop to receive it (either processed or drained on shutdown).
-	b.closeMu.RLock()
-	if b.isClosed() {
-		b.closeMu.RUnlock()
-		return nil, ErrClosed
-	}
+	// Быстрый отказ, когда батчер уже остановлен: иначе select ниже выбирал бы
+	// между stop и свободным местом в очереди случайно.
 	select {
+	case <-b.stop:
+		return nil, ErrClosed
+	default:
+	}
+
+	// stop обязателен в этом select: без него отправитель, упёршийся в полную
+	// очередь после остановки циклов, блокируется навсегда.
+	select {
+	case <-b.stop:
+		return nil, ErrClosed
 	case <-ctx.Done():
-		b.closeMu.RUnlock()
 		return nil, ctx.Err()
 	case queue <- j:
-		b.closeMu.RUnlock()
 	}
+
 	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
 	case res := <-j.done:
 		return res.outcomes, res.err
+	case <-ctx.Done():
+		// Команда уже в очереди и может дойти до TigerBeetle после этого
+		// возврата: отменить её отсюда нельзя. Вызывающий (Kafka-синк) увидит
+		// ошибку и, скорее всего, повторит команду. Корректность здесь
+		// целиком держится на идемпотентности по id: повтор даёт
+		// TransferExists/AccountExists, а MapTransferResults/MapAccountResults
+		// трактуют их как StatusOK. Это работает только потому, что id
+		// приходят от вызывающего и стабильны между попытками.
+		return nil, ctx.Err()
+	case <-b.stop:
+		// Исход мог быть доставлен ровно в момент остановки — не выбрасываем его.
+		select {
+		case res := <-j.done:
+			return res.outcomes, res.err
+		default:
+		}
+		// Тот же расчёт на идемпотентность, что и в ветке ctx.Done() выше.
+		return nil, ErrClosed
 	}
 }
 
 // Close закрывает приём и дожидается, пока циклы разгребут очереди.
 func (b *Batcher) Close() {
-	b.closeOnce.Do(func() {
-		b.closeMu.Lock()
-		close(b.closed)
-		b.closeMu.Unlock()
-	})
+	b.signalStop()
+	if b.unwatch != nil {
+		b.unwatch()
+	}
 	b.wg.Wait()
 }
 
-// isClosed сообщает, был ли уже вызван Close.
-// Вызывается только под b.closeMu (RLock или Lock).
-func (b *Batcher) isClosed() bool {
-	select {
-	case <-b.closed:
-		return true
-	default:
-		return false
-	}
+// signalStop закрывает stop ровно один раз, откуда бы ни пришёл сигнал.
+func (b *Batcher) signalStop() {
+	b.stopOnce.Do(func() { close(b.stop) })
 }
 
 // loop собирает батч по правилу «max_batch_size или linger, что раньше».
-func (b *Batcher) loop(ctx context.Context, queue chan *job, send func([]*job) error) {
+func (b *Batcher) loop(queue chan *job, send func([]*job) error) {
 	var (
 		batch []*job
 		size  int
@@ -161,11 +177,9 @@ func (b *Batcher) loop(ctx context.Context, queue chan *job, send func([]*job) e
 
 	for {
 		select {
-		case <-ctx.Done():
-			flush()
-			b.drain(queue, ctx.Err())
-			return
-		case <-b.closed:
+		case <-b.stop:
+			// Накопленное всё равно отправляем, остаток очереди отвечаем ошибкой:
+			// каждая команда, попавшая в очередь, получает ровно один исход.
 			flush()
 			b.drain(queue, ErrClosed)
 			return
@@ -250,7 +264,7 @@ func (b *Batcher) sendAccounts(jobs []*job) error {
 	return nil
 }
 
-// call повторяет вызов, пока TigerBeetle не ответит или батчер не закроют.
+// call повторяет вызов, пока TigerBeetle не ответит или батчер не остановят.
 // Ошибка вызова — всегда инфраструктурная: отказ по бизнесу приходит в результатах.
 func (b *Batcher) call(fn func() (any, error)) (any, error) {
 	delay := b.retry.Initial
@@ -262,8 +276,10 @@ func (b *Batcher) call(fn func() (any, error)) (any, error) {
 		b.log.Warn("tigerbeetle call failed, retrying",
 			slog.Int("attempt", attempt), slog.String("error", err.Error()), slog.Duration("in", delay))
 
+		// stop, а не только Close: при отмене контекста и лежащем TigerBeetle
+		// ретраи иначе крутятся вечно, батч не завершается, горутина течёт.
 		select {
-		case <-b.closed:
+		case <-b.stop:
 			return nil, ErrClosed
 		case <-time.After(b.jitter(delay)):
 		}

@@ -56,7 +56,9 @@ func BenchmarkBatcherAssemble(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			if _, err := bt.Submit(ctx, cmd); err != nil {
-				b.Fatal(err)
+				// b.Error, а не b.Fatal: FailNow из не-бенчмарочной горутины — UB.
+				b.Error(err)
+				return
 			}
 		}
 	})

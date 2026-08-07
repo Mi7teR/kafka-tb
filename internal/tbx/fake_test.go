@@ -41,6 +41,10 @@ func (f *fakeClient) CreateTransfers(ts []types.Transfer) ([]types.CreateTransfe
 func (f *fakeClient) CreateAccounts(as []types.Account) ([]types.CreateAccountResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failTimes > 0 {
+		f.failTimes--
+		return nil, f.err
+	}
 	cp := make([]types.Account, len(as))
 	copy(cp, as)
 	f.accountBatches = append(f.accountBatches, cp)
