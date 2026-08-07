@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	kafkatbv1 "github.com/Mi7teR/kafka-tb/gen/kafkatb/v1"
@@ -16,14 +17,24 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// httpShutdownTimeout bounds how long Serve waits for in-flight HTTP
-// requests to drain once the context is cancelled.
-const httpShutdownTimeout = 10 * time.Second
+// shutdownTimeout bounds how long Serve waits, once ctx is cancelled or
+// either server exits early, for gRPC's GracefulStop and HTTP's Shutdown to
+// drain in-flight requests before Serve returns regardless of their state.
+// Var (not const) so tests can shrink it instead of waiting out the full
+// bound.
+var shutdownTimeout = 10 * time.Second
 
 // Serve поднимает gRPC на cfg.GRPCAddr и REST/JSON-шлюз (сгенерированный из
-// того же proto) на cfg.HTTPAddr, гасит оба по отмене ctx и возвращает
-// управление только после того, как оба остановились.
-func (s *Server) Serve(ctx context.Context, cfg config.API) error {
+// того же proto) на cfg.HTTPAddr и возвращает управление, когда оба
+// остановились — по отмене ctx или по ранней ошибке любого из двух серверов.
+// Остановка ограничена shutdownTimeout и не ждёт зависшие RPC: gRPC получает
+// GracefulStop, а если тот не укладывается в срок — Stop() без ожидания
+// результата (сам зависший обработчик, например Submit внутри
+// Batcher.Close, может и не вернуться — это не в силах Go остановить
+// принудительно); HTTP получает Shutdown с тем же дедлайном, конкурентно с
+// gRPC, а не после него. На любом раннем выходе (до старта серверов)
+// закрывает уже занятые слушатели, чтобы порт не оставался занятым.
+func (s *Server) Serve(ctx context.Context, cfg config.API) (err error) {
 	grpcSrv := grpc.NewServer()
 	kafkatbv1.RegisterLedgerServer(grpcSrv, s)
 
@@ -31,9 +42,14 @@ func (s *Server) Serve(ctx context.Context, cfg config.API) error {
 	if err != nil {
 		return fmt.Errorf("listen grpc: %w", err)
 	}
+	defer func() {
+		if err != nil {
+			_ = lis.Close()
+		}
+	}()
 
 	mux := runtime.NewServeMux()
-	if err := kafkatbv1.RegisterLedgerHandlerFromEndpoint(ctx, mux, lis.Addr().String(),
+	if err := kafkatbv1.RegisterLedgerHandlerFromEndpoint(ctx, mux, dialAddr(lis),
 		[]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}); err != nil {
 		return fmt.Errorf("register gateway: %w", err)
 	}
@@ -43,21 +59,76 @@ func (s *Server) Serve(ctx context.Context, cfg config.API) error {
 	if err != nil {
 		return fmt.Errorf("listen http: %w", err)
 	}
+	defer func() {
+		if err != nil {
+			_ = httpLis.Close()
+		}
+	}()
 
-	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() error { return grpcSrv.Serve(lis) })
-	g.Go(func() error {
-		if err := httpSrv.Serve(httpLis); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
+	// grpcSrv.Serve blocks past GracefulStop/Stop until every in-flight RPC
+	// handler returns (see grpc-go's Server.stop), so a stuck handler can
+	// keep this goroutine alive forever. It is intentionally not joined via
+	// an errgroup.Wait: doing so would make Serve's own return wait on it
+	// too. The buffered channel lets the goroutine exit (or leak) without
+	// anyone needing to receive from it.
+	grpcErrCh := make(chan error, 1)
+	go func() { grpcErrCh <- grpcSrv.Serve(lis) }()
+
+	httpErrCh := make(chan error, 1)
+	go func() {
+		err := httpSrv.Serve(httpLis)
+		if err != nil && errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		httpErrCh <- err
+	}()
+
+	var serveErr error
+	select {
+	case <-ctx.Done():
+	case serveErr = <-grpcErrCh:
+	case serveErr = <-httpErrCh:
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
+	defer cancel()
+
+	var sg errgroup.Group
+	sg.Go(func() error {
+		stopped := make(chan struct{})
+		go func() {
+			grpcSrv.GracefulStop()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-shutdownCtx.Done():
+			// GracefulStop is still waiting on an in-flight RPC handler
+			// (e.g. Submit blocked inside Batcher.Close's TigerBeetle
+			// call). Force-stop without waiting for it: the handler may
+			// still never return, but Serve must not hang on it.
+			go grpcSrv.Stop()
 		}
 		return nil
 	})
-	g.Go(func() error {
-		<-gctx.Done()
-		grpcSrv.GracefulStop()
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(gctx), httpShutdownTimeout)
-		defer cancel()
-		return httpSrv.Shutdown(shutdownCtx)
-	})
-	return g.Wait()
+	sg.Go(func() error { return httpSrv.Shutdown(shutdownCtx) })
+
+	if shutdownErr := sg.Wait(); shutdownErr != nil && serveErr == nil {
+		serveErr = shutdownErr
+	}
+	return serveErr
+}
+
+// dialAddr returns the address the gateway mux dials to reach the gRPC
+// server. lis.Addr() is a wildcard (e.g. "[::]:9090") for the documented
+// production config ("grpc_addr: \":9090\""); dialing a wildcard back is a
+// historically flaky pattern on Linux, the deployment target. Dial loopback
+// on the listener's actual port instead; a host-specific listener (as used
+// in tests) is dialed as-is.
+func dialAddr(lis net.Listener) string {
+	tcpAddr, ok := lis.Addr().(*net.TCPAddr)
+	if !ok || !tcpAddr.IP.IsUnspecified() {
+		return lis.Addr().String()
+	}
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(tcpAddr.Port))
 }

@@ -10,6 +10,7 @@ import (
 
 	kafkatbv1 "github.com/Mi7teR/kafka-tb/gen/kafkatb/v1"
 	"github.com/Mi7teR/kafka-tb/internal/config"
+	"github.com/Mi7teR/kafka-tb/internal/model"
 	"github.com/Mi7teR/kafka-tb/internal/tbx"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -103,5 +104,87 @@ func TestServeServesGRPCAndRESTAndStopsOnCancel(t *testing.T) {
 		require.NoError(t, err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return after context cancellation")
+	}
+}
+
+// TestServeReleasesGRPCListenerOnHTTPBindFailure reproduces C1: if the HTTP
+// listener fails to bind after the gRPC listener already succeeded, Serve
+// must close the gRPC listener before returning — otherwise the port stays
+// bound and a supervisor's retry leaks a socket per attempt.
+func TestServeReleasesGRPCListenerOnHTTPBindFailure(t *testing.T) {
+	grpcAddr := freeAddr(t)
+	httpAddr := freeAddr(t)
+
+	// Occupy the HTTP address so Serve's own httpLis bind fails.
+	blocker, err := net.Listen("tcp", httpAddr)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Close() }()
+
+	srv := NewServer(nil, &stubSubmitter{}, testRegistry(), config.API{MaxPageSize: 10})
+	err = srv.Serve(context.Background(), config.API{GRPCAddr: grpcAddr, HTTPAddr: httpAddr, MaxPageSize: 10})
+	require.Error(t, err)
+
+	// If the gRPC listener leaked, this rebind fails with "address already
+	// in use".
+	lis, err := net.Listen("tcp", grpcAddr)
+	require.NoError(t, err, "grpc listener should have been released after Serve failed")
+	require.NoError(t, lis.Close())
+}
+
+// blockingSubmitter simulates Batcher.Close waiting on an in-flight
+// TigerBeetle call: Submit never returns and ignores context cancellation,
+// exactly the scenario I2 describes — a CreateTransfers stuck inside Submit
+// hangs GracefulStop.
+type blockingSubmitter struct {
+	started chan struct{}
+}
+
+func (b *blockingSubmitter) Submit(context.Context, *model.Command) ([]tbx.Outcome, error) {
+	close(b.started)
+	select {} // blocks forever; nothing can force this goroutine to return.
+}
+
+// TestServeShutdownIsBoundedByStuckRPC reproduces I2: an RPC parked inside
+// Submit must not stop Serve from returning once ctx is cancelled — the
+// shutdown has to be bounded even when GracefulStop can't finish.
+func TestServeShutdownIsBoundedByStuckRPC(t *testing.T) {
+	orig := shutdownTimeout
+	shutdownTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { shutdownTimeout = orig })
+
+	grpcAddr := freeAddr(t)
+	httpAddr := freeAddr(t)
+
+	sub := &blockingSubmitter{started: make(chan struct{})}
+	srv := NewServer(nil, sub, testRegistry(), config.API{MaxPageSize: 10})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- srv.Serve(ctx, config.API{GRPCAddr: grpcAddr, HTTPAddr: httpAddr, MaxPageSize: 10})
+	}()
+
+	waitForDial(t, grpcAddr)
+	waitForDial(t, httpAddr)
+
+	conn, err := grpc.NewClient(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	client := kafkatbv1.NewLedgerClient(conn)
+	go func() { _, _ = client.CreateTransfers(context.Background(), req()) }()
+
+	select {
+	case <-sub.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RPC never reached Submit")
+	}
+
+	cancel()
+	select {
+	case err := <-serveDone:
+		require.NoError(t, err)
+	case <-time.After(shutdownTimeout + 5*time.Second):
+		t.Fatal("Serve did not return within the shutdown bound")
 	}
 }

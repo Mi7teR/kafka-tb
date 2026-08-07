@@ -98,7 +98,7 @@ func (s *Server) transferFromProto(pt *kafkatbv1.Transfer) (types.Transfer, erro
 	}
 	if pt.GetUserData_128() != "" {
 		if t.UserData128, err = model.ParseID(pt.GetUserData_128()); err != nil {
-			return t, err
+			return t, fmt.Errorf("user_data_128: %w", err)
 		}
 	}
 	t.UserData64 = pt.GetUserData_64()
