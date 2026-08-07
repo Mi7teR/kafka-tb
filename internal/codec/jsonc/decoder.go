@@ -70,7 +70,6 @@ func (d *Decoder) Decode(payload []byte) (cmd *model.Command, err error) {
 	var m message
 	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.DisallowUnknownFields()
-	dec.UseNumber()
 	if err := dec.Decode(&m); err != nil {
 		return nil, codec.Poison("json: %v", err)
 	}
@@ -138,6 +137,20 @@ func (d *Decoder) transfer(jt jsonTransfer) (types.Transfer, error) {
 		}
 		if t.PendingID, err = model.ParseID(jt.PendingID); err != nil {
 			return t, err
+		}
+		// debit/credit account IDs are optional here: if the producer
+		// supplies them, TigerBeetle asserts they match the pending
+		// transfer's accounts. Forward them when present, leave zero
+		// when omitted.
+		if jt.DebitAccountID != "" {
+			if t.DebitAccountID, err = model.ParseID(jt.DebitAccountID); err != nil {
+				return t, err
+			}
+		}
+		if jt.CreditAccountID != "" {
+			if t.CreditAccountID, err = model.ParseID(jt.CreditAccountID); err != nil {
+				return t, err
+			}
 		}
 	} else {
 		if jt.PendingID != "" {

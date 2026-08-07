@@ -64,6 +64,39 @@ func TestDecodeClearsTrailingLinked(t *testing.T) {
 	require.Zero(t, last.Flags&uint16(1), "trailing linked flag must be cleared")
 }
 
+// Пост/войд-перевод может нести debit/credit account id как ассерт
+// TigerBeetle-у, что они совпадают со счетами pending-перевода: декодер
+// обязан их прокинуть, а не обнулить.
+func TestDecodePostPendingForwardsAccountIDs(t *testing.T) {
+	body := `{"operation":"create_transfers","transfers":[
+	  {"id":"0193f8a1-7c2e-7000-8000-000000000001",
+	   "pending_id":"0193f8a1-7c2e-7000-8000-000000000099",
+	   "debit_account_id":"0193f8a1-0000-7000-8000-000000000010",
+	   "credit_account_id":"0193f8a1-0000-7000-8000-000000000020",
+	   "amount":"12.34","ledger":"USD","code":"payment","flags":["post_pending_transfer"]}
+	]}`
+	cmd, err := newDecoder(t).Decode([]byte(body))
+	require.NoError(t, err)
+	require.Len(t, cmd.Transfers, 1)
+	require.NotZero(t, cmd.Transfers[0].DebitAccountID)
+	require.NotZero(t, cmd.Transfers[0].CreditAccountID)
+}
+
+// Когда продюсер не указывает debit/credit account id на пост/войде, они
+// должны остаться нулевыми, а не быть обязательными.
+func TestDecodePostPendingAllowsOmittedAccountIDs(t *testing.T) {
+	body := `{"operation":"create_transfers","transfers":[
+	  {"id":"0193f8a1-7c2e-7000-8000-000000000001",
+	   "pending_id":"0193f8a1-7c2e-7000-8000-000000000099",
+	   "amount":"12.34","ledger":"USD","code":"payment","flags":["void_pending_transfer"]}
+	]}`
+	cmd, err := newDecoder(t).Decode([]byte(body))
+	require.NoError(t, err)
+	require.Len(t, cmd.Transfers, 1)
+	require.Zero(t, cmd.Transfers[0].DebitAccountID)
+	require.Zero(t, cmd.Transfers[0].CreditAccountID)
+}
+
 func TestDecodeAccounts(t *testing.T) {
 	body := `{"operation":"create_accounts","accounts":[
 	  {"id":"0193f8a1-0000-7000-8000-000000000010","ledger":"USD","code":"payment","flags":["history"]}]}`
@@ -84,8 +117,15 @@ func TestDecodePoison(t *testing.T) {
 		"unknown flag":      strings.Replace(okTransfers, `"linked"`, `"teleport"`, 1),
 		"empty array":       `{"operation":"create_transfers","transfers":[]}`,
 		"unknown operation": `{"operation":"drop_database","transfers":[]}`,
-		"mixed operations":  `{"operation":"create_transfers","transfers":[],"accounts":[]}`,
-		"zero id":           strings.Replace(okTransfers, `"0193f8a1-7c2e-7000-8000-000000000001"`, `"00000000-0000-0000-0000-000000000000"`, 1),
+		"mixed operations": `{"operation":"create_transfers","transfers":[
+		  {"id":"0193f8a1-7c2e-7000-8000-000000000001",
+		   "debit_account_id":"0193f8a1-0000-7000-8000-000000000010",
+		   "credit_account_id":"0193f8a1-0000-7000-8000-000000000020",
+		   "amount":"12.34","ledger":"USD","code":"payment","flags":[]}
+		],"accounts":[
+		  {"id":"0193f8a1-0000-7000-8000-000000000010","ledger":"USD","code":"payment","flags":[]}
+		]}`,
+		"zero id": strings.Replace(okTransfers, `"0193f8a1-7c2e-7000-8000-000000000001"`, `"00000000-0000-0000-0000-000000000000"`, 1),
 	}
 	d := newDecoder(t)
 	for name, body := range cases {
