@@ -1524,9 +1524,11 @@ git commit -m "feat(codec): add decoder interface and strict json decoder"
 - Consumes: `model.Command`.
 - Produces:
   - `tbx.Status` — `StatusOK`, `StatusRejected`; тип `tbx.Outcome{Index int; ID string; Status Status; Error string; Timestamp uint64}`.
-  - `tbx.MapTransferResults(cmd *model.Command, results []types.CreateTransferResult, offset int) ([]Outcome, error)`.
-  - `tbx.MapAccountResults(cmd *model.Command, results []types.CreateAccountResult, offset int) ([]Outcome, error)`.
-  - `tbx.ErrResultCountMismatch` — ответ TigerBeetle не совпал по длине с отправленным батчем.
+  - `tbx.MapTransferResults(cmd *model.Command, results []types.CreateTransferResult, offset, batchSize int) ([]Outcome, error)`.
+  - `tbx.MapAccountResults(cmd *model.Command, results []types.CreateAccountResult, offset, batchSize int) ([]Outcome, error)`.
+  - `tbx.ErrResultCountMismatch` — длина ответа TigerBeetle не равна размеру отправленного батча.
+
+**Контракт длины:** клиент TigerBeetle возвращает плотный массив ровно на `batchSize` элементов; пустой массив приходит только на пустой запрос. Поэтому `len(results) != batchSize` — всегда `ErrResultCountMismatch`, включая пустой ответ на непустой батч. Проверять только «влезает ли моё окно» нельзя: чужой или устаревший ответ подходящей длины молча припишет исходы не тем платежам.
   - `tbx.Client` — интерфейс `CreateTransfers([]types.Transfer) ([]types.CreateTransferResult, error)`, `CreateAccounts([]types.Account) ([]types.CreateAccountResult, error)`, `LookupAccounts([]types.Uint128) ([]types.Account, error)`, `LookupTransfers([]types.Uint128) ([]types.Transfer, error)`, `GetAccountTransfers(types.AccountFilter) ([]types.Transfer, error)`, `GetAccountBalances(types.AccountFilter) ([]types.AccountBalance, error)`, `QueryAccounts(types.QueryFilter) ([]types.Account, error)`, `QueryTransfers(types.QueryFilter) ([]types.Transfer, error)`, `Close()`.
   - `tbx.NewClient(cfg config.TigerBeetle) (Client, error)`.
 
@@ -1843,7 +1845,7 @@ func BenchmarkMapResults(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := MapTransferResults(c, res, 0); err != nil {
+		if _, err := MapTransferResults(c, res, 0, n); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -2331,7 +2333,7 @@ func (b *Batcher) sendTransfers(jobs []*job) error {
 	}
 	typed, _ := results.([]types.CreateTransferResult)
 	for i, j := range jobs {
-		outcomes, mapErr := MapTransferResults(j.cmd, typed, offsets[i])
+		outcomes, mapErr := MapTransferResults(j.cmd, typed, offsets[i], len(events))
 		j.done <- submitResult{outcomes: outcomes, err: mapErr}
 	}
 	return nil
@@ -2352,7 +2354,7 @@ func (b *Batcher) sendAccounts(jobs []*job) error {
 	}
 	typed, _ := results.([]types.CreateAccountResult)
 	for i, j := range jobs {
-		outcomes, mapErr := MapAccountResults(j.cmd, typed, offsets[i])
+		outcomes, mapErr := MapAccountResults(j.cmd, typed, offsets[i], len(events))
 		j.done <- submitResult{outcomes: outcomes, err: mapErr}
 	}
 	return nil
