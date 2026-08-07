@@ -225,7 +225,7 @@ func runSink(t *testing.T, ctx context.Context, cfg *config.Config, tb tbx.Clien
 
 	runCtx, cancel := context.WithCancel(ctx)
 
-	batcher := tbx.NewBatcher(tb, cfg.Batcher, cfg.Retry, log)
+	batcher := tbx.NewBatcher(tb, cfg.Batcher, cfg.Retry, log, nil)
 	batcher.Start(runCtx)
 
 	reg := model.NewRegistry(cfg)
@@ -248,7 +248,7 @@ func runSink(t *testing.T, ctx context.Context, cfg *config.Config, tb tbx.Clien
 	var holder sinkHolder
 	cl, err := sink.NewKafkaClient(cfg, holder.onRevoked)
 	require.NoError(t, err)
-	s := sink.New(cfg, cl, decoders, batcher, em, log)
+	s := sink.New(cfg, cl, decoders, batcher, em, log, nil)
 	holder.set(s)
 
 	done := make(chan struct{})
@@ -301,7 +301,7 @@ func runSinkAbrupt(t *testing.T, cfg *config.Config, tb tbx.Client) (kill func()
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
-	batcher := tbx.NewBatcher(tb, cfg.Batcher, cfg.Retry, log)
+	batcher := tbx.NewBatcher(tb, cfg.Batcher, cfg.Retry, log, nil)
 	batcher.Start(context.Background())
 
 	reg := model.NewRegistry(cfg)
@@ -322,7 +322,7 @@ func runSinkAbrupt(t *testing.T, cfg *config.Config, tb tbx.Client) (kill func()
 	// graceful path under another name.
 	cl, err := sink.NewKafkaClient(cfg, func(context.Context, map[string][]int32) {})
 	require.NoError(t, err)
-	s := sink.New(cfg, cl, decoders, batcher, em, log)
+	s := sink.New(cfg, cl, decoders, batcher, em, log, nil)
 
 	done := make(chan struct{})
 	go func() {

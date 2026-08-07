@@ -12,6 +12,9 @@ import (
 
 	"github.com/Mi7teR/kafka-tb/internal/config"
 	"github.com/Mi7teR/kafka-tb/internal/model"
+	"github.com/Mi7teR/kafka-tb/internal/obs"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	types "github.com/tigerbeetle/tigerbeetle-go"
@@ -41,7 +44,7 @@ func startBatcher(t *testing.T, fc *fakeClient, maxBatch int, linger time.Durati
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	b := NewBatcher(fc, config.Batcher{MaxBatchSize: maxBatch, Linger: linger, MaxQueue: 128},
-		config.Retry{Initial: time.Millisecond, Max: 10 * time.Millisecond}, testLogger())
+		config.Retry{Initial: time.Millisecond, Max: 10 * time.Millisecond}, testLogger(), nil)
 	b.Start(ctx)
 	t.Cleanup(func() { cancel(); b.Close() })
 	return b, cancel
@@ -180,7 +183,7 @@ func TestBatcherSubmitAfterCloseFails(t *testing.T) {
 	fc := &fakeClient{}
 	ctx, cancel := context.WithCancel(context.Background())
 	b := NewBatcher(fc, config.Batcher{MaxBatchSize: 10, Linger: time.Millisecond, MaxQueue: 8},
-		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger())
+		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger(), nil)
 	b.Start(ctx)
 	cancel()
 	b.Close()
@@ -195,7 +198,7 @@ func TestBatcherCloseReturnsWithBlockedSubmitters(t *testing.T) {
 	fc := &fakeClient{}
 	ctx, cancel := context.WithCancel(context.Background())
 	b := NewBatcher(fc, config.Batcher{MaxBatchSize: 10, Linger: time.Hour, MaxQueue: 2},
-		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger())
+		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger(), nil)
 	b.Start(ctx)
 
 	cancel()
@@ -235,7 +238,7 @@ func TestBatcherSubmitAfterContextCancelFails(t *testing.T) {
 	fc := &fakeClient{}
 	ctx, cancel := context.WithCancel(context.Background())
 	b := NewBatcher(fc, config.Batcher{MaxBatchSize: 10, Linger: time.Hour, MaxQueue: 8},
-		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger())
+		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger(), nil)
 	b.Start(ctx)
 	t.Cleanup(b.Close)
 
@@ -267,7 +270,7 @@ func TestBatcherCloseDeliversOutcomeForInFlightBatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	b := NewBatcher(fc, config.Batcher{MaxBatchSize: 10, Linger: 5 * time.Millisecond, MaxQueue: 8},
-		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger())
+		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger(), nil)
 	b.Start(ctx)
 
 	type result struct {
@@ -324,4 +327,33 @@ func TestBatcherAccountsGoToSeparateBatches(t *testing.T) {
 	defer fc.mu.Unlock()
 	require.Len(t, fc.accountBatches, 1)
 	require.Len(t, fc.transferBatches, 1)
+}
+
+// TestBatcherRecordsMetrics verifies sendTransfers/sendAccounts actually
+// observe BatchSize and TBLatency on a real registry, not just that the
+// constructor accepts a *obs.Metrics argument.
+func TestBatcherRecordsMetrics(t *testing.T) {
+	fc := &fakeClient{}
+	reg := prometheus.NewRegistry()
+	m := obs.NewMetrics(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	b := NewBatcher(fc, config.Batcher{MaxBatchSize: 10, Linger: 5 * time.Millisecond, MaxQueue: 8},
+		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger(), m)
+	b.Start(ctx)
+	t.Cleanup(func() { cancel(); b.Close() })
+
+	_, err := b.Submit(context.Background(), transferCmd(2, "t"))
+	require.NoError(t, err)
+	_, err = b.Submit(context.Background(), accountCmd(1, "a"))
+	require.NoError(t, err)
+
+	var batchSize dto.Metric
+	require.NoError(t, m.BatchSize.Write(&batchSize))
+	require.Equal(t, uint64(2), batchSize.GetHistogram().GetSampleCount(), "expected two batches observed")
+
+	var transferLatency, accountLatency dto.Metric
+	require.NoError(t, m.TBLatency.WithLabelValues(string(model.OpCreateTransfers)).(prometheus.Metric).Write(&transferLatency))
+	require.NoError(t, m.TBLatency.WithLabelValues(string(model.OpCreateAccounts)).(prometheus.Metric).Write(&accountLatency))
+	require.Equal(t, uint64(1), transferLatency.GetHistogram().GetSampleCount())
+	require.Equal(t, uint64(1), accountLatency.GetHistogram().GetSampleCount())
 }

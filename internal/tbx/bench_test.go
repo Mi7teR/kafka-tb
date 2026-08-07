@@ -45,7 +45,7 @@ func transferCmdBench(n int) *model.Command {
 func BenchmarkBatcherAssemble(b *testing.B) {
 	fc := &fakeClient{}
 	bt := NewBatcher(fc, config.Batcher{MaxBatchSize: 8189, Linger: time.Millisecond, MaxQueue: 1024},
-		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger())
+		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() { cancel(); bt.Close() }()
 	bt.Start(ctx)

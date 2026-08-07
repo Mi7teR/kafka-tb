@@ -10,6 +10,7 @@ import (
 
 	"github.com/Mi7teR/kafka-tb/internal/config"
 	"github.com/Mi7teR/kafka-tb/internal/model"
+	"github.com/Mi7teR/kafka-tb/internal/obs"
 	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
@@ -36,10 +37,11 @@ type submitResult struct {
 // Держит по одному in-flight батчу на каждый тип операции, чем гарантирует,
 // что порядок применения совпадает с порядком Submit.
 type Batcher struct {
-	client Client
-	cfg    config.Batcher
-	retry  config.Retry
-	log    *slog.Logger
+	client  Client
+	cfg     config.Batcher
+	retry   config.Retry
+	log     *slog.Logger
+	metrics *obs.Metrics
 
 	transfers chan *job
 	accounts  chan *job
@@ -68,12 +70,13 @@ type Batcher struct {
 	wg      sync.WaitGroup
 }
 
-func NewBatcher(c Client, cfg config.Batcher, retry config.Retry, log *slog.Logger) *Batcher {
+func NewBatcher(c Client, cfg config.Batcher, retry config.Retry, log *slog.Logger, metrics *obs.Metrics) *Batcher {
 	return &Batcher{
 		client:    c,
 		cfg:       cfg,
 		retry:     retry,
 		log:       log,
+		metrics:   metrics,
 		transfers: make(chan *job, cfg.MaxQueue),
 		accounts:  make(chan *job, cfg.MaxQueue),
 		stop:      make(chan struct{}),
@@ -273,7 +276,10 @@ func (b *Batcher) sendTransfers(jobs []*job) error {
 		events[len(events)-1].Flags &^= linkedBit
 	}
 
+	b.metrics.ObserveBatchSize(len(events))
+	start := time.Now()
 	results, err := b.call(func() (any, error) { return b.client.CreateTransfers(events) })
+	b.metrics.ObserveTBLatency(string(model.OpCreateTransfers), time.Since(start))
 	if err != nil {
 		return err
 	}
@@ -294,7 +300,10 @@ func (b *Batcher) sendAccounts(jobs []*job) error {
 		events[len(events)-1].Flags &^= linkedBit
 	}
 
+	b.metrics.ObserveBatchSize(len(events))
+	start := time.Now()
 	results, err := b.call(func() (any, error) { return b.client.CreateAccounts(events) })
+	b.metrics.ObserveTBLatency(string(model.OpCreateAccounts), time.Since(start))
 	if err != nil {
 		return err
 	}

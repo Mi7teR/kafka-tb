@@ -12,6 +12,7 @@ import (
 	"github.com/Mi7teR/kafka-tb/internal/config"
 	"github.com/Mi7teR/kafka-tb/internal/emit"
 	"github.com/Mi7teR/kafka-tb/internal/model"
+	"github.com/Mi7teR/kafka-tb/internal/obs"
 	"github.com/Mi7teR/kafka-tb/internal/tbx"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -62,6 +63,7 @@ type Sink struct {
 	em       emitterIface
 	offsets  *Offsets
 	log      *slog.Logger
+	metrics  *obs.Metrics
 
 	pollSize        int
 	commitPeriod    time.Duration
@@ -83,6 +85,7 @@ func New(
 	sub Submitter,
 	em emitterIface,
 	log *slog.Logger,
+	metrics *obs.Metrics,
 ) *Sink {
 	return &Sink{
 		cl:              cl,
@@ -92,6 +95,7 @@ func New(
 		em:              em,
 		offsets:         NewOffsets(),
 		log:             log,
+		metrics:         metrics,
 		pollSize:        cfg.Batcher.MaxBatchSize,
 		commitPeriod:    defaultCommitPeriod,
 		retryPeriod:     defaultRetryPeriod,
@@ -301,17 +305,23 @@ func (s *Sink) handle(ctx context.Context, rec *kgo.Record) (done bool, err erro
 		s.log.Error("panic handling record", slog.Any("panic", r),
 			slog.String("topic", rec.Topic), slog.Int64("offset", rec.Offset))
 		if e := s.em.DLQ(ctx, rec, emit.ReasonPoison, "panic", fmt.Sprint(r)); e != nil {
+			s.metrics.IncRecords("blocked")
 			done, err = false, e
 			return
 		}
+		s.metrics.IncRecords("poison")
+		s.metrics.IncDLQ(string(emit.ReasonPoison), "panic")
 		done, err = true, nil
 	}()
 
 	dec, derr := s.decoders.For(rec.Topic)
 	if derr != nil {
 		if e := s.em.DLQ(ctx, rec, emit.ReasonPoison, "unknown_topic", derr.Error()); e != nil {
+			s.metrics.IncRecords("blocked")
 			return false, e
 		}
+		s.metrics.IncRecords("poison")
+		s.metrics.IncDLQ(string(emit.ReasonPoison), "unknown_topic")
 		return true, nil
 	}
 
@@ -320,8 +330,11 @@ func (s *Sink) handle(ctx context.Context, rec *kgo.Record) (done bool, err erro
 		// Контракт codec.Decoder: любая ошибка декодинга — poison. Считать
 		// её инфраструктурной значило бы повторять запись вечно.
 		if e := s.em.DLQ(ctx, rec, emit.ReasonPoison, "decode", derr.Error()); e != nil {
+			s.metrics.IncRecords("blocked")
 			return false, e
 		}
+		s.metrics.IncRecords("poison")
+		s.metrics.IncDLQ(string(emit.ReasonPoison), "decode")
 		return true, nil
 	}
 
@@ -329,11 +342,18 @@ func (s *Sink) handle(ctx context.Context, rec *kgo.Record) (done bool, err erro
 	if serr != nil {
 		if errors.Is(serr, tbx.ErrCommandTooLarge) {
 			if e := s.em.DLQ(ctx, rec, emit.ReasonPoison, "command_too_large", serr.Error()); e != nil {
+				s.metrics.IncRecords("blocked")
 				return false, e
 			}
+			s.metrics.IncRecords("poison")
+			s.metrics.IncDLQ(string(emit.ReasonPoison), "command_too_large")
 			return true, nil
 		}
+		s.metrics.IncRecords("blocked")
 		return false, serr
+	}
+	for _, o := range outcomes {
+		s.metrics.IncRecords(string(o.Status))
 	}
 
 	if e := s.em.Results(ctx, rec, outcomes); e != nil {
@@ -347,6 +367,7 @@ func (s *Sink) handle(ctx context.Context, rec *kgo.Record) (done bool, err erro
 		if e := s.em.DLQ(ctx, rec, emit.ReasonReject, o.Error, detail); e != nil {
 			return false, e
 		}
+		s.metrics.IncDLQ(string(emit.ReasonReject), o.Error)
 	}
 	return true, nil
 }

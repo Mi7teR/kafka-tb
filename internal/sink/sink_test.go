@@ -11,7 +11,10 @@ import (
 
 	"github.com/Mi7teR/kafka-tb/internal/codec"
 	"github.com/Mi7teR/kafka-tb/internal/model"
+	"github.com/Mi7teR/kafka-tb/internal/obs"
 	"github.com/Mi7teR/kafka-tb/internal/tbx"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	types "github.com/tigerbeetle/tigerbeetle-go"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -374,6 +377,51 @@ func TestHandleDLQFailureInsideRejectLoopBlocks(t *testing.T) {
 	require.Error(t, err)
 	require.False(t, done)
 	require.Equal(t, 1, em.results, "results уже опубликованы — ветка именно про reject-цикл")
+}
+
+// TestHandleMetricsByOutcome verifies handle actually increments RecordsTotal
+// and DLQTotal on a real registry for each outcome class, not just that
+// *obs.Metrics can be plumbed through. s.metrics is set directly (this test
+// is in-package) rather than through New/newForTest, so every other test in
+// this file — which never touches s.metrics — keeps running against a nil
+// *obs.Metrics exactly as before.
+func TestHandleMetricsByOutcome(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := obs.NewMetrics(reg)
+
+	em := &recordingEmitter{}
+	sub := &stubSubmitter{outcomes: []tbx.Outcome{
+		{Index: 0, ID: "id-0", Status: tbx.StatusOK},
+	}}
+	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
+	s.metrics = m
+	_, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	require.NoError(t, err)
+	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("ok")))
+
+	sub = &stubSubmitter{outcomes: []tbx.Outcome{
+		{Index: 0, ID: "id-0", Status: tbx.StatusRejected, Error: "exceeds_credits"},
+	}}
+	s = newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, &recordingEmitter{})
+	s.metrics = m
+	_, err = s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	require.NoError(t, err)
+	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("rejected")))
+	require.Equal(t, 1.0, testutil.ToFloat64(m.DLQTotal.WithLabelValues("reject", "exceeds_credits")))
+
+	s = newSink(t, stubDecoder{err: codec.Poison("bad json")}, &stubSubmitter{}, &recordingEmitter{})
+	s.metrics = m
+	_, err = s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	require.NoError(t, err)
+	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("poison")))
+	require.Equal(t, 1.0, testutil.ToFloat64(m.DLQTotal.WithLabelValues("poison", "decode")))
+
+	s = newSink(t, stubDecoder{cmd: oneTransferCmd()},
+		&stubSubmitter{err: errors.New("tigerbeetle unavailable")}, &recordingEmitter{})
+	s.metrics = m
+	_, err = s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	require.Error(t, err)
+	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("blocked")))
 }
 
 func TestProcessBatchMarksEveryRecordDone(t *testing.T) {
