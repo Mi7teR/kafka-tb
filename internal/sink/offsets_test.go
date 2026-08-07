@@ -229,6 +229,53 @@ func TestCommittedEpochMatchesBoundaryRecord(t *testing.T) {
 	require.Equal(t, int32(6), eo.Epoch, "epoch must belong to offset 1, the boundary record")
 }
 
+// F5 regression: a partition reassigned back to this consumer after Forget
+// must become live again — Forget's tombstone must not be permanent.
+func TestTrackAfterForgetRevivesPartition(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(0))
+	o.Done(rec(0))
+	o.Forget("t", 0)
+
+	o.Track(rec(1)) // group reassigned the partition back to us
+	o.Done(rec(1))
+
+	got, ok := commitOffset(t, o)
+	require.True(t, ok, "reassigned partition must become commitable again")
+	require.Equal(t, int64(2), got)
+}
+
+// F5 regression: without an intervening Track, Forget's tombstone must
+// still gate a late Done from before the revoke — the tombstone's original
+// job must survive the fix that lets Track revive the partition.
+func TestForgetStillGatesLateDoneWithoutTrack(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(0))
+	o.Forget("t", 0)
+
+	o.Done(rec(0)) // late completion from a worker still running at revoke time
+
+	_, ok := commitOffset(t, o)
+	require.False(t, ok, "forgotten partition with no intervening Track must stay absent")
+	require.Zero(t, o.InFlight())
+}
+
+// F5 regression: InFlight must correctly count work tracked on a partition
+// revived by Track after Forget.
+func TestInFlightCountsRevivedPartition(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(0))
+	o.Done(rec(0))
+	o.Forget("t", 0)
+
+	o.Track(rec(1))
+	o.Track(rec(2))
+	require.Equal(t, 2, o.InFlight())
+
+	o.Done(rec(1))
+	require.Equal(t, 1, o.InFlight())
+}
+
 // TestMarkCommittedDropsDoneEntries proves done entries below the new
 // committed watermark are pruned so the map cannot grow without bound.
 func TestMarkCommittedDropsDoneEntries(t *testing.T) {
