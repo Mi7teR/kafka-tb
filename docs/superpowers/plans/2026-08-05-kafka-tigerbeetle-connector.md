@@ -6,14 +6,14 @@
 
 **Architecture:** Один Go-бинарь с режимами `sink|api|all`. Все обращения к TigerBeetle идут через единственный `tbx.Batcher`, который упаковывает Job'ы в батчи ≤8189 событий, отправляет их последовательно и разводит sparse-результаты обратно по Job'ам. Sink коммитит офсеты вручную непрерывным префиксом только после подтверждения от TigerBeetle и ack от DLQ/results-продюсера.
 
-**Tech Stack:** Go 1.23+, `github.com/twmb/franz-go`, `github.com/tigerbeetle/tigerbeetle-go` v0.17.9 (cgo), `google.golang.org/grpc` + `grpc-gateway/v2`, `buf`, `prometheus/client_golang`, `testcontainers-go`.
+**Tech Stack:** Go 1.25+, `github.com/twmb/franz-go`, `github.com/tigerbeetle/tigerbeetle-go` v0.17.9 (cgo), `google.golang.org/grpc` + `grpc-gateway/v2`, `buf`, `prometheus/client_golang`, `testcontainers-go`.
 
 **Спека:** [2026-08-05-kafka-tigerbeetle-connector-design.md](../specs/2026-08-05-kafka-tigerbeetle-connector-design.md)
 
 ## Global Constraints
 
 - Модуль: `github.com/Mi7teR/kafka-tb`. Регистр владельца обязателен.
-- Go 1.23 или новее. `CGO_ENABLED=1` — клиент TigerBeetle использует cgo, чистая кросс-компиляция невозможна.
+- Go 1.25 или новее (планка поднята с 1.23 в Task 6: franz-go v1.21.5 объявляет `go 1.25.0`). `CGO_ENABLED=1` — клиент TigerBeetle использует cgo, чистая кросс-компиляция невозможна.
 - TigerBeetle client v0.17.9. Максимум событий в одном `create_accounts`/`create_transfers` — **8189**.
 - **macOS:** предсобранная статическая библиотека TigerBeetle не проходит линковку новым `ld` (`64-bit mach-o member 'libtb_client.a.o' not 8-byte aligned`). Сборка и тесты идут только через `make` — Makefile подставляет `-ldflags=-extldflags=-Wl,-ld_classic` на Darwin. Голый `go test ./...` на macOS падает на линковке; это не дефект кода.
 - **Проверено на установленном v0.17.9:** все типы лежат в корневом пакете `github.com/tigerbeetle/tigerbeetle-go` (импортировать как `types "github.com/tigerbeetle/tigerbeetle-go"`), подпакета `pkg/types` не существует.
