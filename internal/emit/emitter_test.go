@@ -68,6 +68,15 @@ func TestDLQPreservesPayloadAndAddsHeaders(t *testing.T) {
 	require.Equal(t, "src", h[HeaderSrcTopic])
 	require.Equal(t, "3", h[HeaderSrcPartition])
 	require.Equal(t, "42", h[HeaderSrcOffset])
+
+	// Gap 1: Assert timestamp headers are correctly formatted
+	expectedSrcTS := src.Timestamp.UTC().Format(time.RFC3339Nano)
+	require.Equal(t, expectedSrcTS, h[HeaderSrcTimestamp], "src timestamp must be in RFC3339Nano format with UTC")
+	require.NotEmpty(t, h[HeaderAttemptTS], "attempt timestamp must be set")
+	// Verify HeaderAttemptTS parses and is not zero time
+	attemptTS, err := time.Parse(time.RFC3339Nano, h[HeaderAttemptTS])
+	require.NoError(t, err, "attempt timestamp must parse as RFC3339Nano")
+	require.NotEqual(t, time.Time{}, attemptTS, "attempt timestamp must not be zero time")
 }
 
 func TestResultsCarryOutcomes(t *testing.T) {
@@ -101,6 +110,62 @@ func TestResultsDisabledWhenTopicEmpty(t *testing.T) {
 	em := New(cl, config.Kafka{DLQTopic: "src.dlq"})
 	err = em.Results(context.Background(), &kgo.Record{Topic: "src"}, nil)
 	require.NoError(t, err, "disabled results topic must be a no-op, not an error")
+}
+
+func TestDLQHeaderWireNames(t *testing.T) {
+	// Gap 2: Assert wire-level header names are exactly the expected literal strings.
+	// This pins the contract against accidental renaming of constant values.
+	em, brokers, _ := newTestEmitter(t)
+	src := &kgo.Record{
+		Topic: "src", Partition: 0, Offset: 0,
+		Key: []byte("k"), Value: []byte("v"),
+		Timestamp: time.Unix(1700000000, 0),
+	}
+	require.NoError(t, em.DLQ(context.Background(), src, ReasonReject, "test", "test detail"))
+	require.NoError(t, em.Flush(context.Background()))
+
+	got := consumeOne(t, brokers, "src.dlq")
+
+	// Assert exact wire-level header names (not via constants)
+	expectedHeaders := map[string]bool{
+		"x-kafkatb-reason":        false,
+		"x-kafkatb-error":         false,
+		"x-kafkatb-detail":        false,
+		"x-kafkatb-src-topic":     false,
+		"x-kafkatb-src-partition": false,
+		"x-kafkatb-src-offset":    false,
+		"x-kafkatb-src-timestamp": false,
+		"x-kafkatb-attempt-ts":    false,
+	}
+	for _, h := range got.Headers {
+		if _, exists := expectedHeaders[h.Key]; exists {
+			expectedHeaders[h.Key] = true
+		}
+	}
+	for name, found := range expectedHeaders {
+		require.True(t, found, "header %q must be present in wire format", name)
+	}
+}
+
+func TestDLQZeroValueTimestamp(t *testing.T) {
+	// Gap 3: Document behavior when rec.Timestamp is zero (unset).
+	// This records the current behavior so future changes are deliberate.
+	em, brokers, _ := newTestEmitter(t)
+	src := &kgo.Record{
+		Topic: "src", Partition: 0, Offset: 0,
+		Key: []byte("k"), Value: []byte("v"),
+		Timestamp: time.Time{}, // zero value
+	}
+	require.NoError(t, em.DLQ(context.Background(), src, ReasonPoison, "test", "test detail"))
+	require.NoError(t, em.Flush(context.Background()))
+
+	got := consumeOne(t, brokers, "src.dlq")
+	h := headerMap(got)
+
+	// Zero-value time.Time silently formats to "0001-01-01T00:00:00Z"
+	zeroFormatted := time.Time{}.UTC().Format(time.RFC3339Nano)
+	require.Equal(t, zeroFormatted, h[HeaderSrcTimestamp],
+		"zero-value timestamp formats to %q", zeroFormatted)
 }
 
 func headerMap(r *kgo.Record) map[string]string {
