@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"math"
 
 	kafkatbv1 "github.com/Mi7teR/kafka-tb/gen/kafkatb/v1"
 	"github.com/Mi7teR/kafka-tb/internal/model"
@@ -37,27 +38,55 @@ func (s *Server) resolveLimit(limit uint32) (uint32, error) {
 	return limit, nil
 }
 
-// nextTransferCursor выставляет next_cursor как timestamp последнего
-// возвращённого элемента + 1; пустая страница даёт курсор 0.
-func nextTransferCursor(transfers []types.Transfer) uint64 {
+// cursorBounds направляет курсор в тот конец диапазона [TimestampMin,
+// TimestampMax], который в данном направлении сужается: вперёд — нижняя
+// граница, назад — верхняя. Курсор 0 в обеих полях означает "без границы"
+// для TigerBeetle, что естественно совпадает с первой страницей, когда
+// клиент курсор ещё не передавал.
+func cursorBounds(cursor uint64, reversed bool) (min, max uint64) {
+	if reversed {
+		return 0, cursor
+	}
+	return cursor, 0
+}
+
+// nextCursor выставляет курсор следующей страницы по timestamp последнего
+// возвращённого элемента: вперёд +1, назад −1. Курсор 0 на выходе значит
+// "страниц больше нет" — это и естественный случай пустой страницы, и явно
+// обработанная граница uint64 (вперёд upon MaxUint64, назад upon 0), где
+// шаг увёл бы курсор за пределы типа.
+func nextCursor(lastTimestamp uint64, reversed bool) uint64 {
+	if reversed {
+		if lastTimestamp == 0 {
+			return 0
+		}
+		return lastTimestamp - 1
+	}
+	if lastTimestamp == math.MaxUint64 {
+		return 0
+	}
+	return lastTimestamp + 1
+}
+
+func nextTransferCursor(transfers []types.Transfer, reversed bool) uint64 {
 	if len(transfers) == 0 {
 		return 0
 	}
-	return transfers[len(transfers)-1].Timestamp + 1
+	return nextCursor(transfers[len(transfers)-1].Timestamp, reversed)
 }
 
-func nextAccountCursor(accounts []types.Account) uint64 {
+func nextAccountCursor(accounts []types.Account, reversed bool) uint64 {
 	if len(accounts) == 0 {
 		return 0
 	}
-	return accounts[len(accounts)-1].Timestamp + 1
+	return nextCursor(accounts[len(accounts)-1].Timestamp, reversed)
 }
 
-func nextBalanceCursor(balances []types.AccountBalance) uint64 {
+func nextBalanceCursor(balances []types.AccountBalance, reversed bool) uint64 {
 	if len(balances) == 0 {
 		return 0
 	}
-	return balances[len(balances)-1].Timestamp + 1
+	return nextCursor(balances[len(balances)-1].Timestamp, reversed)
 }
 
 func unavailable(err error) error {
@@ -117,9 +146,11 @@ func (s *Server) ListAccountTransfers(_ context.Context, req *kafkatbv1.ListAcco
 	if err != nil {
 		return nil, err
 	}
+	timestampMin, timestampMax := cursorBounds(req.GetCursor(), req.GetReversed())
 	filter := types.AccountFilter{
 		AccountID:    accountID,
-		TimestampMin: req.GetCursor(),
+		TimestampMin: timestampMin,
+		TimestampMax: timestampMax,
 		Limit:        limit,
 		Flags: types.AccountFilterFlags{
 			Debits: true, Credits: true, Reversed: req.GetReversed(),
@@ -139,7 +170,7 @@ func (s *Server) ListAccountTransfers(_ context.Context, req *kafkatbv1.ListAcco
 	}
 	return &kafkatbv1.ListAccountTransfersResponse{
 		Transfers:  out,
-		NextCursor: nextTransferCursor(transfers),
+		NextCursor: nextTransferCursor(transfers, req.GetReversed()),
 	}, nil
 }
 
@@ -157,9 +188,11 @@ func (s *Server) ListAccountBalances(_ context.Context, req *kafkatbv1.ListAccou
 	if err != nil {
 		return nil, err
 	}
+	timestampMin, timestampMax := cursorBounds(req.GetCursor(), req.GetReversed())
 	filter := types.AccountFilter{
 		AccountID:    accountID,
-		TimestampMin: req.GetCursor(),
+		TimestampMin: timestampMin,
+		TimestampMax: timestampMax,
 		Limit:        limit,
 		Flags: types.AccountFilterFlags{
 			Debits: true, Credits: true, Reversed: req.GetReversed(),
@@ -189,7 +222,7 @@ func (s *Server) ListAccountBalances(_ context.Context, req *kafkatbv1.ListAccou
 	}
 	return &kafkatbv1.ListAccountBalancesResponse{
 		Balances:   out,
-		NextCursor: nextBalanceCursor(balances),
+		NextCursor: nextBalanceCursor(balances, req.GetReversed()),
 	}, nil
 }
 
@@ -212,8 +245,10 @@ func (s *Server) QueryTransfers(_ context.Context, req *kafkatbv1.QueryTransfers
 		out = append(out, p)
 	}
 	return &kafkatbv1.QueryTransfersResponse{
-		Transfers:  out,
-		NextCursor: nextTransferCursor(transfers),
+		Transfers: out,
+		// QueryTransfersRequest has no reversed field: this filter is always
+		// forward, so the cursor always advances TimestampMin.
+		NextCursor: nextTransferCursor(transfers, false),
 	}, nil
 }
 
@@ -236,8 +271,10 @@ func (s *Server) QueryAccounts(_ context.Context, req *kafkatbv1.QueryAccountsRe
 		out = append(out, p)
 	}
 	return &kafkatbv1.QueryAccountsResponse{
-		Accounts:   out,
-		NextCursor: nextAccountCursor(accounts),
+		Accounts: out,
+		// QueryAccountsRequest has no reversed field: this filter is always
+		// forward, so the cursor always advances TimestampMin.
+		NextCursor: nextAccountCursor(accounts, false),
 	}, nil
 }
 

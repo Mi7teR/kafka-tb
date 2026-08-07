@@ -111,9 +111,12 @@ func balanceToProto(b types.AccountBalance, scale int32) *kafkatbv1.Balance {
 	}
 }
 
-// flagNamesFromAccount и flagNamesFromTransfer сознательно не публикуют
-// "imported" — model.Registry.AccountFlags/TransferFlags не умеют разбирать
-// это имя обратно, а значит ответ API не был бы затем принят как ввод.
+// flagNamesFromAccount и flagNamesFromTransfer публикуют "imported" наравне
+// с остальными флагами — это часть реального состояния счёта/перевода в
+// TigerBeetle, и умолчание сделало бы ответ API недостоверным. Симметрично
+// на запись: model.Registry.AccountFlags/TransferFlags отклоняют "imported"
+// как ввод с явной ошибкой, потому что импорт требует передаваемых
+// вызывающей стороной timestamp события, а этот коннектор их не принимает.
 func flagNamesFromAccount(f types.AccountFlags) []string {
 	var names []string
 	if f.Linked {
@@ -127,6 +130,9 @@ func flagNamesFromAccount(f types.AccountFlags) []string {
 	}
 	if f.History {
 		names = append(names, "history")
+	}
+	if f.Imported {
+		names = append(names, "imported")
 	}
 	if f.Closed {
 		names = append(names, "closed")
@@ -159,6 +165,9 @@ func flagNamesFromTransfer(f types.TransferFlags) []string {
 	}
 	if f.ClosingCredit {
 		names = append(names, "closing_credit")
+	}
+	if f.Imported {
+		names = append(names, "imported")
 	}
 	return names
 }

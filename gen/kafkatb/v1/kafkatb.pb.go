@@ -547,11 +547,14 @@ func (x *GetTransfersResponse) GetTransfers() []*Transfer {
 }
 
 type ListAccountTransfersRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	AccountId     string                 `protobuf:"bytes,1,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
-	Limit         uint32                 `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
-	Cursor        uint64                 `protobuf:"varint,3,opt,name=cursor,proto3" json:"cursor,omitempty"` // timestamp_min
-	Reversed      bool                   `protobuf:"varint,4,opt,name=reversed,proto3" json:"reversed,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	AccountId string                 `protobuf:"bytes,1,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
+	Limit     uint32                 `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
+	// Bounds the timestamp range on the end that advances with paging:
+	// timestamp_min when reversed is false, timestamp_max when reversed is
+	// true. 0 (the zero value on the first page) means unbounded on that end.
+	Cursor        uint64 `protobuf:"varint,3,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	Reversed      bool   `protobuf:"varint,4,opt,name=reversed,proto3" json:"reversed,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -615,9 +618,11 @@ func (x *ListAccountTransfersRequest) GetReversed() bool {
 }
 
 type ListAccountTransfersResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Transfers     []*Transfer            `protobuf:"bytes,1,rep,name=transfers,proto3" json:"transfers,omitempty"`
-	NextCursor    uint64                 `protobuf:"varint,2,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Transfers []*Transfer            `protobuf:"bytes,1,rep,name=transfers,proto3" json:"transfers,omitempty"`
+	// Pass back as `cursor` (with the same `reversed`) to fetch the next
+	// page. 0 means there is no next page — stop paging.
+	NextCursor    uint64 `protobuf:"varint,2,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -743,11 +748,14 @@ func (x *Balance) GetTimestamp() uint64 {
 }
 
 type ListAccountBalancesRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	AccountId     string                 `protobuf:"bytes,1,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
-	Limit         uint32                 `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
-	Cursor        uint64                 `protobuf:"varint,3,opt,name=cursor,proto3" json:"cursor,omitempty"`
-	Reversed      bool                   `protobuf:"varint,4,opt,name=reversed,proto3" json:"reversed,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	AccountId string                 `protobuf:"bytes,1,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
+	Limit     uint32                 `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
+	// Bounds the timestamp range on the end that advances with paging:
+	// timestamp_min when reversed is false, timestamp_max when reversed is
+	// true. 0 (the zero value on the first page) means unbounded on that end.
+	Cursor        uint64 `protobuf:"varint,3,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	Reversed      bool   `protobuf:"varint,4,opt,name=reversed,proto3" json:"reversed,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -811,9 +819,11 @@ func (x *ListAccountBalancesRequest) GetReversed() bool {
 }
 
 type ListAccountBalancesResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Balances      []*Balance             `protobuf:"bytes,1,rep,name=balances,proto3" json:"balances,omitempty"`
-	NextCursor    uint64                 `protobuf:"varint,2,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Balances []*Balance             `protobuf:"bytes,1,rep,name=balances,proto3" json:"balances,omitempty"`
+	// Pass back as `cursor` (with the same `reversed`) to fetch the next
+	// page. 0 means there is no next page — stop paging.
+	NextCursor    uint64 `protobuf:"varint,2,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -863,14 +873,16 @@ func (x *ListAccountBalancesResponse) GetNextCursor() uint64 {
 }
 
 type QueryTransfersRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	UserData_128  string                 `protobuf:"bytes,1,opt,name=user_data_128,json=userData128,proto3" json:"user_data_128,omitempty"`
-	UserData_64   uint64                 `protobuf:"varint,2,opt,name=user_data_64,json=userData64,proto3" json:"user_data_64,omitempty"`
-	UserData_32   uint32                 `protobuf:"varint,3,opt,name=user_data_32,json=userData32,proto3" json:"user_data_32,omitempty"`
-	Ledger        string                 `protobuf:"bytes,4,opt,name=ledger,proto3" json:"ledger,omitempty"`
-	Code          string                 `protobuf:"bytes,5,opt,name=code,proto3" json:"code,omitempty"`
-	Limit         uint32                 `protobuf:"varint,6,opt,name=limit,proto3" json:"limit,omitempty"`
-	Cursor        uint64                 `protobuf:"varint,7,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	UserData_128 string                 `protobuf:"bytes,1,opt,name=user_data_128,json=userData128,proto3" json:"user_data_128,omitempty"`
+	UserData_64  uint64                 `protobuf:"varint,2,opt,name=user_data_64,json=userData64,proto3" json:"user_data_64,omitempty"`
+	UserData_32  uint32                 `protobuf:"varint,3,opt,name=user_data_32,json=userData32,proto3" json:"user_data_32,omitempty"`
+	Ledger       string                 `protobuf:"bytes,4,opt,name=ledger,proto3" json:"ledger,omitempty"`
+	Code         string                 `protobuf:"bytes,5,opt,name=code,proto3" json:"code,omitempty"`
+	Limit        uint32                 `protobuf:"varint,6,opt,name=limit,proto3" json:"limit,omitempty"`
+	// timestamp_min; there is no reversed flag, this query is always forward.
+	// 0 (the zero value on the first page) means unbounded.
+	Cursor        uint64 `protobuf:"varint,7,opt,name=cursor,proto3" json:"cursor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -955,9 +967,11 @@ func (x *QueryTransfersRequest) GetCursor() uint64 {
 }
 
 type QueryTransfersResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Transfers     []*Transfer            `protobuf:"bytes,1,rep,name=transfers,proto3" json:"transfers,omitempty"`
-	NextCursor    uint64                 `protobuf:"varint,2,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Transfers []*Transfer            `protobuf:"bytes,1,rep,name=transfers,proto3" json:"transfers,omitempty"`
+	// Pass back as `cursor` to fetch the next page. 0 means there is no next
+	// page — stop paging.
+	NextCursor    uint64 `protobuf:"varint,2,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1007,14 +1021,16 @@ func (x *QueryTransfersResponse) GetNextCursor() uint64 {
 }
 
 type QueryAccountsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	UserData_128  string                 `protobuf:"bytes,1,opt,name=user_data_128,json=userData128,proto3" json:"user_data_128,omitempty"`
-	UserData_64   uint64                 `protobuf:"varint,2,opt,name=user_data_64,json=userData64,proto3" json:"user_data_64,omitempty"`
-	UserData_32   uint32                 `protobuf:"varint,3,opt,name=user_data_32,json=userData32,proto3" json:"user_data_32,omitempty"`
-	Ledger        string                 `protobuf:"bytes,4,opt,name=ledger,proto3" json:"ledger,omitempty"`
-	Code          string                 `protobuf:"bytes,5,opt,name=code,proto3" json:"code,omitempty"`
-	Limit         uint32                 `protobuf:"varint,6,opt,name=limit,proto3" json:"limit,omitempty"`
-	Cursor        uint64                 `protobuf:"varint,7,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	UserData_128 string                 `protobuf:"bytes,1,opt,name=user_data_128,json=userData128,proto3" json:"user_data_128,omitempty"`
+	UserData_64  uint64                 `protobuf:"varint,2,opt,name=user_data_64,json=userData64,proto3" json:"user_data_64,omitempty"`
+	UserData_32  uint32                 `protobuf:"varint,3,opt,name=user_data_32,json=userData32,proto3" json:"user_data_32,omitempty"`
+	Ledger       string                 `protobuf:"bytes,4,opt,name=ledger,proto3" json:"ledger,omitempty"`
+	Code         string                 `protobuf:"bytes,5,opt,name=code,proto3" json:"code,omitempty"`
+	Limit        uint32                 `protobuf:"varint,6,opt,name=limit,proto3" json:"limit,omitempty"`
+	// timestamp_min; there is no reversed flag, this query is always forward.
+	// 0 (the zero value on the first page) means unbounded.
+	Cursor        uint64 `protobuf:"varint,7,opt,name=cursor,proto3" json:"cursor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1099,9 +1115,11 @@ func (x *QueryAccountsRequest) GetCursor() uint64 {
 }
 
 type QueryAccountsResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Accounts      []*Account             `protobuf:"bytes,1,rep,name=accounts,proto3" json:"accounts,omitempty"`
-	NextCursor    uint64                 `protobuf:"varint,2,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Accounts []*Account             `protobuf:"bytes,1,rep,name=accounts,proto3" json:"accounts,omitempty"`
+	// Pass back as `cursor` to fetch the next page. 0 means there is no next
+	// page — stop paging.
+	NextCursor    uint64 `protobuf:"varint,2,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

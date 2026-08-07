@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"errors"
+	"math"
+	"sort"
 	"testing"
 
 	kafkatbv1 "github.com/Mi7teR/kafka-tb/gen/kafkatb/v1"
@@ -311,4 +313,237 @@ func TestQueryAccountsClientErrorIsUnavailable(t *testing.T) {
 	_, err := srv.QueryAccounts(context.Background(), &kafkatbv1.QueryAccountsRequest{})
 
 	requireCode(t, err, codes.Unavailable)
+}
+
+// filterByTimestamp — упрощённая, но верная по семантике модель реального
+// TigerBeetle AccountFilter: TimestampMin/TimestampMax включительно, 0 в
+// любом из них означает "без границы", Reversed переключает порядок
+// выдачи, Limit применяется после сортировки/фильтрации. Используется
+// стабами в пагинационных тестах ниже, чтобы воспроизвести C1 (пагинация
+// в обратном порядке) на реалистичном поведении сервера, а не на заглушке,
+// которая бы скрыла баг, попросту игнорируя фильтр.
+func filterByTimestamp[T any](all []T, timestampOf func(T) uint64, f types.AccountFilter) []T {
+	var out []T
+	for _, item := range all {
+		ts := timestampOf(item)
+		if f.TimestampMin != 0 && ts < f.TimestampMin {
+			continue
+		}
+		if f.TimestampMax != 0 && ts > f.TimestampMax {
+			continue
+		}
+		out = append(out, item)
+	}
+	reversed := f.AccountFilterFlags().Reversed
+	sort.Slice(out, func(i, j int) bool {
+		if reversed {
+			return timestampOf(out[i]) > timestampOf(out[j])
+		}
+		return timestampOf(out[i]) < timestampOf(out[j])
+	})
+	if f.Limit > 0 && uint32(len(out)) > f.Limit {
+		out = out[:f.Limit]
+	}
+	return out
+}
+
+func transferTimestamps() []types.Transfer {
+	return []types.Transfer{
+		{ID: types.ToUint128(1), Ledger: 1, Code: 1, Amount: types.ToUint128(1), Timestamp: 10},
+		{ID: types.ToUint128(2), Ledger: 1, Code: 1, Amount: types.ToUint128(1), Timestamp: 20},
+		{ID: types.ToUint128(3), Ledger: 1, Code: 1, Amount: types.ToUint128(1), Timestamp: 30},
+		{ID: types.ToUint128(4), Ledger: 1, Code: 1, Amount: types.ToUint128(1), Timestamp: 40},
+		{ID: types.ToUint128(5), Ledger: 1, Code: 1, Amount: types.ToUint128(1), Timestamp: 50},
+	}
+}
+
+// walkAccountTransfers pages through ListAccountTransfers to exhaustion (nil
+// or short-of-limit results plus a following empty page both terminate via
+// next_cursor 0), collecting the timestamps observed in order. It fails the
+// test outright if a page repeats, if walking exceeds a generous page
+// budget, or if the client hook rejects the filter.
+func walkAccountTransfers(t *testing.T, srv *Server, accountID types.Uint128, limit uint32, reversed bool) []uint64 {
+	t.Helper()
+	seen := map[uint64]bool{}
+	var order []uint64
+	cursor := uint64(0)
+	for pages := 0; pages < 10; pages++ {
+		resp, err := srv.ListAccountTransfers(context.Background(), &kafkatbv1.ListAccountTransfersRequest{
+			AccountId: model.FormatID(accountID),
+			Limit:     limit,
+			Cursor:    cursor,
+			Reversed:  reversed,
+		})
+		require.NoError(t, err)
+		if len(resp.Transfers) == 0 {
+			require.Equal(t, uint64(0), resp.NextCursor, "an exhausted page must report next_cursor 0")
+			return order
+		}
+		for _, tr := range resp.Transfers {
+			require.False(t, seen[tr.Timestamp], "timestamp %d returned twice", tr.Timestamp)
+			seen[tr.Timestamp] = true
+			order = append(order, tr.Timestamp)
+		}
+		cursor = resp.NextCursor
+	}
+	t.Fatalf("walk did not terminate within 10 pages, got %v", order)
+	return nil
+}
+
+func TestListAccountTransfersForwardPaginationWalksWithoutDuplicatesOrGaps(t *testing.T) {
+	all := transferTimestamps()
+	accountID := types.ToUint128(7)
+	stub := &stubClient{
+		getAccountTransfersFn: func(f types.AccountFilter) ([]types.Transfer, error) {
+			require.Equal(t, accountID, f.AccountID)
+			return filterByTimestamp(all, func(t types.Transfer) uint64 { return t.Timestamp }, f), nil
+		},
+	}
+	srv := NewServer(stub, testRegistry(), config.API{MaxPageSize: 50})
+
+	order := walkAccountTransfers(t, srv, accountID, 2, false)
+
+	require.Equal(t, []uint64{10, 20, 30, 40, 50}, order)
+}
+
+// TestListAccountTransfersReversedPaginationWalksWithoutDuplicatesOrGaps is
+// the regression test for C1: with reversed=true the previous code never
+// set AccountFilter.TimestampMax, so each page's TimestampMin (last
+// timestamp + 1) only trimmed the bottom of an unbounded-above, newest-first
+// range. That returned the same near-top records shrinking by one each
+// call, duplicating records and never reaching the tail of the history.
+// Against the pre-fix code this test fails with "timestamp 40 returned
+// twice" on the second page.
+func TestListAccountTransfersReversedPaginationWalksWithoutDuplicatesOrGaps(t *testing.T) {
+	all := transferTimestamps()
+	accountID := types.ToUint128(7)
+	stub := &stubClient{
+		getAccountTransfersFn: func(f types.AccountFilter) ([]types.Transfer, error) {
+			require.Equal(t, accountID, f.AccountID)
+			return filterByTimestamp(all, func(t types.Transfer) uint64 { return t.Timestamp }, f), nil
+		},
+	}
+	srv := NewServer(stub, testRegistry(), config.API{MaxPageSize: 50})
+
+	order := walkAccountTransfers(t, srv, accountID, 2, true)
+
+	require.Equal(t, []uint64{50, 40, 30, 20, 10}, order)
+}
+
+func balanceTimestamps() []types.AccountBalance {
+	return []types.AccountBalance{
+		{DebitsPosted: types.ToUint128(1), Timestamp: 10},
+		{DebitsPosted: types.ToUint128(1), Timestamp: 20},
+		{DebitsPosted: types.ToUint128(1), Timestamp: 30},
+		{DebitsPosted: types.ToUint128(1), Timestamp: 40},
+		{DebitsPosted: types.ToUint128(1), Timestamp: 50},
+	}
+}
+
+func walkAccountBalances(t *testing.T, srv *Server, accountID types.Uint128, limit uint32, reversed bool) []uint64 {
+	t.Helper()
+	seen := map[uint64]bool{}
+	var order []uint64
+	cursor := uint64(0)
+	for pages := 0; pages < 10; pages++ {
+		resp, err := srv.ListAccountBalances(context.Background(), &kafkatbv1.ListAccountBalancesRequest{
+			AccountId: model.FormatID(accountID),
+			Limit:     limit,
+			Cursor:    cursor,
+			Reversed:  reversed,
+		})
+		require.NoError(t, err)
+		if len(resp.Balances) == 0 {
+			require.Equal(t, uint64(0), resp.NextCursor, "an exhausted page must report next_cursor 0")
+			return order
+		}
+		for _, b := range resp.Balances {
+			require.False(t, seen[b.Timestamp], "timestamp %d returned twice", b.Timestamp)
+			seen[b.Timestamp] = true
+			order = append(order, b.Timestamp)
+		}
+		cursor = resp.NextCursor
+	}
+	t.Fatalf("walk did not terminate within 10 pages, got %v", order)
+	return nil
+}
+
+func TestListAccountBalancesForwardPaginationWalksWithoutDuplicatesOrGaps(t *testing.T) {
+	all := balanceTimestamps()
+	accountID := types.ToUint128(9)
+	stub := &stubClient{
+		getAccountBalancesFn: func(f types.AccountFilter) ([]types.AccountBalance, error) {
+			return filterByTimestamp(all, func(b types.AccountBalance) uint64 { return b.Timestamp }, f), nil
+		},
+		lookupAccountsFn: func(ids []types.Uint128) ([]types.Account, error) {
+			return []types.Account{{ID: accountID, Ledger: 1, Code: 1}}, nil
+		},
+	}
+	srv := NewServer(stub, testRegistry(), config.API{MaxPageSize: 50})
+
+	order := walkAccountBalances(t, srv, accountID, 2, false)
+
+	require.Equal(t, []uint64{10, 20, 30, 40, 50}, order)
+}
+
+// TestListAccountBalancesReversedPaginationWalksWithoutDuplicatesOrGaps is
+// the C1 regression test for ListAccountBalances — same defect and same
+// fix as ListAccountTransfers.
+func TestListAccountBalancesReversedPaginationWalksWithoutDuplicatesOrGaps(t *testing.T) {
+	all := balanceTimestamps()
+	accountID := types.ToUint128(9)
+	stub := &stubClient{
+		getAccountBalancesFn: func(f types.AccountFilter) ([]types.AccountBalance, error) {
+			return filterByTimestamp(all, func(b types.AccountBalance) uint64 { return b.Timestamp }, f), nil
+		},
+		lookupAccountsFn: func(ids []types.Uint128) ([]types.Account, error) {
+			return []types.Account{{ID: accountID, Ledger: 1, Code: 1}}, nil
+		},
+	}
+	srv := NewServer(stub, testRegistry(), config.API{MaxPageSize: 50})
+
+	order := walkAccountBalances(t, srv, accountID, 2, true)
+
+	require.Equal(t, []uint64{50, 40, 30, 20, 10}, order)
+}
+
+// TestListAccountTransfersReversedCursorAtZeroDoesNotUnderflow pins the
+// boundary case explicitly: a reversed page whose last element has
+// timestamp 0 must report next_cursor 0 (exhausted), never underflow to
+// math.MaxUint64.
+func TestListAccountTransfersReversedCursorAtZeroDoesNotUnderflow(t *testing.T) {
+	stub := &stubClient{
+		getAccountTransfersFn: func(types.AccountFilter) ([]types.Transfer, error) {
+			return []types.Transfer{{ID: types.ToUint128(1), Ledger: 1, Code: 1, Amount: types.ToUint128(1), Timestamp: 0}}, nil
+		},
+	}
+	srv := NewServer(stub, testRegistry(), config.API{MaxPageSize: 10})
+
+	resp, err := srv.ListAccountTransfers(context.Background(), &kafkatbv1.ListAccountTransfersRequest{
+		AccountId: model.FormatID(types.ToUint128(1)),
+		Reversed:  true,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), resp.NextCursor)
+}
+
+// TestListAccountTransfersForwardCursorAtMaxDoesNotWrap pins the forward
+// boundary: a page whose last element has timestamp math.MaxUint64 must
+// report next_cursor 0 (exhausted), never wrap to 0 and be mistaken for an
+// unbounded restart.
+func TestListAccountTransfersForwardCursorAtMaxDoesNotWrap(t *testing.T) {
+	stub := &stubClient{
+		getAccountTransfersFn: func(types.AccountFilter) ([]types.Transfer, error) {
+			return []types.Transfer{{ID: types.ToUint128(1), Ledger: 1, Code: 1, Amount: types.ToUint128(1), Timestamp: math.MaxUint64}}, nil
+		},
+	}
+	srv := NewServer(stub, testRegistry(), config.API{MaxPageSize: 10})
+
+	resp, err := srv.ListAccountTransfers(context.Background(), &kafkatbv1.ListAccountTransfersRequest{
+		AccountId: model.FormatID(types.ToUint128(1)),
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), resp.NextCursor)
 }

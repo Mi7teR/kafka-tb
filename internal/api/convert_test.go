@@ -43,6 +43,18 @@ func TestAccountBalanceDebitNormal(t *testing.T) {
 	require.Contains(t, got.Flags, "credits_must_not_exceed_debits")
 }
 
+// I2 regression: an account that was imported must surface "imported" in
+// its flags, not be misreported as though it were not imported.
+func TestAccountImportedFlagIsSurfaced(t *testing.T) {
+	acc := types.Account{
+		ID: types.ToUint128(1), Ledger: 1, Code: 1,
+		Flags: types.AccountFlags{Imported: true}.ToUint16(),
+	}
+	got, err := accountToProto(acc, testRegistry())
+	require.NoError(t, err)
+	require.Contains(t, got.Flags, "imported")
+}
+
 func TestAccountUnknownLedgerIsError(t *testing.T) {
 	_, err := accountToProto(types.Account{Ledger: 99, Code: 1}, testRegistry())
 	require.ErrorContains(t, err, "unknown ledger")
@@ -88,6 +100,18 @@ func TestTransferToProtoRoundTrip(t *testing.T) {
 	require.Equal(t, "customer", got.Code)
 	require.Contains(t, got.Flags, "pending")
 	require.Equal(t, uint64(42), got.Timestamp)
+}
+
+// I2 regression: a transfer that was imported must surface "imported" in
+// its flags, not be misreported as though it were not imported.
+func TestTransferImportedFlagIsSurfaced(t *testing.T) {
+	tr := types.Transfer{
+		Ledger: 1, Code: 1,
+		Flags: types.TransferFlags{Imported: true}.ToUint16(),
+	}
+	got, err := transferToProto(tr, testRegistry())
+	require.NoError(t, err)
+	require.Contains(t, got.Flags, "imported")
 }
 
 func TestTransferUnknownCodeIsError(t *testing.T) {

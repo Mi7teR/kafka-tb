@@ -62,11 +62,16 @@ message GetTransfersResponse {
 message ListAccountTransfersRequest {
   string account_id = 1;
   uint32 limit = 2;
-  uint64 cursor = 3; // timestamp_min
+  // Bounds the timestamp range on the end that advances with paging:
+  // timestamp_min when reversed is false, timestamp_max when reversed is
+  // true. 0 (the zero value on the first page) means unbounded on that end.
+  uint64 cursor = 3;
   bool reversed = 4;
 }
 message ListAccountTransfersResponse {
   repeated Transfer transfers = 1;
+  // Pass back as `cursor` (with the same `reversed`) to fetch the next
+  // page. 0 means there is no next page — stop paging.
   uint64 next_cursor = 2;
 }
 
@@ -80,11 +85,16 @@ message Balance {
 message ListAccountBalancesRequest {
   string account_id = 1;
   uint32 limit = 2;
+  // Bounds the timestamp range on the end that advances with paging:
+  // timestamp_min when reversed is false, timestamp_max when reversed is
+  // true. 0 (the zero value on the first page) means unbounded on that end.
   uint64 cursor = 3;
   bool reversed = 4;
 }
 message ListAccountBalancesResponse {
   repeated Balance balances = 1;
+  // Pass back as `cursor` (with the same `reversed`) to fetch the next
+  // page. 0 means there is no next page — stop paging.
   uint64 next_cursor = 2;
 }
 
@@ -95,10 +105,14 @@ message QueryTransfersRequest {
   string ledger = 4;
   string code = 5;
   uint32 limit = 6;
+  // timestamp_min; there is no reversed flag, this query is always forward.
+  // 0 (the zero value on the first page) means unbounded.
   uint64 cursor = 7;
 }
 message QueryTransfersResponse {
   repeated Transfer transfers = 1;
+  // Pass back as `cursor` to fetch the next page. 0 means there is no next
+  // page — stop paging.
   uint64 next_cursor = 2;
 }
 
@@ -109,10 +123,14 @@ message QueryAccountsRequest {
   string ledger = 4;
   string code = 5;
   uint32 limit = 6;
+  // timestamp_min; there is no reversed flag, this query is always forward.
+  // 0 (the zero value on the first page) means unbounded.
   uint64 cursor = 7;
 }
 message QueryAccountsResponse {
   repeated Account accounts = 1;
+  // Pass back as `cursor` to fetch the next page. 0 means there is no next
+  // page — stop paging.
   uint64 next_cursor = 2;
 }
 

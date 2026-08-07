@@ -90,6 +90,8 @@ func (r *Registry) TransferFlags(names []string) (types.TransferFlags, error) {
 			f.ClosingDebit = true
 		case "closing_credit":
 			f.ClosingCredit = true
+		case "imported":
+			return f, fmt.Errorf("transfer flag %q is read-only in this connector: importing requires caller-supplied event timestamps, which this connector does not support", n)
 		default:
 			return f, fmt.Errorf("unknown transfer flag %q", n)
 		}
@@ -111,6 +113,8 @@ func (r *Registry) AccountFlags(names []string) (types.AccountFlags, error) {
 			f.History = true
 		case "closed":
 			f.Closed = true
+		case "imported":
+			return f, fmt.Errorf("account flag %q is read-only in this connector: importing requires caller-supplied event timestamps, which this connector does not support", n)
 		default:
 			return f, fmt.Errorf("unknown account flag %q", n)
 		}
