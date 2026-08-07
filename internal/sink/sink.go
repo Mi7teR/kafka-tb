@@ -159,13 +159,13 @@ func (s *Sink) Run(ctx context.Context) {
 			// висеть на недоступном брокере до бесконечности не должен.
 			shutCtx, cancelShut := context.WithTimeout(
 				context.WithoutCancel(ctx), s.shutdownTimeout)
-			s.commit(shutCtx)
+			s.commit(shutCtx, slog.LevelError)
 			cancelShut()
 			return
 		}
 		select {
 		case <-commitTicker.C:
-			s.commit(ctx)
+			s.commit(ctx, slog.LevelError)
 		default:
 		}
 	}
@@ -181,6 +181,20 @@ func (s *Sink) processBatch(ctx context.Context, records []*kgo.Record) {
 	}
 	deadline := time.Now().Add(s.batchBudget)
 	for _, rec := range records {
+		if !time.Now().Before(deadline) {
+			if ctx.Err() == nil {
+				// Бюджет пачки исчерпан ещё до этой записи: длинная серия
+				// медленных, но успешных записей (без единой
+				// инфраструктурной ошибки) держала бы AllowRebalance так
+				// же долго, как и вечный ретрай, если бы бюджет
+				// проверялся только внутри applyRecord.
+				s.abandonBatch()
+			}
+			// При отмене контекста перематывать нечего: процесс уходит, а
+			// незавершённые офсеты и так упираются в ватермарк и не
+			// коммитятся.
+			return
+		}
 		if s.applyRecord(ctx, rec, deadline) {
 			continue
 		}
@@ -203,13 +217,25 @@ func (s *Sink) applyRecord(ctx context.Context, rec *kgo.Record, deadline time.T
 		if err == nil {
 			if done {
 				s.offsets.Done(rec)
+				return true
 			}
-			return true
+			// handle'а контракт: (false, nil) значить не должно ничего —
+			// каждая ветка отдаёт либо (true, nil), либо (_, err).
+			// Сегодня недостижимо, но молча продвинуться дальше здесь
+			// значило бы навсегда пришпилить ватермарк этой партиции:
+			// офсет остался бы в pending, а Commitable никогда не увидит
+			// его завершённым. Считаем это инфраструктурным сбоем — запись
+			// повторяется, а по истечении бюджета партиция перематывается
+			// как при любой другой зависшей записи.
+			s.log.Error("handle contract violation: done=false with no error, retrying",
+				slog.String("topic", rec.Topic), slog.Int("partition", int(rec.Partition)),
+				slog.Int64("offset", rec.Offset))
+		} else {
+			// Инфраструктура: та же запись повторяется, следующие ждут её.
+			s.log.Error("record failed, retrying", slog.String("topic", rec.Topic),
+				slog.Int("partition", int(rec.Partition)),
+				slog.Int64("offset", rec.Offset), slog.String("error", err.Error()))
 		}
-		// Инфраструктура: та же запись повторяется, следующие ждут её.
-		s.log.Error("record failed, retrying", slog.String("topic", rec.Topic),
-			slog.Int("partition", int(rec.Partition)),
-			slog.Int64("offset", rec.Offset), slog.String("error", err.Error()))
 		if !time.Now().Add(s.retryPeriod).Before(deadline) {
 			return false
 		}
@@ -321,7 +347,14 @@ func (s *Sink) handle(ctx context.Context, rec *kgo.Record) (done bool, err erro
 // commit отдаёт брокеру непрерывный префикс обработанных офсетов.
 // Flush до коммита обязателен: закоммитить офсет записи, чей DLQ или results
 // ещё лежат в буфере продюсера, значит потерять её при падении процесса.
-func (s *Sink) commit(ctx context.Context) {
+//
+// level задаёт уровень лога провала коммита и передаётся вызывающей
+// стороной, а не выводится внутри: у OnRevoked провал коммита штатный —
+// это гонка revoke с закрытием клиента (контекст уже отменён), тот же офсет
+// уедет при следующей отдаче партиции. У периодического и shutdown-коммита
+// в Run провал означает, что брокер стабильно отклоняет коммиты, и это
+// обязано быть видно алертингу.
+func (s *Sink) commit(ctx context.Context, level slog.Level) {
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
 
@@ -333,15 +366,12 @@ func (s *Sink) commit(ctx context.Context) {
 		s.log.Error("flush before commit failed", slog.String("error", err.Error()))
 		return
 	}
-	// Провал коммита логируется как warn, а не error: данные не теряются —
-	// тот же офсет уедет следующим тиком, а при revoke на закрытии клиента
-	// (контекст клиента уже отменён) коммит и вовсе штатно не проходит.
 	var failed bool
 	s.oc.CommitOffsetsSync(ctx, offsets,
 		func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest, resp *kmsg.OffsetCommitResponse, err error) {
 			if err != nil {
 				failed = true
-				s.log.Warn("commit failed", slog.String("error", err.Error()))
+				s.log.Log(ctx, level, "commit failed", slog.String("error", err.Error()))
 				return
 			}
 			// Ошибка уровня партиции не поднимается в err: без этой проверки
@@ -353,7 +383,7 @@ func (s *Sink) commit(ctx context.Context) {
 						continue
 					}
 					failed = true
-					s.log.Warn("commit failed", slog.String("topic", t.Topic),
+					s.log.Log(ctx, level, "commit failed", slog.String("topic", t.Topic),
 						slog.Int("partition", int(p.Partition)),
 						slog.String("error", perr.Error()))
 				}
@@ -370,7 +400,7 @@ func (s *Sink) commit(ctx context.Context) {
 // OnRevoked коммитит перед отдачей партиций: после Forget состояние партиции —
 // тумбстон, и коммитить будет уже нечего.
 func (s *Sink) OnRevoked(ctx context.Context, revoked map[string][]int32) {
-	s.commit(ctx)
+	s.commit(ctx, slog.LevelWarn)
 	for topic, parts := range revoked {
 		for _, p := range parts {
 			s.offsets.Forget(topic, p)

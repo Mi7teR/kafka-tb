@@ -289,14 +289,29 @@ func TestPendingReportsLowestUnfinishedOffset(t *testing.T) {
 	}, o.Pending())
 }
 
-// Epoch обязан принадлежать той записи, с которой перечитываем, а не
-// какой-нибудь другой из партиции.
-func TestPendingCarriesEpochOfThatRecord(t *testing.T) {
+// F6 regression: EpochOffset.Epoch is franz-go's lastConsumedEpoch — the
+// epoch of the record at offset-1 — not the epoch of the pending record
+// itself, which has not been consumed yet.
+func TestPendingCarriesLastConsumedEpoch(t *testing.T) {
 	o := NewOffsets()
 	o.Track(&kgo.Record{Topic: "t", Partition: 0, Offset: 9, LeaderEpoch: 2})
+	o.Done(&kgo.Record{Topic: "t", Partition: 0, Offset: 9, LeaderEpoch: 2})
 	o.Track(&kgo.Record{Topic: "t", Partition: 0, Offset: 10, LeaderEpoch: 4})
 
-	require.Equal(t, kgo.EpochOffset{Epoch: 2, Offset: 9}, o.Pending()["t"][0])
+	require.Equal(t, kgo.EpochOffset{Epoch: 2, Offset: 10}, o.Pending()["t"][0],
+		"epoch must belong to the done record at offset-1, not the pending record at offset")
+}
+
+// F6 regression: when offset-1 was never Done by this consumer (e.g. a
+// leader election moved to a new epoch and this consumer never read
+// through the old one for this partition), Pending must fall back to
+// franz-go's documented sentinel -1, which skips truncation detection,
+// rather than reporting an epoch that was never actually consumed.
+func TestPendingUsesSentinelEpochWhenPriorOffsetNotDone(t *testing.T) {
+	o := NewOffsets()
+	o.Track(&kgo.Record{Topic: "t", Partition: 0, Offset: 100, LeaderEpoch: 5})
+
+	require.Equal(t, kgo.EpochOffset{Epoch: -1, Offset: 100}, o.Pending()["t"][0])
 }
 
 // Партиции без незавершённых записей и тумбстоны перематывать нечего.
@@ -318,8 +333,8 @@ func TestPendingIsPerPartition(t *testing.T) {
 	o.Track(&kgo.Record{Topic: "u", Partition: 0, Offset: 5, LeaderEpoch: 1})
 
 	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
-		"t": {0: {Epoch: 1, Offset: 8}, 1: {Epoch: 1, Offset: 2}},
-		"u": {0: {Epoch: 1, Offset: 5}},
+		"t": {0: {Epoch: -1, Offset: 8}, 1: {Epoch: -1, Offset: 2}},
+		"u": {0: {Epoch: -1, Offset: 5}},
 	}, o.Pending())
 }
 

@@ -54,6 +54,22 @@ func (s *scriptedSubmitter) Submit(context.Context, *model.Command) ([]tbx.Outco
 	return s.outcomes, nil
 }
 
+// slowSubmitter всегда успешен, но перед возвратом ждёт delay. Нужен, чтобы
+// смоделировать пачку без единой инфраструктурной ошибки, которая тем не
+// менее коллективно медленная — бюджет должен ловить и такой случай, а не
+// только вечный ретрай.
+type slowSubmitter struct {
+	delay    time.Duration
+	outcomes []tbx.Outcome
+	calls    int
+}
+
+func (s *slowSubmitter) Submit(context.Context, *model.Command) ([]tbx.Outcome, error) {
+	time.Sleep(s.delay)
+	s.calls++
+	return s.outcomes, nil
+}
+
 // recordingEmitter умеет отказывать выборочно: провал DLQ и провал Results —
 // разные ветки handle, и их нельзя проверить одним общим переключателем.
 type recordingEmitter struct {
@@ -371,12 +387,46 @@ func TestProcessBatchAbandonsAndRewindsOnBudget(t *testing.T) {
 	require.Len(t, cl.setOffsets, 1, "брошенная пачка обязана перематываться")
 	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
 		"src": {
-			0: {Epoch: 3, Offset: 11}, // 10 обработана, перечитывать с 11
-			1: {Epoch: 3, Offset: 4},  // до неё не дошли вовсе
+			0: {Epoch: 3, Offset: 11}, // 10 обработана и Done с epoch 3
+			1: {Epoch: -1, Offset: 4}, // до неё не дошли вовсе — offset 3 не Done, сентинел
 		},
 	}, cl.setOffsets[0])
 	require.Zero(t, s.offsets.InFlight(), "брошенные партиции забыты")
 	require.Empty(t, s.offsets.Commitable(), "забытая партиция ничего не коммитит")
+}
+
+// C4: пачка без единой инфраструктурной ошибки — каждая запись успешна, но
+// медленная — обязана уложиться в бюджет так же, как и пачка, упирающаяся в
+// ретраи: бюджет проверяется в начале каждой итерации, а не только внутри
+// applyRecord.
+func TestProcessBatchAbandonsSlowSuccessfulBatch(t *testing.T) {
+	em := &recordingEmitter{}
+	sub := &slowSubmitter{
+		delay:    10 * time.Millisecond,
+		outcomes: []tbx.Outcome{{Index: 0, ID: "id-0", Status: tbx.StatusOK}},
+	}
+	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
+	s.batchBudget = 20 * time.Millisecond
+
+	records := []*kgo.Record{srcRec(0, 0), srcRec(0, 1), srcRec(0, 2), srcRec(0, 3), srcRec(0, 4)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.processBatch(context.Background(), records)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("processBatch не уложилась в бюджет — медленная успешная пачка не ограничена")
+	}
+
+	require.Less(t, sub.calls, len(records),
+		"пачка обязана быть брошена, не дойдя до конца")
+	cl := clientOf(t, s)
+	require.Len(t, cl.setOffsets, 1, "брошенная пачка обязана перематываться")
+	require.Equal(t, int64(2), cl.setOffsets[0]["src"][0].Offset,
+		"перематывать нужно с первой недошедшей записи")
+	require.Zero(t, s.offsets.InFlight(), "брошенная партиция забыта")
 }
 
 // Отмена контекста — не повод перематывать: процесс уходит, а незавершённые
@@ -402,7 +452,7 @@ func TestCommitSkipsMarkCommittedOnTransportError(t *testing.T) {
 	rec := srcRec(0, 0)
 	s.offsets.Track(rec)
 	s.offsets.Done(rec)
-	s.commit(context.Background())
+	s.commit(context.Background(), slog.LevelError)
 
 	require.Len(t, cl.committed, 1)
 	require.Equal(t, int64(1), s.offsets.Commitable()["src"][0].Offset,
@@ -419,7 +469,7 @@ func TestCommitSkipsMarkCommittedOnPartitionError(t *testing.T) {
 	rec := srcRec(0, 0)
 	s.offsets.Track(rec)
 	s.offsets.Done(rec)
-	s.commit(context.Background())
+	s.commit(context.Background(), slog.LevelError)
 
 	require.Len(t, cl.committed, 1)
 	require.Equal(t, int64(1), s.offsets.Commitable()["src"][0].Offset)
@@ -430,7 +480,7 @@ func TestCommitMarksCommittedOnSuccess(t *testing.T) {
 	rec := srcRec(0, 0)
 	s.offsets.Track(rec)
 	s.offsets.Done(rec)
-	s.commit(context.Background())
+	s.commit(context.Background(), slog.LevelError)
 
 	require.Empty(t, s.offsets.Commitable(), "успешный коммит двигает ватермарк")
 }

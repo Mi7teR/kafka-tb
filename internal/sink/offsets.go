@@ -124,8 +124,13 @@ func (o *Offsets) Commitable() map[string]map[int32]kgo.EpochOffset {
 }
 
 // Pending отдаёт для каждой партиции, где есть зарегистрированные, но не
-// завершённые записи, минимальный такой офсет и его leader epoch — точку,
-// с которой партицию нужно перечитать, если брошенную пачку не доработали.
+// завершённые записи, минимальный такой офсет — точку, с которой партицию
+// нужно перечитать, если брошенную пачку не доработали. EpochOffset.Epoch —
+// это franz-go'шный lastConsumedEpoch, epoch записи на offset-1, а не epoch
+// самой возвращаемой (ещё не прочитанной) записи; если offset-1 не
+// завершён (например, ничего не было прочитано до него этим консьюмером),
+// отдаём -1 — документированный сентинел franz-go, отключающий проверку
+// truncation detection для этой партиции.
 // Партиции без незавершённых записей и тумбстоны не попадают в результат.
 func (o *Offsets) Pending() map[string]map[int32]kgo.EpochOffset {
 	o.mu.Lock()
@@ -136,12 +141,16 @@ func (o *Offsets) Pending() map[string]map[int32]kgo.EpochOffset {
 			continue
 		}
 		offset := minOffset(st.pending)
+		epoch, ok := st.done[offset-1]
+		if !ok {
+			epoch = -1
+		}
 		tp, ok := out[k.topic]
 		if !ok {
 			tp = make(map[int32]kgo.EpochOffset)
 			out[k.topic] = tp
 		}
-		tp[k.partition] = kgo.EpochOffset{Epoch: st.pending[offset], Offset: offset}
+		tp[k.partition] = kgo.EpochOffset{Epoch: epoch, Offset: offset}
 	}
 	return out
 }
