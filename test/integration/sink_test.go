@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	types "github.com/tigerbeetle/tigerbeetle-go"
 
 	"github.com/Mi7teR/kafka-tb/internal/emit"
+	"github.com/Mi7teR/kafka-tb/internal/tbx"
 )
 
 // applyTimeout is how long a scenario waits for the sink to drain its topic.
@@ -79,9 +81,10 @@ func TestSinkAppliesTransfers(t *testing.T) {
 
 	debit, credit := seedAccounts(t, tb)
 	topic := cfg.Kafka.Topics[0].Name
+	id1, id2 := uuid.NewString(), uuid.NewString()
 	produce(t, brokers, topic, []string{
-		transferJSON(uuid.NewString(), debit, credit, "10.00"),
-		transferJSON(uuid.NewString(), debit, credit, "5.50"),
+		transferJSON(id1, debit, credit, "10.00"),
+		transferJSON(id2, debit, credit, "5.50"),
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -91,7 +94,20 @@ func TestSinkAppliesTransfers(t *testing.T) {
 	requireBalance(t, tb, credit, "15.50", applyTimeout)
 	require.Equal(t, "-15.50", balanceOf(t, tb, debit))
 
-	readTopic(t, brokers, cfg.Kafka.ResultsTopic, 2, applyTimeout)
+	// The two input records land on offsets 0 and 1 of a single-partition
+	// topic, so results are produced and read back in that same order.
+	results := readTopic(t, brokers, cfg.Kafka.ResultsTopic, 2, applyTimeout)
+	for i, want := range []string{id1, id2} {
+		var msg emit.ResultsMessage
+		require.NoError(t, json.Unmarshal(results[i].Value, &msg), "results record %d", i)
+		require.Equal(t, topic, msg.Source.Topic, "results record %d", i)
+		require.Equal(t, int32(0), msg.Source.Partition, "results record %d", i)
+		require.Equal(t, int64(i), msg.Source.Offset, "results record %d", i)
+		require.Len(t, msg.Results, 1, "results record %d", i)
+		require.Equal(t, 0, msg.Results[0].Index, "results record %d", i)
+		require.Equal(t, want, msg.Results[0].ID, "results record %d", i)
+		require.Equal(t, string(tbx.StatusOK), msg.Results[0].Status, "results record %d", i)
+	}
 	dlqRecords(t, brokers, cfg.Kafka.DLQTopic, 0, applyTimeout)
 }
 
@@ -203,8 +219,9 @@ func TestSinkSendsRejectToDLQ(t *testing.T) {
 	fund(t, tb, funder, debit, "100.00")
 
 	topic := cfg.Kafka.Topics[0].Name
+	rejectPayload := transferJSON(uuid.NewString(), debit, credit, "1000.00")
 	produce(t, brokers, topic, []string{
-		transferJSON(uuid.NewString(), debit, credit, "1000.00"),
+		rejectPayload,
 		transferJSON(uuid.NewString(), debit, credit, "25.00"),
 	})
 
@@ -218,6 +235,10 @@ func TestSinkSendsRejectToDLQ(t *testing.T) {
 	dlq := dlqRecords(t, brokers, cfg.Kafka.DLQTopic, 1, applyTimeout)
 	require.Equal(t, string(emit.ReasonReject), header(t, dlq[0], emit.HeaderReason))
 	require.Equal(t, "exceeds_credits", header(t, dlq[0], emit.HeaderError))
+	require.Equal(t, rejectPayload, string(dlq[0].Value),
+		"the DLQ must carry the original bytes so the record can be replayed")
+	require.Equal(t, "0", header(t, dlq[0], emit.HeaderSrcPartition))
+	require.Equal(t, "0", header(t, dlq[0], emit.HeaderSrcOffset))
 }
 
 // 5. DLQ replay is safe: republishing a dead-lettered record leaves balances
@@ -268,8 +289,9 @@ func TestSinkSurvivesRestart(t *testing.T) {
 
 	brokers := startRedpanda(t)
 	cfg := testConfig(t, brokers, startTigerBeetle(t))
-	// A small poll size makes the sink advance in visible steps, so the
-	// restart really lands in the middle of the stream instead of after it.
+	// A small TigerBeetle batch size makes the sink advance in visible steps,
+	// so the restart really lands in the middle of the stream instead of
+	// after it.
 	cfg.Batcher.MaxBatchSize = 8
 	createTopics(t, cfg)
 	tb := newTBClient(t, cfg)
@@ -304,6 +326,55 @@ func TestSinkSurvivesRestart(t *testing.T) {
 	dlqRecords(t, brokers, cfg.Kafka.DLQTopic, 0, applyTimeout)
 }
 
+// 6b. Restart after an abrupt stop: same no-loss, no-double-spend property as
+// scenario 6, but the first sink is not given a chance to run its graceful
+// drain (no ctx-cancellation final commit, no revoke commit — see
+// runSinkAbrupt for exactly how far that goes with this harness). A
+// regression that only commits offsets ahead of what TigerBeetle actually
+// durably applied would show up here as a gap the graceful case cannot
+// exercise, because the graceful case flushes and commits everything applied
+// right up to the stop.
+func TestSinkSurvivesAbruptRestart(t *testing.T) {
+	const count = 300
+
+	brokers := startRedpanda(t)
+	cfg := testConfig(t, brokers, startTigerBeetle(t))
+	// A small TigerBeetle batch size makes the sink advance in visible steps,
+	// so the kill really lands in the middle of the stream instead of after
+	// it.
+	cfg.Batcher.MaxBatchSize = 8
+	createTopics(t, cfg)
+	tb := newTBClient(t, cfg)
+
+	debit, credit := seedAccounts(t, tb)
+	ids := make([]string, count)
+	payloads := make([]string, count)
+	for i := range ids {
+		ids[i] = uuid.NewString()
+		payloads[i] = transferJSON(ids[i], debit, credit, "1.00")
+	}
+	produce(t, brokers, cfg.Kafka.Topics[0].Name, payloads)
+
+	kill := runSinkAbrupt(t, cfg, tb)
+	waitBalanceAtLeast(t, tb, credit, 300, applyTimeout) // 3.00, i.e. 3 records
+
+	atRestart := balanceMinor(t, tb, credit)
+	t.Logf("sink killed abruptly with %s of %d.00 applied", formatSigned(atRestart), count)
+	require.Less(t, atRestart.Int64(), int64(count*100),
+		"the sink drained the topic before the kill; this run proves nothing about mid-stream restarts")
+	kill()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	runSink(t, ctx, cfg, tb)
+	requireBalance(t, tb, credit, "300.00", 3*time.Minute)
+
+	// No loss: every id is present. No double-spend: the balance above is
+	// exactly count * 1.00, and a re-applied transfer would have overshot it.
+	require.Len(t, lookupTransfers(t, tb, ids), count)
+	dlqRecords(t, brokers, cfg.Kafka.DLQTopic, 0, applyTimeout)
+}
+
 // 7. Linked chain atomicity: a two-transfer chain whose second leg has
 // insufficient funds applies neither leg.
 func TestLinkedChainIsAtomic(t *testing.T) {
@@ -323,11 +394,12 @@ func TestLinkedChainIsAtomic(t *testing.T) {
 
 	legs := []string{uuid.NewString(), uuid.NewString()}
 	topic := cfg.Kafka.Topics[0].Name
+	chainPayload := transfersJSON(
+		transferSpec{ID: legs[0], Debit: debit, Credit: first, Amount: "10.00", Flags: []string{"linked"}},
+		transferSpec{ID: legs[1], Debit: debit, Credit: second, Amount: "1000.00"},
+	)
 	produce(t, brokers, topic, []string{
-		transfersJSON(
-			transferSpec{ID: legs[0], Debit: debit, Credit: first, Amount: "10.00", Flags: []string{"linked"}},
-			transferSpec{ID: legs[1], Debit: debit, Credit: second, Amount: "1000.00"},
-		),
+		chainPayload,
 		// A follow-up that must still be applied: a failed chain does not
 		// poison the stream.
 		transferJSON(uuid.NewString(), debit, first, "1.00"),
@@ -351,5 +423,9 @@ func TestLinkedChainIsAtomic(t *testing.T) {
 	require.ElementsMatch(t, []string{"linked_event_failed", "exceeds_credits"}, errs)
 	for _, rec := range dlq {
 		require.Equal(t, string(emit.ReasonReject), header(t, rec, emit.HeaderReason))
+		require.Equal(t, chainPayload, string(rec.Value),
+			"the DLQ must carry the original bytes so the record can be replayed")
+		require.Equal(t, "0", header(t, rec, emit.HeaderSrcPartition))
+		require.Equal(t, "0", header(t, rec, emit.HeaderSrcOffset))
 	}
 }

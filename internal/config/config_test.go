@@ -80,6 +80,28 @@ func TestLoadRejectsEmptyDLQ(t *testing.T) {
 	require.ErrorContains(t, err, "dlq_topic")
 }
 
+// P2: TigerBeetle rejects hostnames only at connect time, with an opaque
+// error. config.validate must catch it at load time instead.
+func TestLoadAcceptsBarePortAddress(t *testing.T) {
+	// validCfg already uses a bare port ("3000"); this pins that it stays valid.
+	_, err := Load(writeCfg(t, validCfg))
+	require.NoError(t, err)
+}
+
+func TestLoadAcceptsIPPortAddress(t *testing.T) {
+	body := replace(validCfg, `addresses: ["3000"]`, `addresses: ["127.0.0.1:3000"]`)
+	_, err := Load(writeCfg(t, body))
+	require.NoError(t, err)
+}
+
+func TestLoadRejectsHostnameAddress(t *testing.T) {
+	body := replace(validCfg, `addresses: ["3000"]`, `addresses: ["localhost:3000"]`)
+	_, err := Load(writeCfg(t, body))
+	require.ErrorContains(t, err, "tigerbeetle.addresses")
+	require.ErrorContains(t, err, "localhost:3000")
+	require.ErrorContains(t, err, "hostnames are not supported")
+}
+
 func TestEnvOverride(t *testing.T) {
 	t.Setenv("KAFKATB_MODE", "sink")
 	cfg, err := Load(writeCfg(t, validCfg))

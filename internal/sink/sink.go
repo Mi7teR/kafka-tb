@@ -230,6 +230,13 @@ func (s *Sink) applyRecord(ctx context.Context, rec *kgo.Record, deadline time.T
 			s.log.Error("handle contract violation: done=false with no error, retrying",
 				slog.String("topic", rec.Topic), slog.Int("partition", int(rec.Partition)),
 				slog.Int64("offset", rec.Offset))
+		} else if ctx.Err() != nil {
+			// Контекст уже отменён: это штатное завершение, а не сбой —
+			// backoff ниже вернёт false немедленно, ретрая не будет. Запись
+			// остаётся некоммиченной и будет обработана заново после рестарта.
+			s.log.Info("shutting down, leaving record uncommitted for reprocessing",
+				slog.String("topic", rec.Topic), slog.Int("partition", int(rec.Partition)),
+				slog.Int64("offset", rec.Offset), slog.String("error", err.Error()))
 		} else {
 			// Инфраструктура: та же запись повторяется, следующие ждут её.
 			s.log.Error("record failed, retrying", slog.String("topic", rec.Topic),

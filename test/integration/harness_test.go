@@ -12,6 +12,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -277,6 +278,77 @@ func runSink(t *testing.T, ctx context.Context, cfg *config.Config, tb tbx.Clien
 	return stop
 }
 
+// runSinkAbrupt starts the sink the same way runSink does, except for the
+// two things that make a stop graceful: it wires no OnRevoked commit (a
+// revoke is a no-op here), and s.Run is handed a context this function never
+// cancels. The only way to stop this instance is the returned kill, which
+// closes the Kafka client out from under the still-running Run loop: the
+// in-flight PollRecords call returns with IsClientClosed()==true, and Run
+// exits through its very first return statement — before the ctx-cancellation
+// final commit and before any revoke commit can run. Whatever the ordinary
+// periodic commit ticker already committed is all that survives.
+//
+// This is the closest approximation to a hard process kill (SIGKILL) this
+// in-process harness can express honestly. It is not identical: franz-go's
+// Close still performs a synchronous LeaveGroup exchange with the broker
+// before PollRecords unblocks, so the broker learns about the departure
+// immediately instead of via session-timeout, and the two internal commit
+// paths are skipped by construction rather than by the process simply
+// vanishing. What it does genuinely exercise is the property under test: no
+// commit synchronized with "stop" ever runs, so recovery depends entirely on
+// whatever the periodic ticker committed.
+func runSinkAbrupt(t *testing.T, cfg *config.Config, tb tbx.Client) (kill func()) {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	batcher := tbx.NewBatcher(tb, cfg.Batcher, cfg.Retry, log)
+	batcher.Start(context.Background())
+
+	reg := model.NewRegistry(cfg)
+	decoders, err := codec.NewRegistry(cfg.Kafka.Topics, func(name string) (codec.Decoder, error) {
+		if name != "json" {
+			return nil, fmt.Errorf("unsupported codec %q", name)
+		}
+		return jsonc.New(reg, cfg.Limits), nil
+	})
+	require.NoError(t, err)
+
+	producer, err := kgo.NewClient(kgo.SeedBrokers(cfg.Kafka.Brokers...))
+	require.NoError(t, err)
+	em := emit.New(producer, cfg.Kafka)
+
+	// No-op onRevoked: a revoke triggered as a side effect of the kill below
+	// must not be able to commit anything, or this would just be the
+	// graceful path under another name.
+	cl, err := sink.NewKafkaClient(cfg, func(context.Context, map[string][]int32) {})
+	require.NoError(t, err)
+	s := sink.New(cfg, cl, decoders, batcher, em, log)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.Run(context.Background())
+	}()
+
+	var once sync.Once
+	kill = func() {
+		once.Do(func() {
+			cl.Close()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Minute):
+				t.Error("sink did not exit within 2m of an abrupt client close")
+			}
+			// Not part of the property under test: plain resource cleanup so
+			// the rest of the suite does not leak connections and goroutines.
+			em.Close()
+			batcher.Close()
+		})
+	}
+	t.Cleanup(kill)
+	return kill
+}
+
 type sinkHolder struct {
 	mu sync.Mutex
 	s  *sink.Sink
@@ -501,6 +573,16 @@ func readTopic(t *testing.T, brokers []string, topic string, want int, timeout t
 		ctx, cancel := context.WithTimeout(context.Background(), budget)
 		fetches := cl.PollFetches(ctx)
 		cancel()
+		// The context deadline above is our own polling bound, not a real
+		// fetch error: without filtering it out, a genuinely broken consumer
+		// (bad auth, missing topic, ...) would be indistinguishable from an
+		// empty topic — every poll "fails" with DeadlineExceeded either way.
+		fetches.EachError(func(errTopic string, partition int32, err error) {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			require.NoError(t, err, "fetch error on topic %s partition %d", errTopic, partition)
+		})
 		before := len(out)
 		fetches.EachRecord(func(r *kgo.Record) { out = append(out, r) })
 		if len(out) >= want && len(out) == before {

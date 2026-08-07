@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -267,6 +268,54 @@ func TestHandlePanicWithDLQFailureBlocks(t *testing.T) {
 	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
 	require.Error(t, err)
 	require.False(t, done)
+}
+
+// capturedLog is one record captured by captureHandler.
+type capturedLog struct {
+	level slog.Level
+	msg   string
+}
+
+// captureHandler is a minimal slog.Handler that records level+message pairs
+// so a test can assert on what was logged, and at what level.
+type captureHandler struct {
+	mu   sync.Mutex
+	logs *[]capturedLog
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	*h.logs = append(*h.logs, capturedLog{level: r.Level, msg: r.Message})
+	return nil
+}
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
+
+// P1: a cancelled context is a graceful shutdown, not a failure. backoff
+// returns false immediately on a cancelled context, so there is no retry —
+// logging "record failed, retrying" at ERROR would page someone for a clean
+// shutdown. This pins the fix: no ERROR-level record-failure log when the
+// context is already cancelled.
+func TestApplyRecordCancelledContextDoesNotLogError(t *testing.T) {
+	var logs []capturedLog
+	em := &recordingEmitter{}
+	sub := &stubSubmitter{err: errors.New("tigerbeetle unavailable")}
+	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
+	s.log = slog.New(&captureHandler{logs: &logs})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rec := srcRec(0, 0)
+	ok := s.applyRecord(ctx, rec, time.Now().Add(time.Minute))
+
+	require.False(t, ok, "a cancelled context must abandon the record, not commit it")
+	require.NotEmpty(t, logs, "expected a shutdown log explaining the uncommitted record")
+	for _, l := range logs {
+		require.NotEqual(t, slog.LevelError, l.level,
+			"cancelled context must not log at ERROR: %q", l.msg)
+	}
 }
 
 type panicDecoder struct{}

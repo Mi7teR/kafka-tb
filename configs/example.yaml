@@ -3,6 +3,9 @@ mode: all
 # TigerBeetle cluster connection
 tigerbeetle:
   cluster_id: 0
+  # Each address is a bare port or an IP:port with an IP literal (e.g.
+  # "127.0.0.1:3000"). Hostnames are not supported: TigerBeetle's address
+  # parser rejects them at connect time, not here.
   addresses: ["3000"]
 # Batching behaviour for TigerBeetle writes
 batcher:

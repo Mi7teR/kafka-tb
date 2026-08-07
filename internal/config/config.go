@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -137,6 +138,11 @@ func (c *Config) validate() error {
 	if len(c.TigerBeetle.Addresses) == 0 {
 		return fmt.Errorf("tigerbeetle.addresses: must not be empty")
 	}
+	for _, a := range c.TigerBeetle.Addresses {
+		if err := validateTBAddress(a); err != nil {
+			return fmt.Errorf("tigerbeetle.addresses: %w", err)
+		}
+	}
 	if c.Batcher.MaxBatchSize <= 0 || c.Batcher.MaxBatchSize > MaxBatchSize {
 		return fmt.Errorf("batcher.max_batch_size: want 1..%d, got %d", MaxBatchSize, c.Batcher.MaxBatchSize)
 	}
@@ -216,6 +222,25 @@ func (c *Config) validate() error {
 		if c.API.MaxPageSize == 0 {
 			return fmt.Errorf("api.max_page_size: must be > 0")
 		}
+	}
+	return nil
+}
+
+// validateTBAddress rejects anything the TigerBeetle client would reject
+// only at connect time. TigerBeetle's address parser takes a bare port or an
+// IP:port with an IP literal — never a hostname: "localhost:3000" fails at
+// connect with an opaque "invalid client cluster address", long after config
+// load succeeded.
+func validateTBAddress(addr string) error {
+	if _, err := strconv.ParseUint(addr, 10, 16); err == nil {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%q: want a bare port or IP:port", addr)
+	}
+	if net.ParseIP(host) == nil {
+		return fmt.Errorf("%q: hostnames are not supported, TigerBeetle requires an IP literal", addr)
 	}
 	return nil
 }
