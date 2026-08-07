@@ -30,15 +30,17 @@ type Outcome struct {
 }
 
 // MapTransferResults вырезает окно команды из плотного ответа батча.
-// offset — позиция первого события команды внутри отправленного батча.
-func MapTransferResults(cmd *model.Command, results []types.CreateTransferResult, offset int) ([]Outcome, error) {
+// offset — позиция первого события команды внутри отправленного батча,
+// batchSize — размер всего батча, которым команда была отправлена.
+func MapTransferResults(cmd *model.Command, results []types.CreateTransferResult, offset, batchSize int) ([]Outcome, error) {
 	out := newOutcomes(cmd)
-	if len(results) == 0 {
-		return out, nil // пустой ответ = все события применены
+	if len(results) != batchSize {
+		return nil, fmt.Errorf("%w: got %d results, expected batch size %d",
+			ErrResultCountMismatch, len(results), batchSize)
 	}
-	if offset+len(out) > len(results) {
-		return nil, fmt.Errorf("%w: got %d results, command needs [%d,%d)",
-			ErrResultCountMismatch, len(results), offset, offset+len(out))
+	if offset < 0 || offset+len(out) > batchSize {
+		return nil, fmt.Errorf("%w: command window [%d,%d) does not fit batch size %d",
+			ErrResultCountMismatch, offset, offset+len(out), batchSize)
 	}
 	for i := range out {
 		r := results[offset+i]
@@ -53,15 +55,17 @@ func MapTransferResults(cmd *model.Command, results []types.CreateTransferResult
 }
 
 // MapAccountResults вырезает окно команды из плотного ответа батча.
-// offset — позиция первого события команды внутри отправленного батча.
-func MapAccountResults(cmd *model.Command, results []types.CreateAccountResult, offset int) ([]Outcome, error) {
+// offset — позиция первого события команды внутри отправленного батча,
+// batchSize — размер всего батча, которым команда была отправлена.
+func MapAccountResults(cmd *model.Command, results []types.CreateAccountResult, offset, batchSize int) ([]Outcome, error) {
 	out := newOutcomes(cmd)
-	if len(results) == 0 {
-		return out, nil
+	if len(results) != batchSize {
+		return nil, fmt.Errorf("%w: got %d results, expected batch size %d",
+			ErrResultCountMismatch, len(results), batchSize)
 	}
-	if offset+len(out) > len(results) {
-		return nil, fmt.Errorf("%w: got %d results, command needs [%d,%d)",
-			ErrResultCountMismatch, len(results), offset, offset+len(out))
+	if offset < 0 || offset+len(out) > batchSize {
+		return nil, fmt.Errorf("%w: command window [%d,%d) does not fit batch size %d",
+			ErrResultCountMismatch, offset, offset+len(out), batchSize)
 	}
 	for i := range out {
 		r := results[offset+i]
@@ -84,15 +88,26 @@ func newOutcomes(cmd *model.Command) []Outcome {
 }
 
 // errorName переводит "TransferExceedsCredits" в "exceeds_credits":
-// снимает префикс типа и переводит CamelCase в snake_case.
+// снимает префикс типа и переводит CamelCase в snake_case. Если ожидаемого
+// префикса нет (например, String() ушёл в default-ветку и вернул что-то вроде
+// "CreateTransferStatus(1)"), это не настоящее имя статуса TigerBeetle — сырая
+// строка возвращается как есть за пометкой "unknown_status_".
 func errorName(s, prefix string) string {
-	s = strings.TrimPrefix(s, prefix)
+	trimmed, ok := strings.CutPrefix(s, prefix)
+	if !ok {
+		return "unknown_status_" + s
+	}
+	runes := []rune(trimmed)
 	var sb strings.Builder
-	sb.Grow(len(s) + 8)
-	for i, r := range s {
+	sb.Grow(len(trimmed) + 8)
+	for i, r := range runes {
 		if r >= 'A' && r <= 'Z' {
 			if i > 0 {
-				sb.WriteByte('_')
+				prevUpper := runes[i-1] >= 'A' && runes[i-1] <= 'Z'
+				nextLower := i+1 < len(runes) && runes[i+1] >= 'a' && runes[i+1] <= 'z'
+				if !prevUpper || nextLower {
+					sb.WriteByte('_')
+				}
 			}
 			sb.WriteRune(r + ('a' - 'A'))
 			continue

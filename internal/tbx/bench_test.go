@@ -24,7 +24,7 @@ func BenchmarkMapResults(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := MapTransferResults(c, res, 0); err != nil {
+		if _, err := MapTransferResults(c, res, 0, n); err != nil {
 			b.Fatal(err)
 		}
 	}
