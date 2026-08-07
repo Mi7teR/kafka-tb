@@ -3,7 +3,9 @@ module github.com/Mi7teR/kafka-tb
 go 1.23
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/stretchr/testify v1.11.1
+	github.com/tigerbeetle/tigerbeetle-go v0.17.9
 	gopkg.in/yaml.v3 v3.0.1
 )
 
