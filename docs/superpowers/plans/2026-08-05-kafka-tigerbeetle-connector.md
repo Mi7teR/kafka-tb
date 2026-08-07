@@ -15,6 +15,7 @@
 - Модуль: `github.com/Mi7teR/kafka-tb`. Регистр владельца обязателен.
 - Go 1.23 или новее. `CGO_ENABLED=1` — клиент TigerBeetle использует cgo, чистая кросс-компиляция невозможна.
 - TigerBeetle client v0.17.9. Максимум событий в одном `create_accounts`/`create_transfers` — **8189**.
+- **macOS:** предсобранная статическая библиотека TigerBeetle не проходит линковку новым `ld` (`64-bit mach-o member 'libtb_client.a.o' not 8-byte aligned`). Сборка и тесты идут только через `make` — Makefile подставляет `-ldflags=-extldflags=-Wl,-ld_classic` на Darwin. Голый `go test ./...` на macOS падает на линковке; это не дефект кода.
 - Результаты `CreateAccounts`/`CreateTransfers` **sparse**: возвращаются только неуспешные события, каждое с полем `Index`. Отсутствие индекса в ответе означает успех.
 - `TransferOK` и `TransferExists` (и их account-аналоги) трактуются как успех. Всё остальное — reject.
 - Флаг `linked` не может стоять на последнем элементе батча — снимаем его на последнем элементе каждого сообщения.
