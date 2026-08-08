@@ -457,7 +457,7 @@ func (s *Sink) confirm(
 
 // count фиксирует окончательный исход подтверждённой записи.
 func (s *Sink) count(pub issuedPubs) {
-	if pub.poison != "" {
+	if pub.isPoison {
 		s.metrics.IncRecords("poison")
 		s.metrics.IncDLQ(string(emit.ReasonPoison), pub.poison)
 		return
@@ -587,8 +587,14 @@ func (s *Sink) prepare(ctx context.Context, rec *kgo.Record) (p prepared) {
 // results, либо DLQ.
 type issuedPubs struct {
 	pubs []*emit.Publication
+	// isPoison отличает запись, которая никогда не применится, от применённой:
+	// от этого флага, а не от значения poison, зависит, какую ветку count
+	// берёт для метрики. poison — только текст ошибки для DLQ и метрики;
+	// заведение его как единственного флага позволило бы пустому errName
+	// молча провалиться в ветку outcomes.
+	isPoison bool
 	// poison называет ошибку для DLQ записи, которая никогда не применится.
-	// Пусто, если запись дошла до TigerBeetle.
+	// Осмыслен только когда isPoison — true.
 	poison string
 	// outcomes — исходы применённой команды; nil у poison.
 	outcomes []tbx.Outcome
@@ -601,6 +607,12 @@ type issuedPubs struct {
 func (s *Sink) finish(
 	ctx context.Context, rec *kgo.Record, p prepared, res tbx.SubmitResult,
 ) (pub issuedPubs, err error) {
+	// pubs — публикации, уже выданные брокеру к моменту паники, если она
+	// случится ниже. Паника в recover заменяет исход, но не имеет права
+	// стереть то, что уже улетело: та публикация всё равно долетит и обязана
+	// быть дождана, иначе Done наступит по одному только ack поисонового DLQ,
+	// пока эта первая публикация повисла неучтённой.
+	var pubs []*emit.Publication
 	defer func() {
 		r := recover()
 		if r == nil {
@@ -609,7 +621,9 @@ func (s *Sink) finish(
 		// Паника — дефект в обработке этого сообщения, а не всего потока.
 		s.log.Error("panic handling record", slog.Any("panic", r),
 			slog.String("topic", rec.Topic), slog.Int64("offset", rec.Offset))
-		pub, err = s.emitPoison(ctx, rec, "panic", fmt.Sprint(r)), nil
+		poison := s.emitPoison(ctx, rec, "panic", fmt.Sprint(r))
+		pub = issuedPubs{pubs: append(pubs, poison.pubs...), isPoison: true, poison: poison.poison}
+		err = nil
 	}()
 
 	if p.poison != "" {
@@ -630,7 +644,7 @@ func (s *Sink) finish(
 		return issuedPubs{}, res.Err
 	}
 
-	pubs := make([]*emit.Publication, 0, 1+len(res.Outcomes))
+	pubs = make([]*emit.Publication, 0, 1+len(res.Outcomes))
 	pubs = append(pubs, s.em.Results(ctx, rec, res.Outcomes))
 	for _, o := range res.Outcomes {
 		if o.Status != tbx.StatusRejected {
@@ -647,8 +661,9 @@ func (s *Sink) finish(
 // этой публикации.
 func (s *Sink) emitPoison(ctx context.Context, rec *kgo.Record, errName, detail string) issuedPubs {
 	return issuedPubs{
-		pubs:   []*emit.Publication{s.em.DLQ(ctx, rec, emit.ReasonPoison, errName, detail)},
-		poison: errName,
+		pubs:     []*emit.Publication{s.em.DLQ(ctx, rec, emit.ReasonPoison, errName, detail)},
+		isPoison: true,
+		poison:   errName,
 	}
 }
 

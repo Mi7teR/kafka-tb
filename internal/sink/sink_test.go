@@ -372,6 +372,29 @@ func (panicOnDLQEmitter) Close()                      {}
 
 var _ emitterIface = panicOnDLQEmitter{}
 
+// resultsThenPanicOnceEmitter issues a real, controllable Results publication
+// and panics on its first DLQ call — modelling a panic in finish after
+// Results has already been issued to the broker but before the reject DLQ
+// publication is. Every DLQ call after the first (the panic-recovery's own
+// poison publication) behaves like deferredEmitter. Used to prove the
+// already-issued Results publication is not orphaned by the recovery.
+type resultsThenPanicOnceEmitter struct {
+	deferredEmitter
+	dlqCalls int
+}
+
+func (e *resultsThenPanicOnceEmitter) DLQ(
+	ctx context.Context, rec *kgo.Record, reason emitReason, errName, detail string,
+) *emit.Publication {
+	e.dlqCalls++
+	if e.dlqCalls == 1 {
+		panic("dlq exploded")
+	}
+	return e.deferredEmitter.DLQ(ctx, rec, reason, errName, detail)
+}
+
+var _ emitterIface = (*resultsThenPanicOnceEmitter)(nil)
+
 // deferredEmitter публикует, не отвечая: обещания копятся, а завершает их
 // release — в любом порядке. Так выглядит настоящая асинхронная публикация, у
 // которой брокер отвечает позже и не обязательно в порядке выдачи. Без такого
@@ -386,7 +409,7 @@ type deferredEmitter struct {
 }
 
 func (d *deferredEmitter) pend(kind string, rec *kgo.Record) *emit.Publication {
-	p, resolve := emit.NewPending()
+	p, resolve := emit.NewTestPublication()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.published = append(d.published,
@@ -420,6 +443,32 @@ func (d *deferredEmitter) releaseAll() int {
 		pending[i](nil)
 	}
 	return len(pending)
+}
+
+// releaseKind resolves only the accumulated promises whose publication kind
+// matches, leaving the rest pending. Needed to prove that acknowledging one
+// of a record's publications alone is not enough to complete it while
+// another is still outstanding — releaseAll can't distinguish that from
+// "everything was awaited". Relies on d.resolve and d.published growing in
+// lockstep in pend(), which holds as long as this is the only kind of
+// partial release used against a given deferredEmitter.
+func (d *deferredEmitter) releaseKind(kind string) int {
+	d.mu.Lock()
+	var toResolve []func(error)
+	remaining := d.resolve[:0:0]
+	for i, resolve := range d.resolve {
+		if d.published[i].kind == kind {
+			toResolve = append(toResolve, resolve)
+			continue
+		}
+		remaining = append(remaining, resolve)
+	}
+	d.resolve = remaining
+	d.mu.Unlock()
+	for _, resolve := range toResolve {
+		resolve(nil)
+	}
+	return len(toResolve)
 }
 
 func (d *deferredEmitter) publishedFor(partition int32) []publication {
@@ -1186,6 +1235,65 @@ func TestProcessBatchSurvivesPanicInPartitionGoroutine(t *testing.T) {
 	require.Equal(t, int64(4), cl.setOffsets[0]["src"][0].Offset)
 	require.Zero(t, s.offsets.InFlight(), "брошенная партиция забыта")
 	require.Empty(t, s.offsets.Commitable(), "офсет записи с паникой не коммитится")
+}
+
+// F2 (review): паника между выдачей Results и выдачей reject DLQ не имеет
+// права осиротить уже выданную публикацию Results — recover в finish обязан
+// дождаться и её вместе с поисоновым DLQ, а не заменить набор публикаций
+// целиком. Без фикса Results-публикация терялась бы: offsets.Done наступал
+// бы по одному только ack поисонового DLQ, хотя брокеру ушли обе.
+func TestFinishPanicAfterResultsAwaitsAlreadyIssuedPublication(t *testing.T) {
+	em := &resultsThenPanicOnceEmitter{}
+	sub := &stubSubmitter{outcomes: []tbx.Outcome{
+		{Index: 0, ID: "id-0", Status: tbx.StatusRejected, Error: "exceeds_credits"},
+	}}
+	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
+
+	rec := srcRec(0, 0)
+	s.offsets.Track(rec)
+
+	type passResult struct {
+		applied int
+		err     error
+	}
+	done := make(chan passResult, 1)
+	go func() {
+		applied, err := s.pass(context.Background(), []*kgo.Record{rec}, time.Now().Add(time.Minute))
+		done <- passResult{applied, err}
+	}()
+
+	// Обе публикации обязаны быть выданы — Results до паники, DLQ поисона
+	// после recover'а, — и ни одна ещё не подтверждена: pass обязана висеть.
+	require.Eventually(t, func() bool { return len(em.publishedFor(0)) == 2 }, time.Second, time.Millisecond,
+		"Results и поисоновый DLQ обязаны быть выданы, даже если между ними была паника")
+	select {
+	case r := <-done:
+		t.Fatalf("pass завершилась до подтверждения обеих публикаций: %+v", r)
+	case <-time.After(50 * time.Millisecond):
+	}
+	require.Equal(t, 1, s.offsets.InFlight(), "запись без подтверждения обеих публикаций не может быть Done")
+	require.Empty(t, s.offsets.Commitable())
+
+	// Подтверждается только поисоновый DLQ: если бы recover заменял набор
+	// публикаций целиком (баг), этого было бы достаточно для Done — Results
+	// давно потерян. С фиксом record обязана остаться в полёте.
+	require.Equal(t, 1, em.releaseKind("dlq"))
+	select {
+	case r := <-done:
+		t.Fatalf("pass завершилась при неподтверждённом Results: %+v", r)
+	case <-time.After(50 * time.Millisecond):
+	}
+	require.Equal(t, 1, s.offsets.InFlight(),
+		"осиротевшая публикация Results обязана по-прежнему держать запись в полёте")
+
+	require.Equal(t, 1, em.releaseKind("results"))
+
+	r := <-done
+	require.NoError(t, r.err)
+	require.Equal(t, 1, r.applied)
+	require.Zero(t, s.offsets.InFlight())
+	require.Equal(t, int64(1), s.offsets.Commitable()["src"][0].Offset,
+		"запись обязана стать коммитабельной только после ack обеих публикаций")
 }
 
 // T16: публикация теперь асинхронна, и весь контракт «офсет только после ack»

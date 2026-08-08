@@ -318,6 +318,39 @@ func TestWaitOnUnfinishedPublicationRespectsContext(t *testing.T) {
 	require.ErrorIs(t, p.Wait(ctx), context.DeadlineExceeded)
 }
 
+// Позднее Wait одной ошибки не имеет права снять с учёта другую, добавленную
+// уже после того, как первую доложил и сбросил предыдущий Flush: учёт обязан
+// вестись по идентичности публикации, а не общим счётчиком. Раньше было
+// наоборот — A доложена и сброшена, C добавлена, поздний Wait(A)
+// декрементировал общий счётчик и стирал ошибку C, и следующий Flush
+// врал, что всё подтверждено.
+func TestFlushTracksFailuresByPublicationIdentity(t *testing.T) {
+	em, _, _ := newTestEmitter(t)
+	e := em.(*emitter)
+	ctx := context.Background()
+
+	errA := errors.New("failure A")
+	pubA := e.failed(errA)
+
+	firstFlushErr := em.Flush(ctx)
+	require.Error(t, firstFlushErr, "Flush must report failure A")
+	require.Contains(t, firstFlushErr.Error(), errA.Error())
+
+	errC := errors.New("failure C")
+	pubC := e.failed(errC)
+
+	// A уже доложена и сброшена; поздний Wait на ней не имеет права задеть C.
+	require.EqualError(t, pubA.Wait(ctx), errA.Error())
+
+	secondFlushErr := em.Flush(ctx)
+	require.Error(t, secondFlushErr, "C is still untaken and unacknowledged; the second Flush must report it")
+	require.Contains(t, secondFlushErr.Error(), errC.Error(),
+		"the reported error must belong to the failure actually still outstanding")
+
+	require.EqualError(t, pubC.Wait(ctx), errC.Error())
+	require.NoError(t, em.Flush(ctx), "both failures have now been taken or reported")
+}
+
 func headerMap(r *kgo.Record) map[string]string {
 	m := make(map[string]string, len(r.Headers))
 	for _, h := range r.Headers {

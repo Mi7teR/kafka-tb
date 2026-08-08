@@ -48,11 +48,15 @@ func Resolved(err error) *Publication {
 	return &Publication{done: done, err: err}
 }
 
-// NewPending отдаёт ещё не завершённое обещание и функцию, которой его
-// завершают ровно один раз. Нужен любой реализации Emitter вне этого пакета:
-// без него публикацию можно было бы отдать только уже готовой, а весь смысл
-// обещания в том, что ответ приходит позже.
-func NewPending() (*Publication, func(error)) {
+// NewTestPublication отдаёт ещё не завершённое обещание и функцию, которой
+// его завершают ровно один раз. Экспортирован ради тестового двойника
+// Emitter в internal/sink (deferredEmitter), которому нужен настоящий
+// *Publication с управляемым по времени подтверждением — только так можно
+// проверить, что offsets.Done наступает исключительно после ack, а не на
+// самой выдаче публикации. Имя отделяет его от Resolved и produce —
+// единственных путей, которыми настоящий Emitter строит публикацию, — чтобы
+// не выглядеть частью производственного API.
+func NewTestPublication() (*Publication, func(error)) {
 	p := &Publication{done: make(chan struct{})}
 	var once sync.Once
 	return p, func(err error) {
@@ -88,7 +92,7 @@ func (p *Publication) Wait(ctx context.Context) error {
 // коммит всех остальных партиций.
 func (p *Publication) take() error {
 	if p.err != nil && p.e != nil && p.taken.CompareAndSwap(false, true) {
-		p.e.takeFailure()
+		p.e.takeFailure(p)
 	}
 	return p.err
 }
@@ -119,9 +123,16 @@ type emitter struct {
 	// mu защищает учёт провалившихся публикаций, чей исход никто не забрал.
 	// Именно они — и только они — обязаны валить Flush: коммит после такого
 	// Flush закоммитил бы офсет записи, которой в DLQ или results нет.
-	mu       sync.Mutex
-	untaken  int
-	firstErr error
+	//
+	// Учёт ведётся по идентичности публикации (map, а не общим счётчиком):
+	// иначе Wait, пришедший уже после того, как Flush доложил и сбросил
+	// счётчик, декрементировал бы его вслепую и мог стереть ошибку другой,
+	// добавленной позже публикации. order хранит порядок появления ошибок
+	// только затем, чтобы Flush мог назвать самую раннюю ещё не снятую —
+	// это часть текста ошибки, а не часть решения «валить или нет».
+	mu      sync.Mutex
+	untaken map[*Publication]error
+	order   []*Publication
 }
 
 func New(cl *kgo.Client, cfg config.Kafka) Emitter {
@@ -180,7 +191,7 @@ func (e *emitter) produce(ctx context.Context, out *kgo.Record, what string) *Pu
 	e.cl.Produce(ctx, out, func(_ *kgo.Record, err error) {
 		if err != nil {
 			p.err = fmt.Errorf("%s: %w", what, err)
-			e.addFailure(p.err)
+			e.addFailure(p, p.err)
 		}
 		close(p.done)
 	})
@@ -193,30 +204,30 @@ func (e *emitter) produce(ctx context.Context, out *kgo.Record, what string) *Pu
 func (e *emitter) failed(err error) *Publication {
 	p := Resolved(err)
 	p.e = e
-	e.addFailure(err)
+	e.addFailure(p, err)
 	return p
 }
 
-func (e *emitter) addFailure(err error) {
+// addFailure заводит p на учёт Flush по собственной идентичности: два разных
+// провала не должны делить один слот и мешать снятию друг друга с учёта.
+func (e *emitter) addFailure(p *Publication, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.untaken++
-	if e.firstErr == nil {
-		e.firstErr = err
+	if e.untaken == nil {
+		e.untaken = make(map[*Publication]error)
 	}
+	e.untaken[p] = err
+	e.order = append(e.order, p)
 }
 
-func (e *emitter) takeFailure() {
+// takeFailure снимает p с учёта Flush, если он там ещё числится. Если Flush
+// уже доложил именно эту ошибку и сбросил учёт, снимать нечего — вычитать по
+// общему счётчику здесь не в праве, иначе позднее Wait одной публикации
+// стёрло бы с учёта другую, добавленную уже после того сброса.
+func (e *emitter) takeFailure(p *Publication) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.untaken == 0 {
-		// Ошибку уже доложил Flush и сбросил учёт; повторно её не вычитаем.
-		return
-	}
-	e.untaken--
-	if e.untaken == 0 {
-		e.firstErr = nil
-	}
+	delete(e.untaken, p)
 }
 
 // Flush опустошает буфер продюсера и докладывает о публикациях, которые
@@ -229,11 +240,21 @@ func (e *emitter) Flush(ctx context.Context) error {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.untaken == 0 {
+	if len(e.untaken) == 0 {
 		return nil
 	}
-	err := fmt.Errorf("%d unacknowledged publication(s): %w", e.untaken, e.firstErr)
-	e.untaken, e.firstErr = 0, nil
+	// order может содержать записи, которые уже сняты take'ом (значит, их
+	// уже нет в untaken); firstErr — ошибка самой ранней из тех, что дожили
+	// до этого Flush непринятыми.
+	var firstErr error
+	for _, p := range e.order {
+		if err, ok := e.untaken[p]; ok {
+			firstErr = err
+			break
+		}
+	}
+	err := fmt.Errorf("%d unacknowledged publication(s): %w", len(e.untaken), firstErr)
+	e.untaken, e.order = nil, nil
 	return err
 }
 
