@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,7 +18,6 @@ func writeCfg(t *testing.T, body string) string {
 }
 
 const validCfg = `
-mode: all
 tigerbeetle:
   cluster_id: 0
   addresses: ["3000"]
@@ -48,7 +48,6 @@ metrics_addr: ":9464"
 func TestLoadValid(t *testing.T) {
 	cfg, err := Load(writeCfg(t, validCfg))
 	require.NoError(t, err)
-	require.Equal(t, ModeAll, cfg.Mode)
 	l, ok := cfg.LedgerByName("USD")
 	require.True(t, ok)
 	require.Equal(t, uint32(1), l.ID)
@@ -163,11 +162,80 @@ func TestLoadRejectsNegativeMaxInFlightPerPartition(t *testing.T) {
 	require.ErrorContains(t, err, "sink.max_in_flight_per_partition")
 }
 
-func TestEnvOverride(t *testing.T) {
-	t.Setenv("KAFKATB_MODE", "sink")
+// The --mode flag/field is gone (replaced by cobra subcommands), but the
+// property it used to demonstrate — KAFKATB_* overrides the file — still
+// needs a live field to exercise it against.
+func TestEnvOverridesFile(t *testing.T) {
+	t.Setenv("KAFKATB_KAFKA_GROUP", "from-env")
 	cfg, err := Load(writeCfg(t, validCfg))
 	require.NoError(t, err)
-	require.Equal(t, ModeSink, cfg.Mode)
+	require.Equal(t, "from-env", cfg.Kafka.Group)
+}
+
+// Nested keys get the same env treatment as top-level ones.
+func TestEnvOverridesNestedFile(t *testing.T) {
+	t.Setenv("KAFKATB_BATCHER_MAX_QUEUE", "42")
+	cfg, err := Load(writeCfg(t, validCfg))
+	require.NoError(t, err)
+	require.Equal(t, 42, cfg.Batcher.MaxQueue)
+}
+
+func TestLoadRejectsUnknownTopLevelKey(t *testing.T) {
+	body := validCfg + "\nmax_batch_sze: 100\n"
+	_, err := Load(writeCfg(t, body))
+	require.ErrorContains(t, err, "unknown key")
+	require.ErrorContains(t, err, "max_batch_sze")
+}
+
+func TestLoadRejectsUnknownNestedKey(t *testing.T) {
+	body := replace(validCfg, "max_batch_size: 8189", "max_batch_size: 8189\n  max_batch_sze: 100")
+	_, err := Load(writeCfg(t, body))
+	require.ErrorContains(t, err, "unknown key")
+	require.ErrorContains(t, err, "batcher.max_batch_sze")
+}
+
+// Unknown keys are checked below the map/slice boundary too: a typo inside
+// a ledgers entry, or inside a topics list element, must not be silently
+// accepted as an extra field on that entry.
+func TestLoadRejectsUnknownKeyInsideLedgerEntry(t *testing.T) {
+	body := replace(validCfg, "USD: {id: 1, scale: 2}", "USD: {id: 1, scale: 2, scal: 2}")
+	_, err := Load(writeCfg(t, body))
+	require.ErrorContains(t, err, "unknown key")
+	require.ErrorContains(t, err, "ledgers.USD.scal")
+}
+
+func TestLoadRejectsUnknownKeyInsideTopicsEntry(t *testing.T) {
+	body := replace(validCfg, "{name: ledger.transfers, codec: json}", "{name: ledger.transfers, codec: json, codc: json}")
+	_, err := Load(writeCfg(t, body))
+	require.ErrorContains(t, err, "unknown key")
+	require.ErrorContains(t, err, "kafka.topics[0].codc")
+}
+
+// A flag takes precedence over KAFKATB_* env, which takes precedence over
+// the file — the full chain the task requires.
+func TestFlagOverridesEnv(t *testing.T) {
+	t.Setenv("KAFKATB_METRICS_ADDR", ":9000")
+
+	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	fs.String("metrics-addr", "", "")
+	require.NoError(t, fs.Parse([]string{"--metrics-addr=:9500"}))
+
+	cfg, err := Load(writeCfg(t, validCfg), WithFlag("metrics_addr", fs.Lookup("metrics-addr")))
+	require.NoError(t, err)
+	require.Equal(t, ":9500", cfg.MetricsAddr)
+}
+
+// An unset flag must not shadow a lower-precedence source.
+func TestUnsetFlagDoesNotOverrideEnv(t *testing.T) {
+	t.Setenv("KAFKATB_METRICS_ADDR", ":9000")
+
+	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	fs.String("metrics-addr", "", "")
+	require.NoError(t, fs.Parse(nil))
+
+	cfg, err := Load(writeCfg(t, validCfg), WithFlag("metrics_addr", fs.Lookup("metrics-addr")))
+	require.NoError(t, err)
+	require.Equal(t, ":9000", cfg.MetricsAddr)
 }
 
 // replace performs a single-occurrence string replacement.

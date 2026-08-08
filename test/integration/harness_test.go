@@ -17,6 +17,9 @@ import (
 	"log/slog"
 	"math/big"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -56,6 +59,11 @@ const (
 var (
 	sharedBrokers []string
 	sharedTBAddr  string
+	// sharedBinary is the kafkatb binary built once for the subcommand/SIGTERM
+	// tests, which drive the real CLI as a subprocess rather than calling
+	// package code directly — that is the only way to genuinely exercise OS
+	// signal delivery.
+	sharedBinary string
 )
 
 func TestMain(m *testing.M) { os.Exit(run(m)) }
@@ -82,8 +90,45 @@ func run(m *testing.M) int {
 		return 1
 	}
 
+	bin, cleanup, err := buildKafkatbBinary(ctx)
+	defer cleanup()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "build kafkatb:", err)
+		return 1
+	}
+	sharedBinary = bin
+
 	sharedBrokers, sharedTBAddr = []string{seed}, addr
 	return m.Run()
+}
+
+// buildKafkatbBinary compiles cmd/kafkatb once, into a temp dir the returned
+// cleanup removes. On macOS the TigerBeetle client's prebuilt static library
+// isn't 8-byte aligned, which the modern linker rejects; Makefile works
+// around that with the classic linker, and this does the same directly since
+// exec'ing make from here would just build the same thing a second time.
+func buildKafkatbBinary(ctx context.Context) (string, func(), error) {
+	dir, err := os.MkdirTemp("", "kafkatb-bin-*")
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	if err != nil {
+		return "", func() {}, err
+	}
+
+	bin := filepath.Join(dir, "kafkatb")
+	args := []string{"build", "-o", bin}
+	if runtime.GOOS == "darwin" {
+		args = append(args, "-ldflags=-extldflags=-Wl,-ld_classic")
+	}
+	args = append(args, "github.com/Mi7teR/kafka-tb/cmd/kafkatb")
+
+	cmd := exec.CommandContext(ctx, "go", args...)
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("go build: %w: %s", err, out)
+	}
+	return bin, cleanup, nil
 }
 
 // TigerBeetle needs its data file formatted before the replica can start, so
@@ -147,7 +192,6 @@ func testConfig(t *testing.T, brokers []string, tbAddr string) *config.Config {
 	t.Helper()
 	name := kafkaName(t.Name())
 	return &config.Config{
-		Mode:        config.ModeSink,
 		TigerBeetle: config.TigerBeetle{ClusterID: 0, Addresses: []string{tbAddr}},
 		Batcher: config.Batcher{
 			MaxBatchSize: config.MaxBatchSize,

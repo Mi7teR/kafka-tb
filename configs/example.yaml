@@ -1,5 +1,3 @@
-# Operating mode: sink | all
-mode: all
 # TigerBeetle cluster connection
 tigerbeetle:
   cluster_id: 0

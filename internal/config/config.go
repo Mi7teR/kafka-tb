@@ -1,13 +1,18 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
+	mapstructure "github.com/go-viper/mapstructure/v2"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 )
 
@@ -16,13 +21,6 @@ const MaxBatchSize = 8189
 // DefaultMaxInFlightPerPartition is used when sink.max_in_flight_per_partition
 // is left unset.
 const DefaultMaxInFlightPerPartition = 1000
-
-type Mode string
-
-const (
-	ModeSink Mode = "sink"
-	ModeAll  Mode = "all"
-)
 
 type Ledger struct {
 	ID    uint32 `yaml:"id"`
@@ -85,7 +83,6 @@ type Retry struct {
 }
 
 type Config struct {
-	Mode            Mode              `yaml:"mode"`
 	TigerBeetle     TigerBeetle       `yaml:"tigerbeetle"`
 	Batcher         Batcher           `yaml:"batcher"`
 	Sink            Sink              `yaml:"sink"`
@@ -109,18 +106,78 @@ func (c *Config) CodeByName(name string) (uint16, bool) {
 	return v, ok
 }
 
-func Load(path string) (*Config, error) {
+// Option customises the *viper.Viper Load builds internally, before the
+// config file and environment are read. Its only use today is WithFlag,
+// which lets a caller (cmd/kafkatb) make a command-line flag take precedence
+// over everything else.
+type Option func(*viper.Viper)
+
+// WithFlag binds a pflag to a config key, giving it top priority: an
+// explicitly-set flag overrides KAFKATB_* env vars, which override the
+// config file, which overrides defaults. A flag left at its default is
+// ignored, exactly like viper.Viper.BindPFlag.
+func WithFlag(key string, flag *pflag.Flag) Option {
+	return func(v *viper.Viper) {
+		_ = v.BindPFlag(key, flag) // only errors when flag is nil
+	}
+}
+
+// Load reads and validates the config file at path, in this order:
+// flags (via opts) > KAFKATB_* environment variables > the file > defaults.
+// It is the single place that produces a validated *Config.
+func Load(path string, opts ...Option) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	var cfg Config
-	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
-	dec.KnownFields(true)
-	if err := dec.Decode(&cfg); err != nil {
+
+	// Viper silently ignores keys it doesn't recognise, so a typo like
+	// max_batch_sze would quietly keep its default. Catch that ourselves,
+	// against the shape of Config, before viper ever sees the file.
+	var rawTree map[string]any
+	if err := yaml.Unmarshal(raw, &rawTree); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	applyEnv(&cfg)
+	if err := checkKnownKeys(rawTree, reflect.TypeOf(Config{}), ""); err != nil {
+		return nil, err
+	}
+
+	v := viper.New()
+	for _, opt := range opts {
+		opt(v)
+	}
+	v.SetConfigType("yaml")
+	if err := v.ReadConfig(bytes.NewReader(raw)); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	v.SetEnvPrefix("KAFKATB")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+	// sink.max_in_flight_per_partition is the one field that may be absent
+	// from the file (see the clamp below). Registering it means an env
+	// override for it still works even when the file never mentions it.
+	v.SetDefault("sink.max_in_flight_per_partition", 0)
+
+	var cfg Config
+	err = v.Unmarshal(&cfg, func(c *mapstructure.DecoderConfig) { c.TagName = "yaml" })
+	if err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	// Viper lowercases every key it reads for case-insensitive lookups,
+	// including these two maps' keys — "USD" would become "usd". Ledger and
+	// code names are caller-chosen identifiers, not config knob names, and
+	// must keep their case, so decode just these two fields straight from
+	// the file instead of through viper.
+	var names struct {
+		Ledgers map[string]Ledger `yaml:"ledgers"`
+		Codes   map[string]uint16 `yaml:"codes"`
+	}
+	if err := yaml.Unmarshal(raw, &names); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	cfg.Ledgers, cfg.Codes = names.Ledgers, names.Codes
+
 	if cfg.Sink.MaxInFlightPerPartition == 0 {
 		// The default is clamped to the batcher's ceiling rather than imposed outright:
 		// a config written before this field existed might have a queue smaller
@@ -136,32 +193,71 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-func applyEnv(cfg *Config) {
-	if v := os.Getenv("KAFKATB_MODE"); v != "" {
-		cfg.Mode = Mode(v)
+// checkKnownKeys walks node (as decoded by yaml.v3 into plain maps/slices)
+// against t, the Go type it is destined to fill, and fails on the first key
+// with no corresponding yaml-tagged field — at any depth, not just the top
+// level. path is the dotted/indexed location of node, for the error message.
+func checkKnownKeys(node any, t reflect.Type, path string) error {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
 	}
-	if v := os.Getenv("KAFKATB_KAFKA_BROKERS"); v != "" {
-		cfg.Kafka.Brokers = strings.Split(v, ",")
-	}
-	if v := os.Getenv("KAFKATB_KAFKA_GROUP"); v != "" {
-		cfg.Kafka.Group = v
-	}
-	if v := os.Getenv("KAFKATB_TB_ADDRESSES"); v != "" {
-		cfg.TigerBeetle.Addresses = strings.Split(v, ",")
-	}
-	if v := os.Getenv("KAFKATB_TB_CLUSTER_ID"); v != "" {
-		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
-			cfg.TigerBeetle.ClusterID = n
+	switch t.Kind() {
+	case reflect.Struct:
+		m, ok := node.(map[string]any)
+		if !ok {
+			return nil // shape mismatch: the decode step below will report it
+		}
+		fields := map[string]reflect.StructField{}
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			name, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+			if name == "" || name == "-" {
+				continue
+			}
+			fields[name] = f
+		}
+		for k, v := range m {
+			f, ok := fields[k]
+			child := joinPath(path, k)
+			if !ok {
+				return fmt.Errorf("config: unknown key %q", child)
+			}
+			if err := checkKnownKeys(v, f.Type, child); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		m, ok := node.(map[string]any)
+		if !ok {
+			return nil
+		}
+		for k, v := range m {
+			if err := checkKnownKeys(v, t.Elem(), joinPath(path, k)); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		s, ok := node.([]any)
+		if !ok {
+			return nil
+		}
+		for i, v := range s {
+			if err := checkKnownKeys(v, t.Elem(), fmt.Sprintf("%s[%d]", path, i)); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
+}
+
+func joinPath(prefix, key string) string {
+	if prefix == "" {
+		return key
+	}
+	return prefix + "." + key
 }
 
 func (c *Config) validate() error {
-	switch c.Mode {
-	case ModeSink, ModeAll:
-	default:
-		return fmt.Errorf("mode: want sink|all, got %q", c.Mode)
-	}
 	if len(c.TigerBeetle.Addresses) == 0 {
 		return fmt.Errorf("tigerbeetle.addresses: must not be empty")
 	}
