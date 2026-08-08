@@ -15,8 +15,7 @@ import (
 )
 
 // freeAddr grabs an OS-assigned free port, then closes the listener so Serve
-// can bind it. Racy in theory, used the same way elsewhere in this codebase
-// (internal/api/gateway_test.go).
+// can bind it. Racy in theory.
 func freeAddr(t *testing.T) string {
 	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")

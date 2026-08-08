@@ -1,4 +1,4 @@
-# Operating mode: sink | api | all
+# Operating mode: sink | all
 mode: all
 # TigerBeetle cluster connection
 tigerbeetle:
@@ -56,11 +56,6 @@ limits:
   max_message_bytes: 1048576
   max_events_per_message: 8189
   max_json_depth: 32
-# API server listen addresses
-api:
-  grpc_addr: ":9090"
-  http_addr: ":8080"
-  max_page_size: 1000
 # Ledger name -> TigerBeetle ledger id/scale mapping
 ledgers:
   USD: {id: 1, scale: 2}
@@ -71,7 +66,5 @@ codes:
 retry: {initial: 100ms, max: 30s, jitter: true}
 # Graceful shutdown timeout
 shutdown_timeout: 30s
-# Listen address for /metrics, /healthz and /readyz. Must not collide with
-# api.http_addr: that port is already owned by the grpc-gateway REST mux in
-# api/sink modes.
+# Listen address for /metrics, /healthz and /readyz.
 metrics_addr: ":9464"

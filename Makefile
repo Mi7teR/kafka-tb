@@ -8,7 +8,7 @@ ifeq ($(shell uname -s),Darwin)
 GO_LDFLAGS := -ldflags=-extldflags=-Wl,-ld_classic
 endif
 
-.PHONY: build test lint bench integration proto
+.PHONY: build test lint bench integration
 
 build:
 	go build $(GO_LDFLAGS) -o bin/kafkatb ./cmd/kafkatb
@@ -24,6 +24,3 @@ bench:
 
 lint:
 	golangci-lint run
-
-proto:
-	buf generate

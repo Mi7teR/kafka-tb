@@ -1,6 +1,5 @@
-// Command kafkatb runs the Kafka -> TigerBeetle connector: depending on
-// -mode it consumes Kafka and applies commands to TigerBeetle, serves the
-// gRPC/REST ledger API, or both.
+// Command kafkatb runs the Kafka -> TigerBeetle connector: it consumes
+// Kafka and applies commands to TigerBeetle.
 package main
 
 import (
@@ -18,7 +17,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/Mi7teR/kafka-tb/internal/api"
 	"github.com/Mi7teR/kafka-tb/internal/codec"
 	"github.com/Mi7teR/kafka-tb/internal/codec/jsonc"
 	"github.com/Mi7teR/kafka-tb/internal/config"
@@ -32,7 +30,7 @@ import (
 func main() {
 	var cfgPath string
 	flag.StringVar(&cfgPath, "config", "configs/example.yaml", "path to config file")
-	mode := flag.String("mode", "", "override mode: sink|api|all")
+	mode := flag.String("mode", "", "override mode: sink|all")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -121,52 +119,39 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	reg := model.NewRegistry(cfg)
 
-	var (
-		consumer *kgo.Client
-		s        *sink.Sink
-	)
 	var holder sinkHolder
-	if cfg.Mode != config.ModeAPI {
-		decoders, err := codec.NewRegistry(cfg.Kafka.Topics, func(name string) (codec.Decoder, error) {
-			if name != "json" {
-				return nil, fmt.Errorf("unsupported codec %q", name)
-			}
-			return jsonc.New(reg, cfg.Limits), nil
-		})
-		if err != nil {
-			return fmt.Errorf("codec registry: %w", err)
+	decoders, err := codec.NewRegistry(cfg.Kafka.Topics, func(name string) (codec.Decoder, error) {
+		if name != "json" {
+			return nil, fmt.Errorf("unsupported codec %q", name)
 		}
-
-		pcl, err := kgo.NewClient(kgo.SeedBrokers(cfg.Kafka.Brokers...))
-		if err != nil {
-			return fmt.Errorf("kafka producer: %w", err)
-		}
-		producer := emit.New(pcl, cfg.Kafka)
-		defer producer.Close()
-
-		consumer, err = sink.NewKafkaClient(cfg, holder.onRevoked)
-		if err != nil {
-			return fmt.Errorf("kafka consumer: %w", err)
-		}
-		defer consumer.Close()
-
-		s = sink.New(cfg, consumer, decoders, batcher, producer, log, metrics)
-		holder.set(s)
+		return jsonc.New(reg, cfg.Limits), nil
+	})
+	if err != nil {
+		return fmt.Errorf("codec registry: %w", err)
 	}
 
-	var apiSrv *api.Server
-	if cfg.Mode != config.ModeSink {
-		apiSrv = api.NewServer(tbClient, batcher, reg, cfg.API, cfg.Limits)
+	pcl, err := kgo.NewClient(kgo.SeedBrokers(cfg.Kafka.Brokers...))
+	if err != nil {
+		return fmt.Errorf("kafka producer: %w", err)
 	}
+	producer := emit.New(pcl, cfg.Kafka)
+	defer producer.Close()
+
+	consumer, err := sink.NewKafkaClient(cfg, holder.onRevoked)
+	if err != nil {
+		return fmt.Errorf("kafka consumer: %w", err)
+	}
+	defer consumer.Close()
+
+	s := sink.New(cfg, consumer, decoders, batcher, producer, log, metrics)
+	holder.set(s)
 
 	ready := func() error {
 		if err := tbClient.Nop(); err != nil {
 			return fmt.Errorf("tigerbeetle: %w", err)
 		}
-		if consumer != nil {
-			if id, gen := consumer.GroupMetadata(); id == "" || gen == -1 {
-				return errors.New("consumer: not joined to group")
-			}
+		if id, gen := consumer.GroupMetadata(); id == "" || gen == -1 {
+			return errors.New("consumer: not joined to group")
 		}
 		return nil
 	}
@@ -174,11 +159,6 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return metricsSrv.Serve(gctx) })
-	if s != nil {
-		g.Go(func() error { s.Run(gctx); return nil })
-	}
-	if apiSrv != nil {
-		g.Go(func() error { return apiSrv.Serve(gctx, cfg.API) })
-	}
+	g.Go(func() error { s.Run(gctx); return nil })
 	return g.Wait()
 }

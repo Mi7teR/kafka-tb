@@ -21,7 +21,6 @@ type Mode string
 
 const (
 	ModeSink Mode = "sink"
-	ModeAPI  Mode = "api"
 	ModeAll  Mode = "all"
 )
 
@@ -78,12 +77,6 @@ type Limits struct {
 	MaxJSONDepth        int `yaml:"max_json_depth"`
 }
 
-type API struct {
-	GRPCAddr    string `yaml:"grpc_addr"`
-	HTTPAddr    string `yaml:"http_addr"`
-	MaxPageSize uint32 `yaml:"max_page_size"`
-}
-
 type Retry struct {
 	Initial time.Duration `yaml:"initial"`
 	Max     time.Duration `yaml:"max"`
@@ -97,15 +90,11 @@ type Config struct {
 	Sink            Sink              `yaml:"sink"`
 	Kafka           Kafka             `yaml:"kafka"`
 	Limits          Limits            `yaml:"limits"`
-	API             API               `yaml:"api"`
 	Ledgers         map[string]Ledger `yaml:"ledgers"`
 	Codes           map[string]uint16 `yaml:"codes"`
 	Retry           Retry             `yaml:"retry"`
 	ShutdownTimeout time.Duration     `yaml:"shutdown_timeout"`
-	// MetricsAddr serves /metrics, /healthz and /readyz. It is separate from
-	// api.http_addr: that address is already owned by the grpc-gateway REST
-	// mux in api/sink modes, and binding both to the same port would fail
-	// at startup.
+	// MetricsAddr serves /metrics, /healthz and /readyz.
 	MetricsAddr string `yaml:"metrics_addr"`
 }
 
@@ -168,9 +157,9 @@ func applyEnv(cfg *Config) {
 
 func (c *Config) validate() error {
 	switch c.Mode {
-	case ModeSink, ModeAPI, ModeAll:
+	case ModeSink, ModeAll:
 	default:
-		return fmt.Errorf("mode: want sink|api|all, got %q", c.Mode)
+		return fmt.Errorf("mode: want sink|all, got %q", c.Mode)
 	}
 	if len(c.TigerBeetle.Addresses) == 0 {
 		return fmt.Errorf("tigerbeetle.addresses: must not be empty")
@@ -210,26 +199,24 @@ func (c *Config) validate() error {
 	if c.Limits.MaxJSONDepth <= 0 {
 		return fmt.Errorf("limits.max_json_depth: must be > 0")
 	}
-	if c.Mode != ModeAPI {
-		if len(c.Kafka.Brokers) == 0 {
-			return fmt.Errorf("kafka.brokers: must not be empty")
+	if len(c.Kafka.Brokers) == 0 {
+		return fmt.Errorf("kafka.brokers: must not be empty")
+	}
+	if c.Kafka.Group == "" {
+		return fmt.Errorf("kafka.group: must not be empty")
+	}
+	if len(c.Kafka.Topics) == 0 {
+		return fmt.Errorf("kafka.topics: must not be empty")
+	}
+	if c.Kafka.DLQTopic == "" {
+		return fmt.Errorf("kafka.dlq_topic: must not be empty")
+	}
+	for _, t := range c.Kafka.Topics {
+		if t.Name == "" {
+			return fmt.Errorf("kafka.topics: empty topic name")
 		}
-		if c.Kafka.Group == "" {
-			return fmt.Errorf("kafka.group: must not be empty")
-		}
-		if len(c.Kafka.Topics) == 0 {
-			return fmt.Errorf("kafka.topics: must not be empty")
-		}
-		if c.Kafka.DLQTopic == "" {
-			return fmt.Errorf("kafka.dlq_topic: must not be empty")
-		}
-		for _, t := range c.Kafka.Topics {
-			if t.Name == "" {
-				return fmt.Errorf("kafka.topics: empty topic name")
-			}
-			if t.Codec != "json" {
-				return fmt.Errorf("kafka.topics[%s].codec: only \"json\" supported, got %q", t.Name, t.Codec)
-			}
+		if t.Codec != "json" {
+			return fmt.Errorf("kafka.topics[%s].codec: only \"json\" supported, got %q", t.Name, t.Codec)
 		}
 	}
 	if len(c.Ledgers) == 0 {
@@ -269,14 +256,6 @@ func (c *Config) validate() error {
 	}
 	if c.MetricsAddr == "" {
 		return fmt.Errorf("metrics_addr: must not be empty")
-	}
-	if c.Mode != ModeSink {
-		if c.API.GRPCAddr == "" || c.API.HTTPAddr == "" {
-			return fmt.Errorf("api: grpc_addr and http_addr must be set")
-		}
-		if c.API.MaxPageSize == 0 {
-			return fmt.Errorf("api.max_page_size: must be > 0")
-		}
 	}
 	return nil
 }

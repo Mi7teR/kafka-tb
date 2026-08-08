@@ -9,7 +9,7 @@ const (
 	OpCreateAccounts  Op = "create_accounts"
 )
 
-// Command — результат декодинга одного сообщения или одного API-вызова.
+// Command — результат декодинга одного сообщения.
 // Заполнено ровно одно из полей Transfers/Accounts, согласно Op.
 type Command struct {
 	Op        Op

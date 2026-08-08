@@ -36,10 +36,6 @@ limits:
   max_message_bytes: 1048576
   max_events_per_message: 8189
   max_json_depth: 32
-api:
-  grpc_addr: ":9090"
-  http_addr: ":8080"
-  max_page_size: 1000
 ledgers:
   USD: {id: 1, scale: 2}
 codes:

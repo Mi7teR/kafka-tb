@@ -6,7 +6,7 @@
 
 ## Цель
 
-Сервис, который принимает финансовые операции из Kafka и применяет их в TigerBeetle, плюс gRPC/REST-API для чтения балансов и выписок. Обёртка скрывает низкоуровневую модель TigerBeetle (u128, битовые флаги, числовые коды, целочисленные суммы) за удобным строковым контрактом.
+Сервис, который принимает финансовые операции из Kafka и применяет их в TigerBeetle. Обёртка скрывает низкоуровневую модель TigerBeetle (u128, битовые флаги, числовые коды, целочисленные суммы) за удобным строковым контрактом.
 
 Два требования определяют дизайн:
 
@@ -17,7 +17,7 @@
 
 | Вопрос | Решение |
 |---|---|
-| Направление | Kafka → TigerBeetle (sink) + read/write API |
+| Направление | Kafka → TigerBeetle (sink) |
 | Язык, библиотеки | Go, franz-go, официальный Go-клиент TigerBeetle |
 | Идемпотентность | `id` transfer'а задаёт продюсер; `exists` от TB = успех |
 | Формат сообщений | Pluggable decoder; JSON в MVP, Protobuf и Avro позже |
@@ -25,8 +25,7 @@
 | Порядок | Внутри партиции Kafka; продюсер шардит по счёту |
 | Ошибки | Poison и reject → DLQ, офсет коммитим; infra → ретрай без коммита |
 | Топик результатов | Есть, включается конфигом |
-| API | gRPC + grpc-gateway из одного proto; чтение и синхронная запись |
-| Топология | Один бинарь, режим флагом `--mode=sink\|api\|all` |
+| Топология | Один бинарь |
 | Гарантия доставки | At-least-once поверх идемпотентности TigerBeetle |
 
 ## Архитектура
@@ -34,7 +33,7 @@
 ### Структура пакетов
 
 ```
-cmd/kafkatb/main.go          --mode=sink|api|all
+cmd/kafkatb/main.go
 internal/
   config/       env + yaml, валидация на старте
   model/        внутренние типы: Command{Accounts|Transfers}, Outcome
@@ -42,14 +41,12 @@ internal/
   tbx/          обёртка TB-клиента: Batcher, submit, маппинг result-кодов
   sink/         franz-go consumer, offset-manager, backpressure, rebalance
   emit/         producer: DLQ-топик + results-топик
-  api/          gRPC-сервис + grpc-gateway поверх tbx
   obs/          prometheus, OTel, slog
-proto/kafkatb/v1/*.proto     gRPC + REST-аннотации
 ```
 
 ### Batcher — единственная дверь в TigerBeetle
 
-И sink, и API-запись идут через `tbx.Batcher`. Батчер копит `Job` (одно Kafka-сообщение или один API-вызов), формирует запрос до 8189 событий, отправляет, разбирает результаты и будит каждый Job его подмножеством.
+Sink идёт через `tbx.Batcher` — единственный вызывающий. Батчер копит `Job` (одно Kafka-сообщение), формирует запрос до 8189 событий, отправляет, разбирает результаты и будит каждый Job его подмножеством.
 
 Два независимых батчера — `create_accounts` и `create_transfers`: это разные API TigerBeetle, в один запрос не смешиваются.
 
@@ -150,10 +147,6 @@ Shutdown по SIGTERM: стоп polling → drain → commit → close TB → cl
 
 Массив `transfers` внутри сообщения атомарен. Батчер кладёт его целиком в текущий батч либо флашит и начинает новый — цепочка `linked` никогда не разрезается границей батча. Флаг `linked` на последнем элементе снимается автоматически, как требует TigerBeetle. Массив длиннее 8189 элементов — poison.
 
-### Единый proto
-
-`proto/kafkatb/v1/` определяет gRPC-API, Protobuf-кодек сообщений и схему топика результатов. Один источник правды для типов.
-
 ### Валидация
 
 До обращения к TigerBeetle отклоняем: неизвестный ledger или code, некорректный UUID, `amount` с числом знаков больше scale, пустой массив, нулевой id, смешанные типы операций в одном сообщении.
@@ -205,73 +198,12 @@ x-kafkatb-attempt-ts
 - `/healthz` — процесс жив. `/readyz` — TigerBeetle отвечает и consumer в группе.
 - Метрики: `records_total{result}`, `dlq_total{reason,error}`, `tb_batch_size`, `tb_latency_seconds`, `offset_commit_lag{topic,partition}`. Рост `dlq_total{reason="poison"}` — сигнал о сломанном продюсере. `offset_commit_lag` — разрыв между самым свежим прочитанным офсетом и закоммиченным ватермарком; не путать с брокерским consumer lag (расстояние до конца партиции на брокере) — тот потребовал бы отдельного запроса к брокеру за log-end-offset и здесь не реализован.
 
-## API
-
-Один `proto/kafkatb/v1/kafkatb.proto` даёт gRPC на порту 9090 и REST/JSON через grpc-gateway на 8080. Типы те же, что в Kafka-сообщениях.
-
-```protobuf
-service Ledger {
-  // чтение
-  rpc GetAccounts(GetAccountsRequest) returns (GetAccountsResponse);
-      // GET /v1/accounts?id=...&id=...
-  rpc GetTransfers(GetTransfersRequest) returns (GetTransfersResponse);
-      // GET /v1/transfers?id=...
-  rpc ListAccountTransfers(ListAccountTransfersRequest) returns (ListAccountTransfersResponse);
-      // GET /v1/accounts/{account_id}/transfers
-  rpc ListAccountBalances(ListAccountBalancesRequest) returns (ListAccountBalancesResponse);
-      // GET /v1/accounts/{account_id}/balances
-  rpc QueryTransfers(QueryTransfersRequest) returns (QueryTransfersResponse);
-      // GET /v1/transfers:query?user_data_128=...&code=payment
-  rpc QueryAccounts(QueryAccountsRequest) returns (QueryAccountsResponse);
-
-  // запись
-  rpc CreateAccounts(CreateAccountsRequest) returns (CreateAccountsResponse);
-      // POST /v1/accounts
-  rpc CreateTransfers(CreateTransfersRequest) returns (CreateTransfersResponse);
-      // POST /v1/transfers
-}
-```
-
-`ListAccountBalances` требует, чтобы счёт был создан с флагом `history`.
-
-### Ответ на запись
-
-Бизнес-отказ не является HTTP-ошибкой. Ответ `200` с исходом по каждому элементу:
-
-```json
-{ "results": [
-  { "id": "0193f8a1-7c2e-7000-8000-000000000001", "status": "ok" },
-  { "id": "0193f8a1-7c2e-7000-8000-000000000002",
-    "status": "rejected",
-    "error": "exceeds_credits",
-    "detail": "debit account ...0010 balance 5.00 < 12.34" }
-]}
-```
-
-`4xx` — только невалидный запрос. `503` — TigerBeetle недоступен.
-
-### Ответ на чтение баланса
-
-```json
-{ "id": "0193f8a1-0000-7000-8000-000000000010",
-  "ledger": "USD", "code": "customer",
-  "debits_posted": "1250.00", "credits_posted": "1400.00",
-  "debits_pending": "0.00", "credits_pending": "12.34",
-  "balance": "150.00" }
-```
-
-Поле `balance` вычисляется по флагам счёта: при `credits_must_not_exceed_debits` это `debits - credits`, иначе `credits - debits`. Клиенту не нужно знать, дебетовый счёт или кредитовый.
-
-Пагинация — курсор по `timestamp`, в ответе `next_cursor`. Лимит с потолком из конфига.
-
-Аутентификация в MVP не реализуется: сервис работает за mesh или ingress. В конфиге предусмотрен хук на interceptor.
-
 ## Конфигурация
 
 YAML с переопределением через переменные окружения `KAFKATB_*`. Конфиг валидируется на старте — сервис падает сразу, а не на первом сообщении.
 
 ```yaml
-mode: all                      # sink | api | all
+mode: all                      # sink | all
 tigerbeetle:
   cluster_id: 0
   addresses: ["3000", "3001", "3002"]
@@ -290,10 +222,6 @@ limits:
   max_message_bytes: 1048576
   max_events_per_message: 8189
   max_json_depth: 32
-api:
-  grpc_addr: ":9090"
-  http_addr: ":8080"
-  max_page_size: 1000
 ledgers:
   USD: { id: 1, scale: 2 }
   EUR: { id: 2, scale: 2 }
@@ -326,7 +254,6 @@ shutdown_timeout: 30s
 - Убийство сервиса посреди батча, рестарт: нет потерь и нет двойного списания.
 - Reject: списание сверх баланса даёт DLQ с `exceeds_credits`, поток продолжается.
 - Реплей из DLQ: `exists`, балансы не изменились.
-- API: создание через REST, затем чтение баланса, значения сходятся.
 
 ### Бенчмарки
 
@@ -356,14 +283,12 @@ shutdown_timeout: 30s
 | Горячий счёт (все проводки в один) | Деградация от конкуренции внутри TigerBeetle |
 | `linger` 1мс против 50мс | Кривая throughput/latency, подбор дефолта |
 | Смесь с 5% мусора | Накладные расходы DLQ-пути |
-| Синхронный API-write под фоновым потоком из Kafka | Влияние общего батчера на p99 API |
 | Цепочки `linked` по 10 элементов | Стоимость сохранения атомарности при упаковке |
 
 Цифры фиксируем в `docs/benchmarks/` с версией, конфигом и железом. Смысл — не абсолютные значения, а сравнимость между коммитами.
 
 ## Вне скоупа MVP
 
-- Аутентификация и авторизация API.
 - Пайплайнинг батчей с привязкой партиций.
 - Кодеки Protobuf и Avro (интерфейс есть, реализация позже).
 - CDC в обратную сторону (TigerBeetle → Kafka).
