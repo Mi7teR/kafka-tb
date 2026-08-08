@@ -54,8 +54,8 @@ func TestDecodeTransfers(t *testing.T) {
 	}, cmd.IDs)
 }
 
-// Флаг linked на последнем элементе сообщения снимается: TigerBeetle
-// запрещает открытую цепочку на границе батча.
+// The linked flag on the message's last element is cleared: TigerBeetle
+// forbids an open chain at a batch boundary.
 func TestDecodeClearsTrailingLinked(t *testing.T) {
 	body := strings.Replace(okTransfers, `"flags":[]`, `"flags":["linked"]`, 1)
 	cmd, err := newDecoder(t).Decode([]byte(body))
@@ -64,9 +64,9 @@ func TestDecodeClearsTrailingLinked(t *testing.T) {
 	require.Zero(t, last.Flags&uint16(1), "trailing linked flag must be cleared")
 }
 
-// Пост/войд-перевод может нести debit/credit account id как ассерт
-// TigerBeetle-у, что они совпадают со счетами pending-перевода: декодер
-// обязан их прокинуть, а не обнулить.
+// A post/void transfer may carry a debit/credit account id as an assertion
+// to TigerBeetle that they match the pending transfer's accounts: the decoder
+// must forward them, not zero them out.
 func TestDecodePostPendingForwardsAccountIDs(t *testing.T) {
 	body := `{"operation":"create_transfers","transfers":[
 	  {"id":"0193f8a1-7c2e-7000-8000-000000000001",
@@ -82,8 +82,8 @@ func TestDecodePostPendingForwardsAccountIDs(t *testing.T) {
 	require.NotZero(t, cmd.Transfers[0].CreditAccountID)
 }
 
-// Когда продюсер не указывает debit/credit account id на пост/войде, они
-// должны остаться нулевыми, а не быть обязательными.
+// When the producer does not specify a debit/credit account id on a post/void,
+// they must remain zero, not become mandatory.
 func TestDecodePostPendingAllowsOmittedAccountIDs(t *testing.T) {
 	body := `{"operation":"create_transfers","transfers":[
 	  {"id":"0193f8a1-7c2e-7000-8000-000000000001",

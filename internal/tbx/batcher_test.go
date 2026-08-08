@@ -25,7 +25,7 @@ func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard,
 func transferCmd(n int, tag string) *model.Command {
 	c := &model.Command{Op: model.OpCreateTransfers, Transfers: make([]types.Transfer, n), IDs: make([]string, n)}
 	for i := 0; i < n; i++ {
-		c.Transfers[i] = types.Transfer{ID: types.ToUint128(uint64(i + 1)), Flags: 1} // linked у всех
+		c.Transfers[i] = types.Transfer{ID: types.ToUint128(uint64(i + 1)), Flags: 1} // linked on all of them
 		c.IDs[i] = tag + "-" + strconv.Itoa(i)
 	}
 	return c
@@ -60,7 +60,7 @@ func TestBatcherNeverSplitsCommand(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			_, err := b.Submit(context.Background(), transferCmd(n, "c"))
-			// assert, а не require: FailNow из не-тестовой горутины — UB.
+			// assert, not require: FailNow from a non-test goroutine is UB.
 			assert.NoError(t, err)
 		}(n)
 	}
@@ -86,9 +86,9 @@ func TestBatcherClearsTrailingLinkedPerCommand(t *testing.T) {
 }
 
 func TestBatcherRespectsMaxBatchSize(t *testing.T) {
-	// Linger заведомо длиннее теста: единственный путь к флашу — порог
-	// max_batch_size. Шесть команд по 2 события при max=6 обязаны дать ровно
-	// два батча, каждый упирающийся в границу точно.
+	// Linger is deliberately longer than the test: the only path to a flush is the
+	// max_batch_size threshold. Six commands of 2 events each with max=6 must yield exactly
+	// two batches, each hitting the boundary precisely.
 	fc := &fakeClient{}
 	b, _ := startBatcher(t, fc, 6, time.Hour)
 
@@ -98,7 +98,7 @@ func TestBatcherRespectsMaxBatchSize(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			out, err := b.Submit(context.Background(), transferCmd(2, "c"))
-			// assert, а не require: FailNow из не-тестовой горутины — UB.
+			// assert, not require: FailNow from a non-test goroutine is UB.
 			assert.NoError(t, err)
 			assert.Len(t, out, 2)
 		}()
@@ -113,8 +113,8 @@ func TestBatcherRespectsMaxBatchSize(t *testing.T) {
 }
 
 func TestBatcherRoutesResultsToOwner(t *testing.T) {
-	// Отклоняем каждое событие, у которого Amount == 7: так проверяем,
-	// что исход попал именно в ту команду, где это событие лежало.
+	// Reject every event whose Amount == 7: this checks
+	// that the outcome landed on exactly the command that event belonged to.
 	fc := &fakeClient{resultsFor: func(batch []types.Transfer) []types.CreateTransferResult {
 		out := make([]types.CreateTransferResult, len(batch))
 		for i, tr := range batch {
@@ -191,9 +191,9 @@ func TestBatcherSubmitAfterCloseFails(t *testing.T) {
 	require.ErrorIs(t, err, ErrClosed)
 }
 
-// C1: отмена контекста Start останавливает цикл. Отправители, застрявшие
-// на переполненной очереди, обязаны получить выход, иначе Close() виснет
-// и вместе с ним весь shutdown процесса.
+// C1: cancelling Start's context stops the loop. Submitters stuck
+// on a full queue must be given a way out, otherwise Close() hangs
+// and along with it the whole process shutdown.
 func TestBatcherCloseReturnsWithBlockedSubmitters(t *testing.T) {
 	fc := &fakeClient{}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -202,7 +202,7 @@ func TestBatcherCloseReturnsWithBlockedSubmitters(t *testing.T) {
 	b.Start(ctx)
 
 	cancel()
-	time.Sleep(50 * time.Millisecond) // дать циклам выйти по отмене
+	time.Sleep(50 * time.Millisecond) // let the loops exit on cancellation
 
 	const submitters = 5
 	errs := make(chan error, submitters)
@@ -212,7 +212,7 @@ func TestBatcherCloseReturnsWithBlockedSubmitters(t *testing.T) {
 			errs <- err
 		}()
 	}
-	time.Sleep(50 * time.Millisecond) // дать отправителям заполнить буфер
+	time.Sleep(50 * time.Millisecond) // let the submitters fill the buffer
 
 	closed := make(chan struct{})
 	go func() { b.Close(); close(closed) }()
@@ -232,8 +232,8 @@ func TestBatcherCloseReturnsWithBlockedSubmitters(t *testing.T) {
 	}
 }
 
-// C2: после отмены контекста Start ни один Submit не должен зависнуть
-// на ожидании исхода — иначе сообщение Kafka теряется без ответа.
+// C2: after Start's context is cancelled, no Submit must hang
+// waiting for an outcome — otherwise the Kafka message is lost without a response.
 func TestBatcherSubmitAfterContextCancelFails(t *testing.T) {
 	fc := &fakeClient{}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -243,7 +243,7 @@ func TestBatcherSubmitAfterContextCancelFails(t *testing.T) {
 	t.Cleanup(b.Close)
 
 	cancel()
-	time.Sleep(50 * time.Millisecond) // дать циклам выйти по отмене
+	time.Sleep(50 * time.Millisecond) // let the loops exit on cancellation
 
 	errs := make(chan error, 1)
 	go func() {
@@ -258,10 +258,10 @@ func TestBatcherSubmitAfterContextCancelFails(t *testing.T) {
 	}
 }
 
-// F1: Close() во время уже летящего батча не имеет права соврать отправителю.
-// TigerBeetle применил события — значит Submit обязан вернуть настоящие исходы,
-// а не ErrClosed. Для синхронного API это единственный источник правды:
-// его HTTP-клиент не хранит offset и не обязан повторять запрос с тем же id.
+// F1: Close() during a batch that is already in flight has no right to lie to the submitter.
+// TigerBeetle applied the events — so Submit must return the real outcomes,
+// not ErrClosed. For a synchronous API this is the only source of truth:
+// its HTTP client does not store an offset and is not obligated to repeat the request with the same id.
 func TestBatcherCloseDeliversOutcomeForInFlightBatch(t *testing.T) {
 	fc := &fakeClient{
 		enterTransfers:   make(chan struct{}),
@@ -283,7 +283,7 @@ func TestBatcherCloseDeliversOutcomeForInFlightBatch(t *testing.T) {
 		done <- result{out, err}
 	}()
 
-	// Батч дошёл до клиента и застрял внутри вызова.
+	// The batch reached the client and got stuck inside the call.
 	select {
 	case <-fc.enterTransfers:
 	case <-time.After(2 * time.Second):
@@ -292,9 +292,9 @@ func TestBatcherCloseDeliversOutcomeForInFlightBatch(t *testing.T) {
 
 	closed := make(chan struct{})
 	go func() { b.Close(); close(closed) }()
-	time.Sleep(50 * time.Millisecond) // дать Close закрыть stop и уйти в wg.Wait
+	time.Sleep(50 * time.Millisecond) // let Close close stop and move on to wg.Wait
 
-	fc.releaseTransfers <- struct{}{} // TigerBeetle ответил: события применены
+	fc.releaseTransfers <- struct{}{} // TigerBeetle responded: the events were applied
 
 	select {
 	case r := <-done:
@@ -314,12 +314,12 @@ func TestBatcherCloseDeliversOutcomeForInFlightBatch(t *testing.T) {
 	}
 }
 
-// SubmitAsync существует ради батчинга: синхронный Submit держит очередь
-// пустой, и батч всегда собирается из одной команды. Здесь max_batch_size — 10,
-// linger — час: единственный путь к флашу — десять команд, поставленных в
-// очередь до того, как первая получила исход. Синхронный вызывающий такой
-// батч собрать не может в принципе, поэтому тест заодно фиксирует сам факт
-// неблокирующей постановки.
+// SubmitAsync exists for the sake of batching: a synchronous Submit keeps the queue
+// empty, and the batch always assembles from a single command. Here max_batch_size is 10,
+// linger is an hour: the only path to a flush is ten commands enqueued
+// before the first one gets an outcome. A synchronous caller cannot assemble such
+// a batch in principle, so the test also incidentally establishes the very fact of
+// non-blocking submission.
 func TestBatcherSubmitAsyncBatchesInSubmitOrder(t *testing.T) {
 	const n = 10
 	fc := &fakeClient{}
@@ -354,16 +354,16 @@ func TestBatcherSubmitAsyncBatchesInSubmitOrder(t *testing.T) {
 	}
 }
 
-// Backpressure: полная очередь обязана блокировать постановку, иначе синк
-// поставит в очередь весь опрос и съест память.
+// Backpressure: a full queue must block submission, otherwise the sink
+// would enqueue an entire poll and eat up memory.
 func TestBatcherSubmitAsyncBlocksWhenQueueIsFull(t *testing.T) {
 	fc := &fakeClient{
 		enterTransfers:   make(chan struct{}),
 		releaseTransfers: make(chan struct{}),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	// max_batch_size=1: каждая команда флашится сразу, поэтому цикл застревает
-	// внутри вызова клиента и очередь перестаёт разгребаться.
+	// max_batch_size=1: each command flushes immediately, so the loop gets stuck
+	// inside the client call and the queue stops draining.
 	b := NewBatcher(fc, config.Batcher{MaxBatchSize: 1, Linger: time.Hour, MaxQueue: 2},
 		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger(), nil)
 	b.Start(ctx)
@@ -378,12 +378,12 @@ func TestBatcherSubmitAsyncBlocksWhenQueueIsFull(t *testing.T) {
 	_, err := b.SubmitAsync(context.Background(), transferCmd(1, "c0"))
 	require.NoError(t, err)
 	select {
-	case <-fc.enterTransfers: // цикл внутри вызова клиента и очередь не читает
+	case <-fc.enterTransfers: // the loop is inside the client call and not reading the queue
 	case <-time.After(2 * time.Second):
 		t.Fatal("client call never started")
 	}
 
-	// Ровно MaxQueue команд помещаются в буфер и возвращаются немедленно.
+	// Exactly MaxQueue commands fit into the buffer and return immediately.
 	for i := 0; i < 2; i++ {
 		done := make(chan error, 1)
 		go func() {
@@ -409,7 +409,7 @@ func TestBatcherSubmitAsyncBlocksWhenQueueIsFull(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	// Отпускаем клиент: цикл забирает следующую команду, место освобождается.
+	// Release the client: the loop picks up the next command, freeing a slot.
 	go func() {
 		for {
 			select {
@@ -434,8 +434,8 @@ func TestBatcherSubmitAsyncBlocksWhenQueueIsFull(t *testing.T) {
 	}
 }
 
-// Вызывающий вправе бросить канал не прочитав: писатель ровно один и канал
-// буферизован, поэтому цикл не имеет права встать.
+// A caller is entitled to abandon the channel without reading it: there is exactly one writer, and the channel
+// is buffered, so the loop has no right to stall.
 func TestBatcherSubmitAsyncAbandonedChannelDoesNotWedgeLoop(t *testing.T) {
 	fc := &fakeClient{}
 	b, _ := startBatcher(t, fc, 1, time.Hour)
@@ -487,9 +487,9 @@ func TestBatcherSubmitAsyncAfterCloseFails(t *testing.T) {
 	require.Nil(t, ch)
 }
 
-// Отменённый контекст обязан отпустить отправителя, упёршегося в полную
-// очередь. Циклы не запущены — очередь никто не разгребает, поэтому исход
-// гонки здесь однозначен.
+// A cancelled context must release a submitter stuck against a full
+// queue. No loops are running — nothing drains the queue — so the outcome
+// of the race here is unambiguous.
 func TestBatcherSubmitAsyncCancelledContextOnFullQueue(t *testing.T) {
 	fc := &fakeClient{}
 	b := NewBatcher(fc, config.Batcher{MaxBatchSize: 10, Linger: time.Hour, MaxQueue: 1},
@@ -506,9 +506,9 @@ func TestBatcherSubmitAsyncCancelledContextOnFullQueue(t *testing.T) {
 	require.Nil(t, ch)
 }
 
-// Команда, поставленная так поздно, что её не увидит ни один цикл, обязана
-// получить ErrClosed. Молчание в канал — потерянное сообщение Kafka.
-// Циклов здесь нет вовсе: Start не вызывали, отвечать некому по построению.
+// A command submitted so late that no loop will ever see it must
+// get ErrClosed. Silence on the channel is a lost Kafka message.
+// There are no loops here at all: Start was never called, there is no one to respond by construction.
 func TestBatcherSubmitAsyncUnseenCommandGetsErrClosed(t *testing.T) {
 	fc := &fakeClient{}
 	b := NewBatcher(fc, config.Batcher{MaxBatchSize: 10, Linger: time.Hour, MaxQueue: 8},
@@ -527,9 +527,9 @@ func TestBatcherSubmitAsyncUnseenCommandGetsErrClosed(t *testing.T) {
 	}
 }
 
-// Асинхронный вариант F1: Close во время летящего батча не имеет права
-// подменить настоящий исход на ErrClosed. Гонка «исход доставлен ровно в
-// момент выхода циклов» ловится именно здесь.
+// Async variant of F1: Close during an in-flight batch has no right to
+// substitute ErrClosed for the real outcome. The race "the outcome is delivered exactly at
+// the moment the loops exit" is caught right here.
 func TestBatcherSubmitAsyncCloseDeliversOutcomeForInFlightBatch(t *testing.T) {
 	fc := &fakeClient{
 		enterTransfers:   make(chan struct{}),
@@ -552,9 +552,9 @@ func TestBatcherSubmitAsyncCloseDeliversOutcomeForInFlightBatch(t *testing.T) {
 
 	closed := make(chan struct{})
 	go func() { b.Close(); close(closed) }()
-	time.Sleep(50 * time.Millisecond) // дать Close закрыть stop и уйти в wg.Wait
+	time.Sleep(50 * time.Millisecond) // let Close close stop and move on to wg.Wait
 
-	fc.releaseTransfers <- struct{}{} // TigerBeetle ответил: события применены
+	fc.releaseTransfers <- struct{}{} // TigerBeetle responded: the events were applied
 
 	select {
 	case res := <-ch:

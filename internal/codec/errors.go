@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// PoisonError — данные некорректны. Ретрай бессмысленен, сообщение идёт в DLQ.
+// PoisonError means the data is invalid. A retry is pointless; the message goes to the DLQ.
 type PoisonError struct {
 	Detail string
 }

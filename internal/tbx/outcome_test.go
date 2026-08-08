@@ -16,7 +16,7 @@ func cmd3() *model.Command {
 	}
 }
 
-// Ответ плотный: results[i] относится к событию i батча.
+// The response is dense: results[i] belongs to event i of the batch.
 func TestMapTransferResultsPositional(t *testing.T) {
 	got, err := MapTransferResults(cmd3(), []types.CreateTransferResult{
 		{Status: types.TransferCreated, Timestamp: 100},
@@ -33,7 +33,7 @@ func TestMapTransferResultsPositional(t *testing.T) {
 	require.Equal(t, StatusOK, got[2].Status)
 }
 
-// exists — идемпотентный повтор, а не отказ.
+// exists is an idempotent repeat, not a rejection.
 func TestMapTransferResultsExistsIsSuccess(t *testing.T) {
 	got, err := MapTransferResults(cmd3(), []types.CreateTransferResult{
 		{Status: types.TransferExists},
@@ -45,9 +45,9 @@ func TestMapTransferResultsExistsIsSuccess(t *testing.T) {
 	require.Empty(t, got[0].Error)
 }
 
-// Команда занимает окно [offset, offset+Len) внутри общего батча. Окно
-// заканчивается ровно на границе batchSize (10+3=13) — это же граничный
-// случай на off-by-one: `>` а не `>=` в проверке окна.
+// The command occupies the window [offset, offset+Len) within the overall batch. The window
+// ends exactly on the batchSize boundary (10+3=13) — this is also the boundary
+// case for the off-by-one: `>` and not `>=` in the window check.
 func TestMapTransferResultsHonoursOffset(t *testing.T) {
 	results := make([]types.CreateTransferResult, 13)
 	for i := range results {
@@ -62,18 +62,18 @@ func TestMapTransferResultsHonoursOffset(t *testing.T) {
 	require.Equal(t, StatusOK, got[2].Status)
 }
 
-// Регрессионный тест на Finding 1 (Critical): пустой ответ для непустой
-// команды — не "всё успешно", а нарушение контракта. TigerBeetle возвращает
-// плотный массив ровно длины запроса и пустой массив только для пустого
-// запроса, так что пустой ответ при ожидаемых 3 событиях означает, что этот
-// ответ вообще не про данный батч.
+// Regression test for Finding 1 (Critical): an empty response for a non-empty
+// command is not "everything succeeded" but a contract violation. TigerBeetle returns
+// a dense array of exactly the request's length, and an empty array only for an empty
+// request, so an empty response when 3 events were expected means this
+// response is not about this batch at all.
 func TestMapTransferResultsEmptyResultsAgainstNonEmptyBatchIsMismatch(t *testing.T) {
 	_, err := MapTransferResults(cmd3(), nil, 0, 3)
 	require.ErrorIs(t, err, ErrResultCountMismatch)
 }
 
-// offset далеко за пределами батча — окно команды не влезает, даже если бы
-// длина результатов сошлась с чем-то другим.
+// offset far outside the batch — the command's window does not fit, even if
+// the results length happened to match something else.
 func TestMapTransferResultsOffsetFarOutsideBatchIsMismatch(t *testing.T) {
 	results := make([]types.CreateTransferResult, 13)
 	for i := range results {
@@ -83,15 +83,15 @@ func TestMapTransferResultsOffsetFarOutsideBatchIsMismatch(t *testing.T) {
 	require.ErrorIs(t, err, ErrResultCountMismatch)
 }
 
-// Ответ длиннее заявленного batchSize — тоже нарушение контракта: чужой или
-// устаревший массив мог случайно оказаться длиннее.
+// A response longer than the declared batchSize is also a contract violation: someone
+// else's or a stale array could coincidentally have ended up longer.
 func TestMapTransferResultsResultsLongerThanBatchSizeIsMismatch(t *testing.T) {
 	results := make([]types.CreateTransferResult, 13)
 	_, err := MapTransferResults(cmd3(), results, 0, 10)
 	require.ErrorIs(t, err, ErrResultCountMismatch)
 }
 
-// Ответ не той длины — нарушение контракта: молча разъезжаться нельзя.
+// A response of the wrong length is a contract violation: it must not silently diverge.
 func TestMapTransferResultsCountMismatch(t *testing.T) {
 	_, err := MapTransferResults(cmd3(), []types.CreateTransferResult{
 		{Status: types.TransferCreated},
@@ -115,17 +115,17 @@ func TestMapAccountResults(t *testing.T) {
 	require.Equal(t, "linked_event_failed", got[1].Error)
 }
 
-// Finding 3: последовательные заглавные буквы — это одна аббревиатура, не
-// набор однобуквенных слов.
+// Finding 3: consecutive capital letters are one abbreviation, not
+// a series of one-letter words.
 func TestErrorNameConsecutiveCapitalsAsOneWord(t *testing.T) {
 	got := errorName(types.AccountIDMustNotBeZero.String(), "Account")
 	require.Equal(t, "id_must_not_be_zero", got)
 }
 
-// Finding 3: default-ветка Status.String() (например, "CreateTransferStatus(1)")
-// не несёт ожидаемого префикса — TrimPrefix молча становится no-op. Это не
-// настоящее имя статуса TigerBeetle, поэтому результат должен быть явно
-// помечен как неизвестный, а не мимикрировать под обычный snake_case.
+// Finding 3: the default branch of Status.String() (e.g. "CreateTransferStatus(1)")
+// does not carry the expected prefix — TrimPrefix silently becomes a no-op. This is not
+// a real TigerBeetle status name, so the result must be explicitly
+// marked as unknown rather than mimic ordinary snake_case.
 func TestErrorNameUnknownStatusIsMarkedExplicitly(t *testing.T) {
 	raw := types.CreateTransferStatus(9999).String()
 	got := errorName(raw, "Transfer")

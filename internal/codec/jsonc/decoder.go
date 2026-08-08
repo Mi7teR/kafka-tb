@@ -53,7 +53,7 @@ type jsonAccount struct {
 }
 
 func (d *Decoder) Decode(payload []byte) (cmd *model.Command, err error) {
-	// Паника в парсере не должна ронять процесс: превращаем её в poison.
+	// A panic in the parser must not crash the process: turn it into poison.
 	defer func() {
 		if r := recover(); r != nil {
 			cmd, err = nil, codec.Poison("panic while decoding: %v", r)
@@ -113,7 +113,7 @@ func (d *Decoder) decodeTransfers(in []jsonTransfer) (*model.Command, error) {
 		cmd.Transfers[i] = t
 		cmd.IDs[i] = jt.ID
 	}
-	// Цепочка не может оставаться открытой на границе батча.
+	// A chain cannot be left open at a batch boundary.
 	clearLinked(&cmd.Transfers[len(cmd.Transfers)-1].Flags)
 	return cmd, nil
 }
@@ -237,7 +237,7 @@ func (d *Decoder) decodeAccounts(in []jsonAccount) (*model.Command, error) {
 	return cmd, nil
 }
 
-// linked — младший бит и у TransferFlags, и у AccountFlags.
+// linked is the low bit in both TransferFlags and AccountFlags.
 const linkedBit uint16 = 1
 
 func clearLinked(flags *uint16) { *flags &^= linkedBit }
@@ -257,8 +257,8 @@ func parseTimeoutSeconds(s string) (uint32, error) {
 	return uint32(secs), nil
 }
 
-// checkDepth считает вложенность до полноценного парсинга, чтобы
-// глубоко вложенный мусор не съел стек.
+// checkDepth counts nesting before full parsing, so that
+// deeply nested garbage cannot exhaust the stack.
 func checkDepth(payload []byte, max int) error {
 	depth, maxSeen, inStr, esc := 0, 0, false, false
 	for _, b := range payload {

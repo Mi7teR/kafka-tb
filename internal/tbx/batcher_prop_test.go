@@ -14,16 +14,16 @@ import (
 	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
-// markedTransferCmd штампует каждое событие меткой команды (UserData128)
-// и его позицией внутри команды (UserData64).
-// Без такой метки границы команд невозможно восстановить по записанному батчу,
-// и упаковщик, который режет linked-цепочку пополам, проходил бы проверки.
+// markedTransferCmd stamps each event with the command's marker (UserData128)
+// and its position within the command (UserData64).
+// Without such a marker, command boundaries could not be reconstructed from the recorded batch,
+// and a packer that cuts a linked chain in half would pass the checks.
 func markedTransferCmd(marker uint64, n int) *model.Command {
 	c := &model.Command{Op: model.OpCreateTransfers, Transfers: make([]types.Transfer, n), IDs: make([]string, n)}
 	for i := 0; i < n; i++ {
 		c.Transfers[i] = types.Transfer{
 			ID:          types.ToUint128(uint64(i + 1)),
-			Flags:       linkedBit, // linked у всех, батчер обязан снять его только на хвосте команды
+			Flags:       linkedBit, // linked on all of them, the batcher must clear it only on the command's tail
 			UserData128: types.ToUint128(marker),
 			UserData64:  uint64(i),
 		}
@@ -32,9 +32,9 @@ func markedTransferCmd(marker uint64, n int) *model.Command {
 	return c
 }
 
-// Инвариант упаковки: каждый батч раскладывается на целые команды, идущие
-// подряд и в исходном порядке событий; внутри команды linked снят ровно на
-// последнем событии; ни одна команда не потеряна и не отправлена дважды.
+// Packing invariant: every batch decomposes into whole commands, laid out
+// contiguously and in the original event order; within a command, linked is cleared exactly on
+// the last event; no command is lost or sent twice.
 func TestBatcherPackingInvariants(t *testing.T) {
 	const maxBatch = 64
 	seed := time.Now().UnixNano()
@@ -51,7 +51,7 @@ func TestBatcherPackingInvariants(t *testing.T) {
 		total += sizes[i]
 	}
 
-	// marker (UserData128) -> индекс команды в sizes. Uint128 сравним, значит годится в ключ.
+	// marker (UserData128) -> command index in sizes. Uint128 is comparable, so it works as a key.
 	byMarker := make(map[types.Uint128]int, len(sizes))
 	for i := range sizes {
 		byMarker[types.ToUint128(uint64(i+1))] = i
@@ -63,7 +63,7 @@ func TestBatcherPackingInvariants(t *testing.T) {
 		go func(i, n int) {
 			defer wg.Done()
 			out, err := b.Submit(context.Background(), markedTransferCmd(uint64(i+1), n))
-			// assert, а не require: FailNow из не-тестовой горутины — UB.
+			// assert, not require: FailNow from a non-test goroutine is UB.
 			assert.NoError(t, err)
 			assert.Len(t, out, n)
 		}(i, n)
@@ -77,8 +77,8 @@ func TestBatcherPackingInvariants(t *testing.T) {
 		require.LessOrEqual(t, len(batch), maxBatch, "batch %d exceeds max_batch_size", bi)
 		sent += len(batch)
 
-		// Разбор батча на команды: событие открывает команду только если это
-		// её событие №0, и дальше вся команда обязана лежать подряд.
+		// Parsing the batch into commands: an event opens a command only if it is
+		// that command's event #0, and from there the whole command must lie contiguously.
 		for pos := 0; pos < len(batch); {
 			marker := batch[pos].UserData128
 			cmdIdx, ok := byMarker[marker]

@@ -15,8 +15,8 @@ import (
 )
 
 var (
-	// ErrCommandTooLarge — команда не помещается в батч целиком.
-	// Разрезать нельзя: атомарность linked-цепочки важнее.
+	// ErrCommandTooLarge means the command does not fit into a batch whole.
+	// It cannot be cut: the atomicity of the linked chain matters more.
 	ErrCommandTooLarge = errors.New("command exceeds max batch size")
 	ErrClosed          = errors.New("batcher closed")
 )
@@ -28,16 +28,16 @@ type job struct {
 	done chan SubmitResult
 }
 
-// SubmitResult — исход одной команды: либо исходы всех её событий, либо ошибка.
-// Ровно один такой результат приходит на каждую поставленную в очередь команду.
+// SubmitResult is the outcome of one command: either the outcomes of all its events, or an error.
+// Exactly one such result arrives for every command placed on the queue.
 type SubmitResult struct {
 	Outcomes []Outcome
 	Err      error
 }
 
-// Batcher — единственная дверь в TigerBeetle.
-// Держит один воркер с одной очередью и не больше одного батча в полёте, чем
-// гарантирует, что порядок применения совпадает с порядком Submit.
+// Batcher is the single door into TigerBeetle.
+// It keeps one worker with one queue and no more than one batch in flight, which
+// guarantees that the application order matches the Submit order.
 type Batcher struct {
 	client  Client
 	cfg     config.Batcher
@@ -45,33 +45,33 @@ type Batcher struct {
 	log     *slog.Logger
 	metrics *obs.Metrics
 
-	// queue — одна на обе операции. Отдельная очередь на тип операции — это
-	// отдельный воркер, а два воркера и есть та самая одновременность, которой
-	// быть не должно: create_accounts и create_transfers одной партиции
-	// разъехались бы, и трансфер со счёта, который ещё не создан, вернул бы
-	// debit_account_not_found — бизнес-отказ и DLQ для законной записи.
+	// queue is one for both operations. A separate queue per operation type would be a
+	// separate worker, and two workers are exactly the kind of concurrency that
+	// must not exist: create_accounts and create_transfers from one partition
+	// would come apart, and a transfer from an account that has not been created yet would return
+	// debit_account_not_found — a business rejection and a DLQ for a legitimate record.
 	queue chan *job
 
-	// stop — единственный сигнал остановки, общий для всех участников.
-	// Закрывается ровно один раз: либо из Close(), либо при отмене контекста
-	// Start. Оба пути обязаны сходиться сюда — иначе отмена контекста гасит
-	// цикл, а отправители продолжают считать батчер живым и виснут навсегда.
-	// Протокол намеренно бесlock'овый: закрытый канал одинаково виден всем,
-	// поэтому у отправителя всегда есть выход из блокирующего select.
+	// stop is the single stop signal, shared by all participants.
+	// It is closed exactly once: either from Close(), or when Start's context is
+	// cancelled. Both paths must converge here — otherwise cancelling the context extinguishes
+	// the loop while submitters keep believing the batcher is alive and hang forever.
+	// The protocol is deliberately lock-free: a closed channel is equally visible to everyone,
+	// so a submitter always has a way out of a blocking select.
 	stopOnce sync.Once
 	stop     chan struct{}
 
-	// finished — «цикл вышел», а не «остановку запросили». Разница
-	// принципиальна: пока цикл жив, он ещё может ответить уже поставленной
-	// в очередь команде, и отправитель обязан этого ответа дождаться.
-	// Отправитель, ждущий исход, выходит только по finished — тогда
-	// «никто уже не ответит» — гарантия, а не догадка.
+	// finished means "the loop has exited", not "a stop was requested". The
+	// difference is essential: while the loop is alive, it can still respond to a command
+	// already placed on the queue, and the submitter must wait for that response.
+	// A submitter waiting for an outcome exits only on finished — only then is
+	// "no one will respond anymore" a guarantee rather than a guess.
 	finishedOnce sync.Once
 	finished     chan struct{}
 
-	// unwatch снимает подписку на отмену контекста Start.
-	// Пишется в Start, читается в Close; контракт жизненного цикла
-	// (ровно один Start, Close строго после него) описан в их доккоментариях.
+	// unwatch cancels the subscription to Start's context cancellation.
+	// It is written in Start and read in Close; the lifecycle contract
+	// (exactly one Start, Close strictly after it) is described in their doc comments.
 	unwatch func() bool
 	wg      sync.WaitGroup
 }
@@ -89,28 +89,28 @@ func NewBatcher(c Client, cfg config.Batcher, retry config.Retry, log *slog.Logg
 	}
 }
 
-// Start запускает цикл отправки. Вызывается ровно один раз и строго до Close;
-// повторный или конкурентный с Close вызов не поддерживается.
+// Start launches the send loop. It is called exactly once and strictly before Close;
+// a repeated call, or one concurrent with Close, is not supported.
 func (b *Batcher) Start(ctx context.Context) {
-	// Отмена контекста — это тот же shutdown, что и Close().
+	// Context cancellation is the same shutdown as Close().
 	b.unwatch = context.AfterFunc(ctx, b.signalStop)
 	b.wg.Add(1)
 	go func() { defer b.wg.Done(); b.loop() }()
-	// Наблюдатель живёт здесь, а не в Close: путь остановки по отмене контекста
-	// не проходит через Close, но отправителей отпускать обязан так же.
+	// The watcher lives here, not in Close: the stop path via context cancellation
+	// does not go through Close, but it must release submitters just the same.
 	go func() { b.wg.Wait(); b.signalFinished() }()
 }
 
-// SubmitAsync ставит команду в очередь и сразу возвращает канал, в который
-// придёт ровно один исход. Ошибка возвращается только на самой постановке:
-// пустая или слишком большая команда, остановленный батчер, отменённый контекст.
-// Всё, что случилось после постановки, приходит в канал, а не в эту ошибку.
+// SubmitAsync places the command on the queue and immediately returns a channel that
+// will receive exactly one outcome. An error is returned only at submission itself:
+// an empty or too-large command, a stopped batcher, a cancelled context.
+// Everything that happens after submission arrives on the channel, not as this error.
 //
-// Блокировка при полной очереди сохранена — это backpressure для консьюмера:
-// без него синк поставит в очередь весь опрос и съест память.
+// Blocking on a full queue is preserved — this is backpressure for the consumer:
+// without it the sink would enqueue an entire poll and eat up memory.
 //
-// Канал буферизован на единицу, и писатель у него ровно один, поэтому
-// вызывающий, бросивший канал не прочитав, никого не блокирует.
+// The channel is buffered by one, and it has exactly one writer, so a
+// caller that abandons the channel without reading it does not block anyone.
 func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan SubmitResult, error) {
 	if cmd.Len() == 0 {
 		return nil, errors.New("empty command")
@@ -120,16 +120,16 @@ func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan S
 	}
 	j := &job{cmd: cmd, done: make(chan SubmitResult, 1)}
 
-	// Быстрый отказ, когда батчер уже остановлен: иначе select ниже выбирал бы
-	// между stop и свободным местом в очереди случайно.
+	// Fast-fail when the batcher is already stopped: otherwise the select below would choose
+	// randomly between stop and free room in the queue.
 	select {
 	case <-b.stop:
 		return nil, ErrClosed
 	default:
 	}
 
-	// stop обязателен в этом select: без него отправитель, упёршийся в полную
-	// очередь после остановки циклов, блокируется навсегда.
+	// stop is mandatory in this select: without it, a submitter stuck against a full
+	// queue after the loops have stopped blocks forever.
 	select {
 	case <-b.stop:
 		return nil, ErrClosed
@@ -138,36 +138,36 @@ func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan S
 	case b.queue <- j:
 	}
 
-	// Ожидание исхода живёт здесь, а не у вызывающего: держатель канала знает
-	// только его и не может сам выяснить, что отвечать уже некому. Отдать ему
-	// голый j.done значило бы молчание вместо ErrClosed для команды, которую
-	// не увидел ни один цикл, — для синка это потерянное сообщение.
+	// Waiting for the outcome lives here, not with the caller: the channel's holder knows
+	// only about it and cannot itself find out that there is no one left to answer. Handing it
+	// the bare j.done would mean silence instead of ErrClosed for a command that
+	// no loop ever saw — for the sink that is a lost message.
 	out := make(chan SubmitResult, 1)
 	go func() {
 		select {
 		case res := <-j.done:
 			out <- res
 		case <-b.finished:
-			// Здесь ждём именно finished, а не stop. stop означает лишь «начали
-			// останавливаться»: батч этой команды может быть уже в TigerBeetle и
-			// вот-вот вернуть исход. Ответить в этот момент ErrClosed — соврать
-			// про применённую работу; вызывающий не обязан повторять запрос с
-			// тем же id и восстановить правду ему неоткуда.
-			// finished же закрывается после выхода цикла, то есть когда
-			// ответить этой команде уже некому.
+			// We wait specifically on finished here, not on stop. stop only means "shutdown has
+			// started": this command's batch may already be in TigerBeetle and
+			// about to return an outcome. Responding with ErrClosed at this moment would be a lie
+			// about work that was actually applied; the caller is not obligated to repeat the request with
+			// the same id, and it has no way to recover the truth.
+			// finished, on the other hand, is closed after the loop has exited, i.e. when
+			// there is truly no one left to answer this command.
 			//
-			// Гонка «исход доставлен ровно в момент выхода цикла» реальна:
-			// оба канала готовы, и select выбрал бы случайно. Приоритет исхода
-			// восстанавливаем явной непустой проверкой.
+			// The race "the outcome is delivered exactly when the loop exits" is real:
+			// both channels are ready, and select would choose randomly. We restore
+			// priority for the outcome with an explicit non-empty check.
 			select {
 			case res := <-j.done:
 				out <- res
 			default:
-				// Команда попала в очередь так поздно, что цикл её уже не
-				// увидел. Отвечаем ошибкой, а не молчим; дальше расчёт на
-				// идемпотентность по id — повтор даёт TransferExists/
-				// AccountExists, а MapTransferResults/MapAccountResults
-				// трактуют их как StatusOK.
+				// The command reached the queue so late that the loop never
+				// saw it. We respond with an error rather than staying silent; from here on it relies
+				// on idempotency by id — a retry yields TransferExists/
+				// AccountExists, and MapTransferResults/MapAccountResults
+				// treat them as StatusOK.
 				out <- SubmitResult{Err: ErrClosed}
 			}
 		}
@@ -175,8 +175,8 @@ func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan S
 	return out, nil
 }
 
-// Submit ставит команду в очередь и ждёт исход.
-// Блокировка при полной очереди — это backpressure для консьюмера.
+// Submit places the command on the queue and waits for the outcome.
+// Blocking on a full queue is backpressure for the consumer.
 func (b *Batcher) Submit(ctx context.Context, cmd *model.Command) ([]Outcome, error) {
 	done, err := b.SubmitAsync(ctx, cmd)
 	if err != nil {
@@ -186,52 +186,52 @@ func (b *Batcher) Submit(ctx context.Context, cmd *model.Command) ([]Outcome, er
 	case res := <-done:
 		return res.Outcomes, res.Err
 	case <-ctx.Done():
-		// Команда уже в очереди и может дойти до TigerBeetle после этого
-		// возврата: отменить её отсюда нельзя. Вызывающий (Kafka-синк) увидит
-		// ошибку и, скорее всего, повторит команду. Корректность здесь
-		// целиком держится на идемпотентности по id: повтор даёт
-		// TransferExists/AccountExists, а MapTransferResults/MapAccountResults
-		// трактуют их как StatusOK. Это работает только потому, что id
-		// приходят от вызывающего и стабильны между попытками.
+		// The command is already on the queue and may still reach TigerBeetle after this
+		// return: it cannot be cancelled from here. The caller (the Kafka sink) will see
+		// the error and most likely retry the command. Correctness here rests
+		// entirely on idempotency by id: a retry yields
+		// TransferExists/AccountExists, and MapTransferResults/MapAccountResults
+		// treat them as StatusOK. This works only because the ids
+		// come from the caller and are stable across attempts.
 		return nil, ctx.Err()
 	}
 }
 
-// Close закрывает приём и дожидается, пока цикл разгребёт очередь.
-// Вызывается строго после Start и не конкурентно с ним.
+// Close closes intake and waits for the loop to drain the queue.
+// It is called strictly after Start and not concurrently with it.
 //
-// Close не ограничен по времени: он ждёт завершения текущего запроса к
-// TigerBeetle. Зависший вызов клиента задержит и Close, и отправителей,
-// ожидающих свой исход. Это сознательный размен — синхронному вызывающему
-// не сообщают об ошибке по операции, которая на самом деле применилась.
-// Ограничивать это надо таймаутом на стороне клиента, не здесь.
+// Close is not bounded in time: it waits for the current request to
+// TigerBeetle to finish. A hung client call delays both Close and the submitters
+// waiting for their outcome. This is a deliberate tradeoff — a synchronous caller
+// is not told of an error for an operation that in fact was applied.
+// Bounding this belongs to a timeout on the client side, not here.
 func (b *Batcher) Close() {
 	b.signalStop()
 	if b.unwatch != nil {
 		b.unwatch()
 	}
 	b.wg.Wait()
-	// Подстраховка на случай, когда Start не вызывали: наблюдателя нет,
-	// а отправитель без finished ждал бы исход вечно.
+	// A safeguard for the case where Start was never called: there is no watcher,
+	// and a submitter without finished would wait for an outcome forever.
 	b.signalFinished()
 }
 
-// signalStop закрывает stop ровно один раз, откуда бы ни пришёл сигнал.
+// signalStop closes stop exactly once, no matter where the signal came from.
 func (b *Batcher) signalStop() {
 	b.stopOnce.Do(func() { close(b.stop) })
 }
 
-// signalFinished закрывает finished ровно один раз.
+// signalFinished closes finished exactly once.
 func (b *Batcher) signalFinished() {
 	b.finishedOnce.Do(func() { close(b.finished) })
 }
 
-// loop копит подряд идущие команды одной операции и отправляет накопленное,
-// когда операция сменилась, набрался max_batch_size или истёк linger — что
-// наступит раньше. Смена операции — такой же повод отправить, как и остальные
-// два: один запрос к TigerBeetle несёт события ровно одного типа, смешать
-// счета с трансферами нельзя. Отправка идёт строго последовательно, поэтому
-// порядок применения совпадает с порядком постановки и на стыке операций тоже.
+// loop accumulates consecutive commands of one operation and sends what has
+// accumulated when the operation changes, max_batch_size is reached, or linger expires — whichever
+// comes first. A change of operation is as much a reason to send as the other
+// two: one request to TigerBeetle carries events of exactly one type, accounts cannot be mixed
+// with transfers. Sending happens strictly sequentially, so the
+// application order matches the submission order, including at the seam between operations.
 func (b *Batcher) loop() {
 	var (
 		batch []*job
@@ -260,18 +260,18 @@ func (b *Batcher) loop() {
 	for {
 		select {
 		case <-b.stop:
-			// Накопленное всё равно отправляем, остаток очереди отвечаем ошибкой:
-			// каждая команда, попавшая в очередь, получает ровно один исход.
+			// We still send what has accumulated, and answer the rest of the queue with an error:
+			// every command that made it onto the queue gets exactly one outcome.
 			flush()
 			b.drain(b.queue, ErrClosed)
 			return
 		case j := <-b.queue:
-			// Пробег одной операции кончился — отправляем его целиком, следующий
-			// начинается с этой команды.
+			// One operation's run has ended — send it whole, the next one
+			// starts with this command.
 			if len(batch) > 0 && j.cmd.Op != op {
 				flush()
 			}
-			// Команда не влезает в остаток — отправляем накопленное и начинаем новый батч.
+			// The command does not fit in what remains — send what has accumulated and start a new batch.
 			if size+j.cmd.Len() > b.cfg.MaxBatchSize {
 				flush()
 			}
@@ -309,8 +309,8 @@ func (b *Batcher) failAll(jobs []*job, err error) {
 	}
 }
 
-// send выбирает запрос по операции накопленного пробега. Пробег однороден по
-// построению: loop отправляет накопленное, как только операция сменилась.
+// send picks the request by the accumulated run's operation. The run is homogeneous by
+// construction: loop sends what has accumulated as soon as the operation changes.
 func (b *Batcher) send(op model.Op, jobs []*job) error {
 	if op == model.OpCreateAccounts {
 		return b.sendAccounts(jobs)
@@ -324,7 +324,7 @@ func (b *Batcher) sendTransfers(jobs []*job) error {
 	for i, j := range jobs {
 		offsets[i] = len(events)
 		events = append(events, j.cmd.Transfers...)
-		// Цепочка не должна оставаться открытой на стыке команд.
+		// The chain must not stay open at the seam between commands.
 		events[len(events)-1].Flags &^= linkedBit
 	}
 
@@ -367,8 +367,8 @@ func (b *Batcher) sendAccounts(jobs []*job) error {
 	return nil
 }
 
-// call повторяет вызов, пока TigerBeetle не ответит или батчер не остановят.
-// Ошибка вызова — всегда инфраструктурная: отказ по бизнесу приходит в результатах.
+// call retries the call until TigerBeetle responds or the batcher is stopped.
+// A call error is always infrastructural: business rejections arrive in the results.
 func (b *Batcher) call(fn func() (any, error)) (any, error) {
 	delay := b.retry.Initial
 	for attempt := 1; ; attempt++ {
@@ -379,8 +379,8 @@ func (b *Batcher) call(fn func() (any, error)) (any, error) {
 		b.log.Warn("tigerbeetle call failed, retrying",
 			slog.Int("attempt", attempt), slog.String("error", err.Error()), slog.Duration("in", delay))
 
-		// stop, а не только Close: при отмене контекста и лежащем TigerBeetle
-		// ретраи иначе крутятся вечно, батч не завершается, горутина течёт.
+		// stop, not just Close: on context cancellation with TigerBeetle down,
+		// retries would otherwise spin forever, the batch never completes, the goroutine leaks.
 		select {
 		case <-b.stop:
 			return nil, ErrClosed

@@ -9,14 +9,14 @@ const (
 	OpCreateAccounts  Op = "create_accounts"
 )
 
-// Command — результат декодинга одного сообщения.
-// Заполнено ровно одно из полей Transfers/Accounts, согласно Op.
+// Command is the result of decoding one message.
+// Exactly one of the Transfers/Accounts fields is populated, per Op.
 type Command struct {
 	Op        Op
 	Transfers []types.Transfer
 	Accounts  []types.Account
-	// IDs хранит исходные строковые id в том же порядке — нужны для отчёта
-	// об исходах без обратной конверсии.
+	// IDs holds the original string ids in the same order — needed to report
+	// outcomes without a reverse conversion.
 	IDs []string
 }
 

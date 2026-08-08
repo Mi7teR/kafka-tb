@@ -23,14 +23,14 @@ func commitOffset(t *testing.T, o *Offsets) (int64, bool) {
 	return eo.Offset, ok
 }
 
-// Коммитим только непрерывный префикс: дырка останавливает watermark.
+// We commit only a contiguous prefix: a gap stops the watermark.
 func TestCommitableStopsAtGap(t *testing.T) {
 	o := NewOffsets()
 	for _, r := range []*kgo.Record{rec(0), rec(1), rec(2)} {
 		o.Track(r)
 	}
 	o.Done(rec(0))
-	o.Done(rec(2)) // 1 ещё в работе
+	o.Done(rec(2)) // 1 is still in flight
 
 	got, ok := commitOffset(t, o)
 	require.True(t, ok)
@@ -87,7 +87,7 @@ func TestInFlightCounts(t *testing.T) {
 	require.Equal(t, 1, o.InFlight())
 }
 
-// Партиции не влияют друг на друга.
+// Partitions do not affect each other.
 func TestPartitionsAreIndependent(t *testing.T) {
 	o := NewOffsets()
 	a := &kgo.Record{Topic: "t", Partition: 0, Offset: 0}
@@ -276,7 +276,7 @@ func TestInFlightCountsRevivedPartition(t *testing.T) {
 	require.Equal(t, 1, o.InFlight())
 }
 
-// Pending отдаёт точку перемотки: минимальный незавершённый офсет партиции.
+// Pending reports the rewind point: the partition's lowest unfinished offset.
 func TestPendingReportsLowestUnfinishedOffset(t *testing.T) {
 	o := NewOffsets()
 	o.Track(rec(3))
@@ -314,7 +314,7 @@ func TestPendingUsesSentinelEpochWhenPriorOffsetNotDone(t *testing.T) {
 	require.Equal(t, kgo.EpochOffset{Epoch: -1, Offset: 100}, o.Pending()["t"][0])
 }
 
-// Партиции без незавершённых записей и тумбстоны перематывать нечего.
+// Partitions with no unfinished records, and tombstones, have nothing to rewind.
 func TestPendingSkipsFinishedAndForgottenPartitions(t *testing.T) {
 	o := NewOffsets()
 	o.Track(rec(0))

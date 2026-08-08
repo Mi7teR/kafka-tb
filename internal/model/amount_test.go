@@ -10,7 +10,7 @@ func TestParseAmount(t *testing.T) {
 	cases := []struct {
 		in    string
 		scale int32
-		want  string // десятичное представление минорных единиц
+		want  string // decimal representation of minor units
 	}{
 		{"0", 2, "0"},
 		{"12.34", 2, "1234"},
@@ -36,7 +36,7 @@ func TestParseAmountRejects(t *testing.T) {
 		{"", 2}, {"abc", 2}, {"-1", 2}, {"1.234", 2}, {"1.2.3", 2},
 		{"1e5", 2}, {" 1", 2}, {"1 ", 2}, {"+1", 2}, {".", 2}, {"1.", 2}, {".5", 2},
 		{"340282366920938463463374607431768211456", 0},  // u128 overflow
-		{"3402823669209384634633746074317682114.56", 2}, // overflow после масштабирования
+		{"3402823669209384634633746074317682114.56", 2}, // overflow after scaling
 	}
 	for _, c := range bad {
 		_, err := ParseAmount(c.in, c.scale)

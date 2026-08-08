@@ -19,8 +19,8 @@ func init() {
 	}
 }
 
-// ParseAmount переводит десятичную строку в минорные единицы по масштабу ledger'а.
-// Float не используется намеренно: округление недопустимо.
+// ParseAmount converts a decimal string to minor units at the ledger's scale.
+// Float is deliberately not used: rounding is unacceptable.
 func ParseAmount(s string, scale int32) (types.Uint128, error) {
 	if scale < 0 || int(scale) >= len(pow10) {
 		return types.Uint128{}, fmt.Errorf("amount %q: unsupported scale %d", s, scale)

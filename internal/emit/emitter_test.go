@@ -190,10 +190,10 @@ func newFailingEmitter(t *testing.T) Emitter {
 	return New(cl, config.Kafka{DLQTopic: "no-such-topic"})
 }
 
-// Публикации выдаются все сразу и подтверждаются одним проходом ожидания:
-// именно на этом держится смысл задачи — ожидание стоит одного round-trip'а на
-// пачку, а не round-trip'а на запись. Заодно это пиннит, что порядок Wait не
-// обязан совпадать с порядком, в котором брокер отвечает.
+// Publications are all handed off at once and acknowledged in a single waiting pass:
+// this is exactly what the point of the task rests on — waiting costs one round-trip per
+// batch, not a round-trip per record. This also pins down that Wait order need
+// not match the order in which the broker responds.
 func TestPublicationsIssuedBeforeWaitingAllSucceed(t *testing.T) {
 	const n = 200
 	em, brokers, _ := newTestEmitter(t)
@@ -224,8 +224,8 @@ func TestPublicationsIssuedBeforeWaitingAllSucceed(t *testing.T) {
 	require.Equal(t, n, got, "every issued publication must reach the topic")
 }
 
-// Провал публикации обязан доезжать до вызывающего через Wait, а не растворяться
-// в буфере продюсера.
+// A publication failure must reach the caller through Wait, not dissolve
+// into the producer's buffer.
 func TestWaitSurfacesPublicationFailure(t *testing.T) {
 	em := newFailingEmitter(t)
 	ctx := context.Background()
@@ -233,8 +233,8 @@ func TestWaitSurfacesPublicationFailure(t *testing.T) {
 	require.Error(t, err, "a publication that never reached a broker must not report success")
 }
 
-// Flush обязан учитывать ошибки, а не только опустошение буфера: иначе коммит
-// после него закоммитил бы офсет записи, которой в DLQ нет.
+// Flush must account for errors, not just draining the buffer: otherwise a commit
+// after it would commit the offset of a record that is not in the DLQ.
 func TestFlushSurfacesUntakenPublicationFailure(t *testing.T) {
 	em := newFailingEmitter(t)
 	ctx := context.Background()
@@ -244,9 +244,9 @@ func TestFlushSurfacesUntakenPublicationFailure(t *testing.T) {
 		"Flush must report a failed publication nobody waited on, not just drain the buffer")
 }
 
-// Ошибку, которую вызывающий уже забрал через Wait, Flush повторять не должен:
-// на неё уже отреагировали откатом партиции, а вечно валящийся Flush остановил
-// бы коммит всех остальных партиций.
+// Flush must not repeat an error the caller has already claimed via Wait:
+// it has already been reacted to by rolling back the partition, and a Flush that keeps failing forever would
+// stop the commit of every other partition.
 func TestFlushIgnoresFailureAlreadyTakenByWait(t *testing.T) {
 	em := newFailingEmitter(t)
 	ctx := context.Background()
@@ -257,8 +257,8 @@ func TestFlushIgnoresFailureAlreadyTakenByWait(t *testing.T) {
 		"a failure the caller already handled must not block every later commit")
 }
 
-// Доложив об ошибке один раз, Flush обязан сбросить учёт: иначе один провал
-// навсегда остановил бы коммит.
+// Having reported an error once, Flush must reset its tracking: otherwise one failure
+// would stop the commit forever.
 func TestFlushReportsUntakenFailureOnlyOnce(t *testing.T) {
 	em := newFailingEmitter(t)
 	ctx := context.Background()
@@ -268,8 +268,8 @@ func TestFlushReportsUntakenFailureOnlyOnce(t *testing.T) {
 	require.NoError(t, em.Flush(ctx), "the same failure must not block every later commit")
 }
 
-// Провал одной публикации не имеет права утаскивать за собой остальные: у
-// каждой свой исход.
+// One publication's failure has no right to drag the others down with it: each
+// has its own outcome.
 func TestOnePublicationFailureLeavesOthersAcknowledged(t *testing.T) {
 	fake, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.SeedTopics(1, "src", "src.dlq"))
 	require.NoError(t, err)
@@ -292,8 +292,8 @@ func TestOnePublicationFailureLeavesOthersAcknowledged(t *testing.T) {
 	require.NoError(t, second.Wait(ctx), "a publication issued after a failure must still be confirmed")
 }
 
-// Resolved — обещание, которого никогда не было у брокера: у него нет эмиттера,
-// и учёт Flush оно трогать не имеет права.
+// Resolved is a promise that never touched the broker: it has no emitter,
+// and it has no right to touch Flush's tracking.
 func TestResolvedCarriesItsOwnOutcome(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, Resolved(nil).Wait(ctx))
@@ -302,15 +302,15 @@ func TestResolvedCarriesItsOwnOutcome(t *testing.T) {
 
 var errTest = errors.New("test failure")
 
-// Уже пришедшее подтверждение важнее отменённого контекста: бросить готовый
-// ответ значило бы соврать про уже сделанную работу.
+// An acknowledgment that has already arrived matters more than a cancelled context: discarding a ready
+// answer would mean lying about work already done.
 func TestWaitPrefersDeliveredOutcomeOverCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	require.NoError(t, Resolved(nil).Wait(ctx))
 }
 
-// Не дождавшись ответа, Wait обязан вернуть ошибку, а не подтверждение.
+// Without a response arriving in time, Wait must return an error, not an acknowledgment.
 func TestWaitOnUnfinishedPublicationRespectsContext(t *testing.T) {
 	p := &Publication{done: make(chan struct{})}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
@@ -318,12 +318,12 @@ func TestWaitOnUnfinishedPublicationRespectsContext(t *testing.T) {
 	require.ErrorIs(t, p.Wait(ctx), context.DeadlineExceeded)
 }
 
-// Позднее Wait одной ошибки не имеет права снять с учёта другую, добавленную
-// уже после того, как первую доложил и сбросил предыдущий Flush: учёт обязан
-// вестись по идентичности публикации, а не общим счётчиком. Раньше было
-// наоборот — A доложена и сброшена, C добавлена, поздний Wait(A)
-// декрементировал общий счётчик и стирал ошибку C, и следующий Flush
-// врал, что всё подтверждено.
+// One error's late Wait has no right to remove another from tracking, one added
+// after a previous Flush already reported and reset the first: tracking must
+// be kept by publication identity, not by a shared counter. It used to be
+// the opposite — A reported and reset, C added, a late Wait(A)
+// decremented the shared counter and erased C's error, and the next Flush
+// lied that everything was acknowledged.
 func TestFlushTracksFailuresByPublicationIdentity(t *testing.T) {
 	em, _, _ := newTestEmitter(t)
 	e := em.(*emitter)
@@ -339,7 +339,7 @@ func TestFlushTracksFailuresByPublicationIdentity(t *testing.T) {
 	errC := errors.New("failure C")
 	pubC := e.failed(errC)
 
-	// A уже доложена и сброшена; поздний Wait на ней не имеет права задеть C.
+	// A has already been reported and reset; a late Wait on it has no right to touch C.
 	require.EqualError(t, pubA.Wait(ctx), errA.Error())
 
 	secondFlushErr := em.Flush(ctx)

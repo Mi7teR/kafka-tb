@@ -16,22 +16,22 @@ const (
 	StatusRejected Status = "rejected"
 )
 
-// ErrResultCountMismatch — TigerBeetle вернул ответ, не соответствующий батчу.
-// Разбирать его позиционно нельзя: исходы уедут не тем командам.
+// ErrResultCountMismatch means TigerBeetle returned a response that does not match the batch.
+// It cannot be parsed positionally: outcomes would land on the wrong commands.
 var ErrResultCountMismatch = errors.New("tigerbeetle result count does not match batch size")
 
-// Outcome — исход одного события внутри команды.
+// Outcome is the outcome of a single event within a command.
 type Outcome struct {
 	Index     int
 	ID        string
 	Status    Status
-	Error     string // машиночитаемое имя статуса TigerBeetle, пусто при успехе
+	Error     string // machine-readable TigerBeetle status name, empty on success
 	Timestamp uint64
 }
 
-// MapTransferResults вырезает окно команды из плотного ответа батча.
-// offset — позиция первого события команды внутри отправленного батча,
-// batchSize — размер всего батча, которым команда была отправлена.
+// MapTransferResults cuts the command's window out of the batch's dense response.
+// offset is the position of the command's first event within the sent batch,
+// batchSize is the size of the whole batch the command was sent in.
 func MapTransferResults(cmd *model.Command, results []types.CreateTransferResult, offset, batchSize int) ([]Outcome, error) {
 	out := newOutcomes(cmd)
 	if len(results) != batchSize {
@@ -54,9 +54,9 @@ func MapTransferResults(cmd *model.Command, results []types.CreateTransferResult
 	return out, nil
 }
 
-// MapAccountResults вырезает окно команды из плотного ответа батча.
-// offset — позиция первого события команды внутри отправленного батча,
-// batchSize — размер всего батча, которым команда была отправлена.
+// MapAccountResults cuts the command's window out of the batch's dense response.
+// offset is the position of the command's first event within the sent batch,
+// batchSize is the size of the whole batch the command was sent in.
 func MapAccountResults(cmd *model.Command, results []types.CreateAccountResult, offset, batchSize int) ([]Outcome, error) {
 	out := newOutcomes(cmd)
 	if len(results) != batchSize {
@@ -87,11 +87,11 @@ func newOutcomes(cmd *model.Command) []Outcome {
 	return out
 }
 
-// errorName переводит "TransferExceedsCredits" в "exceeds_credits":
-// снимает префикс типа и переводит CamelCase в snake_case. Если ожидаемого
-// префикса нет (например, String() ушёл в default-ветку и вернул что-то вроде
-// "CreateTransferStatus(1)"), это не настоящее имя статуса TigerBeetle — сырая
-// строка возвращается как есть за пометкой "unknown_status_".
+// errorName converts "TransferExceedsCredits" to "exceeds_credits":
+// it strips the type prefix and converts CamelCase to snake_case. If the expected
+// prefix is missing (e.g. String() fell into the default branch and returned something
+// like "CreateTransferStatus(1)"), this is not a real TigerBeetle status name — the raw
+// string is returned as-is, tagged with "unknown_status_".
 func errorName(s, prefix string) string {
 	trimmed, ok := strings.CutPrefix(s, prefix)
 	if !ok {

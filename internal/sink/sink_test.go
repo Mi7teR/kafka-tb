@@ -31,8 +31,8 @@ type stubDecoder struct {
 
 func (s stubDecoder) Decode([]byte) (*model.Command, error) { return s.cmd, s.err }
 
-// result отдаёт канал, в котором уже лежит res: контракт SubmitAsync — ровно
-// один SubmitResult на принятую команду, и все стабы ниже отвечают им.
+// result returns a channel that already holds res: SubmitAsync's contract is exactly
+// one SubmitResult per accepted command, and all the stubs below honor it.
 func result(res tbx.SubmitResult) <-chan tbx.SubmitResult {
 	ch := make(chan tbx.SubmitResult, 1)
 	ch <- res
@@ -50,10 +50,10 @@ func (s *stubSubmitter) SubmitAsync(context.Context, *model.Command) (<-chan tbx
 	return result(tbx.SubmitResult{Outcomes: s.outcomes, Err: s.err}), nil
 }
 
-// scriptedSubmitter отдаёт заранее заданный результат на каждый вызов;
-// последний элемент errs повторяется. Нужен, чтобы отличить «упало и
-// починилось» от «падает всегда». Расписание по номеру вызова осмысленно
-// только для одной партиции — для нескольких есть idSubmitter.
+// scriptedSubmitter returns a preset result on each call;
+// the last element of errs repeats. It is needed to distinguish "failed and
+// recovered" from "always fails". A schedule by call number only makes sense
+// for a single partition — for several there is idSubmitter.
 type scriptedSubmitter struct {
 	outcomes []tbx.Outcome
 	errs     []error
@@ -69,10 +69,10 @@ func (s *scriptedSubmitter) SubmitAsync(context.Context, *model.Command) (<-chan
 	return result(tbx.SubmitResult{Outcomes: s.outcomes}), nil
 }
 
-// slowSubmitter всегда успешен, но исход отдаёт только через delay — так
-// выглядит round-trip до TigerBeetle. Нужен, чтобы смоделировать пачку без
-// единой инфраструктурной ошибки, которая тем не менее коллективно медленная:
-// бюджет должен ловить и такой случай, а не только вечный ретрай.
+// slowSubmitter is always successful, but hands out the outcome only after delay — this is what
+// a round-trip to TigerBeetle looks like. It is needed to model a batch with no
+// single infrastructure error that is nevertheless collectively slow:
+// the budget must catch this case too, not only an endless retry.
 type slowSubmitter struct {
 	delay    time.Duration
 	outcomes []tbx.Outcome
@@ -91,10 +91,10 @@ func (s *slowSubmitter) SubmitAsync(context.Context, *model.Command) (<-chan tbx
 	return ch, nil
 }
 
-// idDecoder делает из байтов записи команду, чей единственный id — эти байты.
-// Нужен, как только партиции идут параллельно: сценарий, расписанный по
-// номеру вызова, перестаёт быть детерминированным, когда две партиции ставят
-// команды одновременно, — расписывать приходится по самой записи.
+// idDecoder makes a command out of the record's bytes whose sole id is those bytes.
+// It is needed as soon as partitions run in parallel: a scenario scripted by
+// call number stops being deterministic once two partitions submit
+// commands at the same time — the schedule has to be keyed by the record itself.
 type idDecoder struct{}
 
 func (idDecoder) Decode(v []byte) (*model.Command, error) {
@@ -105,7 +105,7 @@ func (idDecoder) Decode(v []byte) (*model.Command, error) {
 	}, nil
 }
 
-// mixedDecoder — тот же idDecoder, но перечисленные id объявляет poison.
+// mixedDecoder is the same as idDecoder, but declares the listed ids poison.
 type mixedDecoder struct{ poison map[string]bool }
 
 func (d mixedDecoder) Decode(v []byte) (*model.Command, error) {
@@ -115,9 +115,9 @@ func (d mixedDecoder) Decode(v []byte) (*model.Command, error) {
 	return idDecoder{}.Decode(v)
 }
 
-// idSubmitter отвечает успехом только на перечисленные в ok id и вечной
-// инфраструктурной ошибкой на всё остальное, а также записывает порядок
-// постановки — именно он задаёт порядок применения в TigerBeetle.
+// idSubmitter responds with success only for the ids listed in ok, and with a permanent
+// infrastructure error for everything else, and it also records the submission
+// order — that order is precisely what dictates the application order in TigerBeetle.
 type idSubmitter struct {
 	mu    sync.Mutex
 	ok    map[string]bool
@@ -144,8 +144,8 @@ func (s *idSubmitter) submitted() []string {
 	return append([]string(nil), s.order...)
 }
 
-// barrierSubmitter отвечает только после того, как в него одновременно зашли n
-// вызовов. При последовательной обработке партиций такого не случится никогда.
+// barrierSubmitter responds only after n calls have entered it
+// simultaneously. With sequential partition processing that will never happen.
 type barrierSubmitter struct {
 	mu    sync.Mutex
 	seen  int
@@ -176,8 +176,8 @@ func (b *barrierSubmitter) SubmitAsync(
 	}), nil
 }
 
-// blockingSubmitter принимает команду и не отвечает никогда: так выглядит
-// TigerBeetle, который перестал отвечать уже после постановки.
+// blockingSubmitter accepts the command and never responds: this is what
+// TigerBeetle looks like once it has stopped responding after submission.
 type blockingSubmitter struct {
 	mu    sync.Mutex
 	calls int
@@ -196,9 +196,9 @@ func (b *blockingSubmitter) Calls() int {
 	return b.calls
 }
 
-// enqueueBlockingSubmitter паркуется на самой постановке и отпускает только по
-// отмене контекста: так выглядит батчер, чья очередь забита, потому что
-// TigerBeetle перестал отвечать и ретраи разбирают её вечно.
+// enqueueBlockingSubmitter parks on submission itself and releases only on
+// context cancellation: this is what a batcher looks like whose queue is jammed because
+// TigerBeetle has stopped responding and retries never drain it.
 type enqueueBlockingSubmitter struct {
 	mu    sync.Mutex
 	calls int
@@ -220,9 +220,9 @@ func (b *enqueueBlockingSubmitter) Calls() int {
 	return b.calls
 }
 
-// refusingSubmitter отказывает в постановке команде с перечисленным id и
-// записывает всё, что до него дошло: только по этому журналу видно, не уехала
-// ли следующая запись партиции в TigerBeetle раньше упавшей.
+// refusingSubmitter refuses submission for a command with a listed id and
+// records everything that reached it up to then: only this log reveals whether
+// the partition's next record went to TigerBeetle before the failed one.
 type refusingSubmitter struct {
 	mu     sync.Mutex
 	refuse map[string]bool
@@ -249,9 +249,9 @@ func (s *refusingSubmitter) submitted() []string {
 	return append([]string(nil), s.order...)
 }
 
-// cancellingSubmitter отвечает первым after записям сразу, а начиная со
-// следующей отменяет контекст и уходит в молчание — так выглядит SIGTERM
-// посреди опроса.
+// cancellingSubmitter responds to the first after records immediately, and starting
+// with the next one cancels the context and goes silent — this is what SIGTERM
+// looks like in the middle of a poll.
 type cancellingSubmitter struct {
 	mu     sync.Mutex
 	seen   int
@@ -273,24 +273,24 @@ func (g *cancellingSubmitter) SubmitAsync(_ context.Context, cmd *model.Command)
 	}), nil
 }
 
-// recordingEmitter умеет отказывать выборочно: провал DLQ и провал Results —
-// разные ветки finish, и их нельзя проверить одним общим переключателем.
-// Мьютекс обязателен: партиции публикуют параллельно.
+// recordingEmitter can fail selectively: a DLQ failure and a Results failure are
+// different branches of finish, and they cannot be verified with one shared switch.
+// The mutex is mandatory: partitions publish in parallel.
 type recordingEmitter struct {
 	mu      sync.Mutex
 	dlq     []dlqCall
 	results int
-	// published — сквозной журнал публикаций, и results, и DLQ, с офсетом
-	// исходной записи. Порядок публикации внутри партиции обязан быть
-	// порядком офсетов, и проверить это можно только по такому журналу.
+	// published is a cross-cutting log of publications, both results and DLQ, with the
+	// source record's offset. Publication order within a partition must be
+	// offset order, and this is the only log that can verify that.
 	published   []publication
 	failDLQ     error
 	failResults error
-	// failResultsAt проваливает публикацию results ровно у перечисленных
-	// офсетов: провал одной записи не имеет права утаскивать за собой пачку,
-	// и проверить это общим переключателем невозможно.
+	// failResultsAt fails a results publication for exactly the listed
+	// offsets: one record's failure must not be allowed to drag the batch down with it,
+	// and a single shared switch cannot verify that.
 	failResultsAt map[int64]error
-	// flushErr — то, чем отвечает Flush; коммит обязан на это реагировать.
+	// flushErr is what Flush responds with; a commit must react to this.
 	flushErr error
 }
 
@@ -342,8 +342,8 @@ func (r *recordingEmitter) resultsCount() int {
 	return r.results
 }
 
-// publishedFor отдаёт журнал публикаций одной партиции: между партициями
-// порядок не гарантируется и никогда не гарантировался.
+// publishedFor returns one partition's publication log: between partitions
+// order is not guaranteed and never was.
 func (r *recordingEmitter) publishedFor(partition int32) []publication {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -356,9 +356,9 @@ func (r *recordingEmitter) publishedFor(partition int32) []publication {
 	return out
 }
 
-// panicOnDLQEmitter паникует на каждой публикации в DLQ — в том числе на той,
-// которой finish отвечает на панику. Так паника выходит за пределы recover'ов
-// prepare и finish и добирается до самой горутины партиции.
+// panicOnDLQEmitter panics on every DLQ publication — including the one
+// finish issues in response to a panic. This lets the panic escape prepare's and
+// finish's recovers and reach the partition goroutine itself.
 type panicOnDLQEmitter struct{}
 
 func (panicOnDLQEmitter) DLQ(context.Context, *kgo.Record, emitReason, string, string) *emit.Publication {
@@ -395,16 +395,16 @@ func (e *resultsThenPanicOnceEmitter) DLQ(
 
 var _ emitterIface = (*resultsThenPanicOnceEmitter)(nil)
 
-// deferredEmitter публикует, не отвечая: обещания копятся, а завершает их
-// release — в любом порядке. Так выглядит настоящая асинхронная публикация, у
-// которой брокер отвечает позже и не обязательно в порядке выдачи. Без такого
-// стаба «Done только после подтверждения» проверить нечем: у уже готового
-// обещания подтверждение и выдача неразличимы.
+// deferredEmitter publishes without responding: promises accumulate, and
+// release completes them — in any order. This is what real asynchronous publication looks
+// like, where the broker responds later and not necessarily in hand-off order. Without such
+// a stub there is nothing to verify "Done only after acknowledgment" with: for an already-resolved
+// promise, acknowledgment and hand-off are indistinguishable.
 type deferredEmitter struct {
 	mu        sync.Mutex
 	published []publication
 	resolve   []func(error)
-	// rejectAt — офсеты, чью публикацию брокер отвергнет.
+	// rejectAt holds offsets whose publication the broker will reject.
 	rejectAt map[int64]error
 }
 
@@ -431,9 +431,9 @@ func (d *deferredEmitter) Results(_ context.Context, rec *kgo.Record, _ []tbx.Ou
 func (d *deferredEmitter) Flush(context.Context) error { return nil }
 func (d *deferredEmitter) Close()                      {}
 
-// releaseAll завершает все накопленные обещания в обратном порядке выдачи:
-// порядок ответов брокера не обязан совпадать с порядком публикации, и синк
-// обязан оставаться корректным именно при таком расхождении.
+// releaseAll completes all accumulated promises in reverse hand-off order:
+// the broker's response order need not match publication order, and the sink
+// must remain correct under exactly that kind of mismatch.
 func (d *deferredEmitter) releaseAll() int {
 	d.mu.Lock()
 	pending := d.resolve
@@ -485,8 +485,8 @@ func (d *deferredEmitter) publishedFor(partition int32) []publication {
 
 var _ emitterIface = (*deferredEmitter)(nil)
 
-// stubClient подменяет *kgo.Client в тех двух вызовах, которыми синк двигает
-// офсеты. Без него processBatch/commit/OnRevoked невозможно прогнать.
+// stubClient substitutes for *kgo.Client in the two calls the sink uses to move
+// offsets. Without it, processBatch/commit/OnRevoked cannot be run.
 type stubClient struct {
 	committed  []map[string]map[int32]kgo.EpochOffset
 	setOffsets []map[string]map[int32]kgo.EpochOffset
@@ -522,8 +522,8 @@ func (c *stubClient) SetOffsets(m map[string]map[int32]kgo.EpochOffset) {
 
 var _ offsetClient = (*stubClient)(nil)
 
-// Компилятор обязан подтвердить, что стаб реализует настоящий emit.Emitter:
-// иначе тесты зелены на сигнатуре, которой в проде нет.
+// The compiler must confirm that the stub implements the real emit.Emitter:
+// otherwise tests would be green against a signature that does not exist in production.
 var _ emitterIface = (*recordingEmitter)(nil)
 
 func oneTransferCmd() *model.Command {
@@ -549,7 +549,7 @@ func clientOf(t *testing.T, s *Sink) *stubClient {
 	return c
 }
 
-// recID именует запись так, чтобы стаб-батчер мог отличить одну от другой.
+// recID names a record so the stub batcher can tell one apart from another.
 func recID(partition int32, offset int64) string {
 	return fmt.Sprintf("%d/%d", partition, offset)
 }
@@ -561,9 +561,9 @@ func srcRec(partition int32, offset int64) *kgo.Record {
 	}
 }
 
-// handleOne прогоняет одну запись через боевой путь синка — постановка,
-// ожидание исхода, публикация — и отвечает тем же, чем отвечала обработка
-// одной записи до пайплайнинга: доведена ли она до конца и с какой ошибкой.
+// handleOne drives one record through the sink's real path — submission,
+// waiting for the outcome, publication — and returns the same thing single-record
+// handling used to return before pipelining: whether it was driven to completion, and with what error.
 func handleOne(t *testing.T, s *Sink, rec *kgo.Record) (bool, error) {
 	t.Helper()
 	applied, err := s.pass(context.Background(), []*kgo.Record{rec}, time.Now().Add(time.Minute))
@@ -611,7 +611,7 @@ func TestHandleSuccessEmitsResultsOnly(t *testing.T) {
 	require.Equal(t, 1, em.results)
 }
 
-// Инфраструктурная ошибка не даёт двигать офсет.
+// An infrastructure error does not allow the offset to move.
 func TestHandleInfraErrorBlocks(t *testing.T) {
 	em := &recordingEmitter{}
 	sub := &stubSubmitter{err: errors.New("tigerbeetle unavailable")}
@@ -623,7 +623,7 @@ func TestHandleInfraErrorBlocks(t *testing.T) {
 	require.Empty(t, em.dlq)
 }
 
-// Команда больше батча — ретрай её не починит: это poison.
+// A command bigger than the batch — a retry will not fix it: this is poison.
 func TestHandleCommandTooLargeGoesToDLQ(t *testing.T) {
 	em := &recordingEmitter{}
 	sub := &stubSubmitter{err: tbx.ErrCommandTooLarge}
@@ -638,7 +638,7 @@ func TestHandleCommandTooLargeGoesToDLQ(t *testing.T) {
 	require.Zero(t, em.results)
 }
 
-// Если DLQ не пишется — это тоже инфраструктура, офсет стоит.
+// If the DLQ write fails — this is also infrastructure, the offset stays put.
 func TestHandleDLQFailureBlocks(t *testing.T) {
 	em := &recordingEmitter{failDLQ: errors.New("broker down")}
 	s := newSink(t, stubDecoder{err: codec.Poison("bad json")}, &stubSubmitter{}, em)
@@ -648,7 +648,7 @@ func TestHandleDLQFailureBlocks(t *testing.T) {
 	require.False(t, done, "must not commit offset if DLQ write failed")
 }
 
-// Паника в обработке не роняет процесс.
+// A panic during processing does not crash the process.
 func TestHandleRecoversPanic(t *testing.T) {
 	em := &recordingEmitter{}
 	s := newSink(t, panicDecoder{}, &stubSubmitter{}, em)
@@ -660,7 +660,7 @@ func TestHandleRecoversPanic(t *testing.T) {
 	require.Equal(t, "panic", em.dlq[0].errName)
 }
 
-// Паника при живой инфраструктурной проблеме в DLQ не должна коммитить офсет.
+// A panic combined with a live infrastructure problem in the DLQ must not commit the offset.
 func TestHandlePanicWithDLQFailureBlocks(t *testing.T) {
 	em := &recordingEmitter{failDLQ: errors.New("broker down")}
 	s := newSink(t, panicDecoder{}, &stubSubmitter{}, em)
@@ -721,8 +721,8 @@ type panicDecoder struct{}
 
 func (panicDecoder) Decode([]byte) (*model.Command, error) { panic("boom") }
 
-// Неизвестный топик — конфигурационная ошибка, но убивать процесс из-за
-// одного сообщения нельзя: пишем в DLQ.
+// An unknown topic is a configuration error, but the process must not be killed over
+// a single message: write it to the DLQ.
 func TestHandleUnknownTopic(t *testing.T) {
 	em := &recordingEmitter{}
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, &stubSubmitter{}, em)
@@ -733,8 +733,8 @@ func TestHandleUnknownTopic(t *testing.T) {
 	require.Equal(t, "unknown_topic", em.dlq[0].errName)
 }
 
-// Контракт codec.Decoder: любая ошибка декодинга — poison. Ошибка не типа
-// PoisonError не должна уходить в бесконечный ретрай.
+// codec.Decoder's contract: any decoding error is poison. An error that is not a
+// PoisonError must not go into an infinite retry.
 func TestHandleAnyDecodeErrorIsPoison(t *testing.T) {
 	em := &recordingEmitter{}
 	sub := &stubSubmitter{}
@@ -749,7 +749,7 @@ func TestHandleAnyDecodeErrorIsPoison(t *testing.T) {
 	require.Zero(t, sub.calls)
 }
 
-// Провал записи в results — инфраструктура: офсет стоит, DLQ не пишется.
+// A record's results-publication failure is infrastructure: the offset stays put, the DLQ is not written.
 func TestHandleResultsFailureBlocks(t *testing.T) {
 	em := &recordingEmitter{failResults: errors.New("results topic down")}
 	sub := &stubSubmitter{outcomes: []tbx.Outcome{{Index: 0, ID: "id-0", Status: tbx.StatusOK}}}
@@ -761,7 +761,7 @@ func TestHandleResultsFailureBlocks(t *testing.T) {
 	require.Empty(t, em.dlq)
 }
 
-// Reject опубликован в results, но не доехал до DLQ — офсет всё равно стоит.
+// A reject is published in results but does not make it to the DLQ — the offset still stays put.
 func TestHandleDLQFailureInsideRejectLoopBlocks(t *testing.T) {
 	em := &recordingEmitter{failDLQ: errors.New("dlq down")}
 	sub := &stubSubmitter{outcomes: []tbx.Outcome{
@@ -876,7 +876,7 @@ func TestProcessBatchMarksEveryRecordDone(t *testing.T) {
 	require.Empty(t, clientOf(t, s).setOffsets, "успешная пачка не перематывается")
 }
 
-// C1: упавшая запись повторяется сама, а не пропускается ради следующей.
+// C1: the failed record itself is retried, it is not skipped in favor of the next one.
 func TestProcessBatchRetriesSameRecord(t *testing.T) {
 	em := &recordingEmitter{}
 	sub := &scriptedSubmitter{
@@ -896,12 +896,12 @@ func TestProcessBatchRetriesSameRecord(t *testing.T) {
 	require.Equal(t, 1, em.results, "результат публикуется ровно один раз")
 }
 
-// C2: вечная инфраструктурная ошибка не держит ребаланс дольше бюджета —
-// пачка бросается, а её партиции перематываются назад и забываются.
+// C2: a permanent infrastructure error does not hold the rebalance longer than the budget —
+// the batch is abandoned, and its partitions are rewound back and forgotten.
 func TestProcessBatchAbandonsAndRewindsOnBudget(t *testing.T) {
 	em := &recordingEmitter{}
-	// Расписание по записи, а не по номеру вызова: партиции теперь идут
-	// параллельно, и «первый вызов успешен» перестало быть детерминированным.
+	// Scheduled by record, not by call number: partitions now run
+	// in parallel, and "the first call succeeds" is no longer deterministic.
 	sub := &idSubmitter{ok: map[string]bool{recID(0, 10): true}}
 	s := newSink(t, idDecoder{}, sub, em)
 	s.retryPeriod = time.Millisecond
@@ -923,18 +923,18 @@ func TestProcessBatchAbandonsAndRewindsOnBudget(t *testing.T) {
 	require.Len(t, cl.setOffsets, 1, "брошенная пачка обязана перематываться")
 	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
 		"src": {
-			0: {Epoch: 3, Offset: 11}, // 10 обработана и Done с epoch 3
-			1: {Epoch: -1, Offset: 4}, // до неё не дошли вовсе — offset 3 не Done, сентинел
+			0: {Epoch: 3, Offset: 11}, // 10 was processed and marked Done with epoch 3
+			1: {Epoch: -1, Offset: 4}, // never reached at all — offset 3 is not Done, sentinel
 		},
 	}, cl.setOffsets[0])
 	require.Zero(t, s.offsets.InFlight(), "брошенные партиции забыты")
 	require.Empty(t, s.offsets.Commitable(), "забытая партиция ничего не коммитит")
 }
 
-// C4: пачка без единой инфраструктурной ошибки — каждая запись успешна, но
-// медленная — обязана уложиться в бюджет так же, как и пачка, упирающаяся в
-// ретраи: бюджет проверяется в начале каждого витка runPartition, а не только
-// на исходе конкретной записи.
+// C4: a batch with no single infrastructure error — every record succeeds, but
+// slowly — must be bounded by the budget just as much as a batch stuck on
+// retries: the budget is checked at the start of every runPartition iteration, not only
+// on a particular record's outcome.
 func TestProcessBatchAbandonsSlowSuccessfulBatch(t *testing.T) {
 	em := &recordingEmitter{}
 	sub := &slowSubmitter{
@@ -943,10 +943,10 @@ func TestProcessBatchAbandonsSlowSuccessfulBatch(t *testing.T) {
 	}
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
 	s.batchBudget = 50 * time.Millisecond
-	// Одна запись в полёте: без этого пайплайнинг превращает эту пачку в
-	// быструю (все пять round-trip'ов идут параллельно) и бюджету нечего
-	// ловить. Проверяется здесь именно бюджет, а не пайплайнинг — за то, что
-	// бюджет действует и на записи в полёте, отвечает
+	// One record in flight: without this, pipelining turns this batch into a
+	// fast one (all five round-trips run in parallel) and there is nothing for the budget to
+	// catch. It is specifically the budget being verified here, not pipelining — the fact that
+	// the budget also applies to records in flight is the responsibility of
 	// TestProcessBatchAbandonsWhileWaitingForOutcomes.
 	s.maxInFlight = 1
 
@@ -971,8 +971,8 @@ func TestProcessBatchAbandonsSlowSuccessfulBatch(t *testing.T) {
 	require.Zero(t, s.offsets.InFlight(), "брошенная партиция забыта")
 }
 
-// Отмена контекста — не повод перематывать: процесс уходит, а незавершённые
-// офсеты и так упираются в ватермарк.
+// Context cancellation is not a reason to rewind: the process is shutting down, and unfinished
+// offsets already sit against the watermark anyway.
 func TestProcessBatchDoesNotRewindOnCancel(t *testing.T) {
 	em := &recordingEmitter{}
 	sub := &stubSubmitter{err: errors.New("tigerbeetle unavailable")}
@@ -986,9 +986,9 @@ func TestProcessBatchDoesNotRewindOnCancel(t *testing.T) {
 	require.Equal(t, 2, s.offsets.InFlight())
 }
 
-// Порядок применения внутри партиции — это порядок постановки в батчер, а
-// батчер применяет команды в порядке очереди. Постановка идёт не дожидаясь
-// исходов, поэтому проверять нужно именно её порядок, а не порядок ответов.
+// The application order within a partition is the batcher submission order, and
+// the batcher applies commands in queue order. Submission proceeds without waiting for
+// outcomes, so it is specifically that order that needs to be checked, not the response order.
 func TestProcessBatchPreservesSubmitOrderWithinPartition(t *testing.T) {
 	const n = 500
 	sub := &idSubmitter{ok: make(map[string]bool, n)}
@@ -1012,10 +1012,10 @@ func TestProcessBatchPreservesSubmitOrderWithinPartition(t *testing.T) {
 	require.Equal(t, int64(n), s.offsets.Commitable()["src"][0].Offset)
 }
 
-// Партиции обязаны идти параллельно. Барьер сходится только если все четыре
-// горутины оказались в батчере одновременно; при последовательной обработке
-// первая упрётся в него навсегда, дождётся отмены и вернёт ошибку — тогда до
-// публикации не дойдёт ни одна запись.
+// Partitions must run in parallel. The barrier resolves only if all four
+// goroutines have reached the batcher at the same time; with sequential processing
+// the first one would hang on it forever, wait for the cancellation, and return an error — then
+// not a single record would reach publication.
 func TestProcessBatchRunsPartitionsConcurrently(t *testing.T) {
 	const parts = 4
 	sub := newBarrierSubmitter(parts)
@@ -1044,8 +1044,8 @@ func TestProcessBatchRunsPartitionsConcurrently(t *testing.T) {
 	require.Zero(t, s.offsets.InFlight())
 }
 
-// Poison в батчер не идёт, но публиковаться обязан на своём месте: порядок
-// исходов партиции — это порядок офсетов, poison там или не poison.
+// Poison does not go to the batcher, but it must be published in its rightful place: a
+// partition's outcome order is offset order, poison or not.
 func TestProcessBatchPublishesPoisonInOffsetOrder(t *testing.T) {
 	const n = 8
 	poison := map[string]bool{}
@@ -1074,11 +1074,11 @@ func TestProcessBatchPublishesPoisonInOffsetOrder(t *testing.T) {
 	require.Equal(t, int64(n), s.offsets.Commitable()["src"][0].Offset)
 }
 
-// Отмена контекста посреди опроса: помечены Done ровно те записи, чей исход
-// пришёл и опубликован. Записи, поставленные, но не подтверждённые, остаются
-// в pending — коммитится только непрерывный префикс до первой из них, поэтому
-// после рестарта партиция перечитается ровно с неё. Перематывать через
-// SetOffsets здесь нечего: процесс уходит.
+// Context cancellation mid-poll: exactly the records whose outcome
+// arrived and was published are marked Done. Records submitted but not acknowledged remain
+// in pending — only the contiguous prefix up to the first of them is committed, so
+// after a restart the partition will be re-read starting exactly there. There is nothing to rewind via
+// SetOffsets here: the process is shutting down.
 func TestProcessBatchCancelledMidPollLeavesUnverifiedRecords(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1108,10 +1108,10 @@ func TestProcessBatchCancelledMidPollLeavesUnverifiedRecords(t *testing.T) {
 	require.Empty(t, clientOf(t, s).setOffsets)
 }
 
-// Бюджет обязан действовать и на записи, которые уже в полёте: постановка
-// прошла мгновенно, а TigerBeetle замолчал. Все записи поставлены до первого
-// ожидания — именно это и есть пайплайнинг — но ждать их дольше бюджета
-// нельзя, иначе ребаланс держится сколь угодно долго.
+// The budget must also apply to records already in flight: submission
+// went through instantly, but TigerBeetle went silent. All records are submitted before the first
+// wait — that is exactly what pipelining is — but they must not be waited on
+// longer than the budget, otherwise the rebalance is held indefinitely.
 func TestProcessBatchAbandonsWhileWaitingForOutcomes(t *testing.T) {
 	sub := &blockingSubmitter{}
 	em := &recordingEmitter{}
@@ -1145,11 +1145,11 @@ func TestProcessBatchAbandonsWhileWaitingForOutcomes(t *testing.T) {
 	require.Zero(t, s.offsets.InFlight(), "брошенные партиции забыты")
 }
 
-// F1: бюджет обязан ограничивать и саму постановку. SubmitAsync паркуется на
-// очереди батчера, и очередь эту синк переполняет намеренно: партиций много, у
-// каждой свой maxInFlight. Пока TigerBeetle отвечает, очередь разбирается; как
-// только он замолчал, застрявшая постановка держала бы блокировку ребаланса
-// сколь угодно долго — а её лимит у группы 60s.
+// F1: the budget must also bound submission itself. SubmitAsync parks on the
+// batcher's queue, and the sink deliberately overflows that queue: there are many partitions, each with
+// its own maxInFlight. As long as TigerBeetle responds, the queue drains; the
+// moment it goes silent, a stuck submission would hold the rebalance block
+// indefinitely — while the group's limit for it is 60s.
 func TestProcessBatchAbandonsWhenEnqueueBlocks(t *testing.T) {
 	sub := &enqueueBlockingSubmitter{}
 	em := &recordingEmitter{}
@@ -1181,9 +1181,9 @@ func TestProcessBatchAbandonsWhenEnqueueBlocks(t *testing.T) {
 	require.Zero(t, s.offsets.InFlight(), "брошенная партиция забыта")
 }
 
-// F3: провал постановки обязан останавливать пробег партиции. Иначе офсеты
-// после упавшего уедут в TigerBeetle, а он — нет: ровно та инверсия порядка
-// применения, которую пробег обязан исключать.
+// F3: a submission failure must stop the partition's run. Otherwise offsets
+// after the failed one would go to TigerBeetle while it would not — exactly the inversion of application
+// order the run is supposed to rule out.
 func TestProcessBatchStopsSubmittingAfterEnqueueFailure(t *testing.T) {
 	sub := &refusingSubmitter{refuse: map[string]bool{recID(0, 0): true}}
 	em := &recordingEmitter{}
@@ -1214,11 +1214,11 @@ func TestProcessBatchStopsSubmittingAfterEnqueueFailure(t *testing.T) {
 		"перематывать нужно с упавшей записи")
 }
 
-// F4: паника в горутине партиции не имеет права уронить процесс. defer
-// AllowRebalance у вызывающего обещает сняться «хоть на панике», но паника в
-// отдельной горутине проходит мимо любого defer вызывающего — ловить её
-// приходится в самой горутине. Здесь паникует DLQ, в том числе та публикация,
-// которой finish отвечает на панику: recover'ы prepare и finish такое не ловят.
+// F4: a panic in a partition goroutine has no right to crash the process. The caller's deferred
+// AllowRebalance is promised to fire "even on panic", but a panic in a
+// separate goroutine bypasses any defer of the caller — it has to be caught
+// in the goroutine itself. Here the DLQ panics, including the very publication
+// finish issues in response to a panic: prepare's and finish's recovers do not catch that.
 func TestProcessBatchSurvivesPanicInPartitionGoroutine(t *testing.T) {
 	sub := &idSubmitter{ok: map[string]bool{}}
 	s := newSink(t, mixedDecoder{poison: map[string]bool{recID(0, 4): true}},
@@ -1237,11 +1237,11 @@ func TestProcessBatchSurvivesPanicInPartitionGoroutine(t *testing.T) {
 	require.Empty(t, s.offsets.Commitable(), "офсет записи с паникой не коммитится")
 }
 
-// F2 (review): паника между выдачей Results и выдачей reject DLQ не имеет
-// права осиротить уже выданную публикацию Results — recover в finish обязан
-// дождаться и её вместе с поисоновым DLQ, а не заменить набор публикаций
-// целиком. Без фикса Results-публикация терялась бы: offsets.Done наступал
-// бы по одному только ack поисонового DLQ, хотя брокеру ушли обе.
+// F2 (review): a panic between issuing Results and issuing the reject DLQ has no
+// right to orphan the Results publication already issued — finish's recover must
+// wait for it too, together with the poison DLQ, rather than replace the set of publications
+// wholesale. Without the fix, the Results publication would be lost: offsets.Done would
+// happen based solely on the poison DLQ's ack, even though both were sent to the broker.
 func TestFinishPanicAfterResultsAwaitsAlreadyIssuedPublication(t *testing.T) {
 	em := &resultsThenPanicOnceEmitter{}
 	sub := &stubSubmitter{outcomes: []tbx.Outcome{
@@ -1262,8 +1262,8 @@ func TestFinishPanicAfterResultsAwaitsAlreadyIssuedPublication(t *testing.T) {
 		done <- passResult{applied, err}
 	}()
 
-	// Обе публикации обязаны быть выданы — Results до паники, DLQ поисона
-	// после recover'а, — и ни одна ещё не подтверждена: pass обязана висеть.
+	// Both publications must be issued — Results before the panic, the poison DLQ
+	// after the recover — and neither is acknowledged yet: pass must hang.
 	require.Eventually(t, func() bool { return len(em.publishedFor(0)) == 2 }, time.Second, time.Millisecond,
 		"Results и поисоновый DLQ обязаны быть выданы, даже если между ними была паника")
 	select {
@@ -1274,9 +1274,9 @@ func TestFinishPanicAfterResultsAwaitsAlreadyIssuedPublication(t *testing.T) {
 	require.Equal(t, 1, s.offsets.InFlight(), "запись без подтверждения обеих публикаций не может быть Done")
 	require.Empty(t, s.offsets.Commitable())
 
-	// Подтверждается только поисоновый DLQ: если бы recover заменял набор
-	// публикаций целиком (баг), этого было бы достаточно для Done — Results
-	// давно потерян. С фиксом record обязана остаться в полёте.
+	// Only the poison DLQ is acknowledged: if recover replaced the set of
+	// publications wholesale (the bug), this alone would be enough for Done — Results would
+	// have been lost long ago. With the fix, the record must remain in flight.
 	require.Equal(t, 1, em.releaseKind("dlq"))
 	select {
 	case r := <-done:
@@ -1296,10 +1296,10 @@ func TestFinishPanicAfterResultsAwaitsAlreadyIssuedPublication(t *testing.T) {
 		"запись обязана стать коммитабельной только после ack обеих публикаций")
 }
 
-// T16: публикация теперь асинхронна, и весь контракт «офсет только после ack»
-// держится на том, что Done наступает строго после подтверждения. Пока брокер
-// молчит, запись обязана оставаться незавершённой — иначе «подтверждено»
-// подменяется на «отдано в буфер», а потерянный DLQ платежа не заметит никто.
+// T16: publication is now asynchronous, and the whole "offset only after ack" contract
+// rests on Done happening strictly after acknowledgment. While the broker
+// stays silent, the record must remain unfinished — otherwise "acknowledged"
+// gets substituted for "handed to the buffer", and no one would notice a lost DLQ for a payment.
 func TestRecordIsNotDoneUntilPublicationIsAcknowledged(t *testing.T) {
 	em := &deferredEmitter{}
 	sub := &stubSubmitter{outcomes: []tbx.Outcome{{Index: 0, ID: "id-0", Status: tbx.StatusOK}}}
@@ -1318,8 +1318,8 @@ func TestRecordIsNotDoneUntilPublicationIsAcknowledged(t *testing.T) {
 		done <- passResult{applied, err}
 	}()
 
-	// Публикация выдана, но не подтверждена: pass обязана висеть, а запись —
-	// оставаться в полёте и не попадать в коммит.
+	// The publication is issued but not acknowledged: pass must hang, and the record must
+	// stay in flight and not enter the commit.
 	require.Eventually(t, func() bool { return len(em.publishedFor(0)) == 1 }, time.Second, time.Millisecond,
 		"публикация обязана выдаваться, не дожидаясь брокера")
 	select {
@@ -1340,9 +1340,9 @@ func TestRecordIsNotDoneUntilPublicationIsAcknowledged(t *testing.T) {
 		"подтверждённая запись обязана стать коммитабельной")
 }
 
-// T16: провал публикации в results — инфраструктурный класс. Запись не
-// помечается Done, а её партиция уходит в откат существующим путём: молча
-// потерять её нельзя.
+// T16: a results-publication failure is an infrastructure class. The record is not
+// marked Done, and its partition goes through the existing rollback path: it must not
+// be silently lost.
 func TestProcessBatchResultsPublicationFailureRewindsPartition(t *testing.T) {
 	em := &recordingEmitter{failResultsAt: map[int64]error{0: errors.New("results topic down")}}
 	sub := &idSubmitter{ok: map[string]bool{recID(0, 0): true, recID(0, 1): true}}
@@ -1371,9 +1371,9 @@ func TestProcessBatchResultsPublicationFailureRewindsPartition(t *testing.T) {
 	require.Zero(t, s.offsets.InFlight())
 }
 
-// T16: провал публикации одной записи не имеет права утаскивать за собой
-// подтверждения соседей. Записи до упавшей подтверждены и помечены Done;
-// откат начинается ровно с упавшей.
+// T16: one record's publication failure has no right to drag its neighbors'
+// acknowledgments down with it. Records before the failed one are acknowledged and marked Done;
+// the rollback starts exactly at the failed one.
 func TestProcessBatchOneFailedPublicationLeavesEarlierOnesConfirmed(t *testing.T) {
 	em := &recordingEmitter{failResultsAt: map[int64]error{2: errors.New("results topic down")}}
 	ok := map[string]bool{}
@@ -1406,9 +1406,9 @@ func TestProcessBatchOneFailedPublicationLeavesEarlierOnesConfirmed(t *testing.T
 		"офсеты 0 и 1 подтверждены и помечены Done, несмотря на провал офсета 2")
 }
 
-// T16: подтверждения приходят не в том порядке, в каком публикации выданы, —
-// и это ничего не меняет. Порядок публикации внутри партиции обязан оставаться
-// порядком офсетов, а Done — наступать по тому же порядку.
+// T16: acknowledgments arrive in an order different from the one publications were issued in —
+// and that changes nothing. Publication order within a partition must remain
+// offset order, and Done must occur in that same order.
 func TestProcessBatchPublicationOrderFollowsOffsetsWithOutOfOrderAcks(t *testing.T) {
 	const (
 		parts = 3
@@ -1431,8 +1431,8 @@ func TestProcessBatchPublicationOrderFollowsOffsetsWithOutOfOrderAcks(t *testing
 		s.processBatch(context.Background(), records)
 	}()
 
-	// Подтверждения выдаются пачками и в обратном порядке — так брокер и
-	// отвечает: порядок ответов не совпадает с порядком выдачи.
+	// Acknowledgments are released in batches and in reverse order — that is how the broker
+	// actually responds: response order does not match hand-off order.
 	released := 0
 	deadline := time.After(30 * time.Second)
 	for released < parts*perP {
@@ -1464,9 +1464,9 @@ func TestProcessBatchPublicationOrderFollowsOffsetsWithOutOfOrderAcks(t *testing
 	require.Zero(t, s.offsets.InFlight())
 }
 
-// T16: Flush перед коммитом обязан учитывать ошибки, а не только опустошение
-// буфера. Провал Flush означает, что какая-то публикация не подтверждена —
-// коммитить после него нельзя ничего.
+// T16: Flush before a commit must account for errors, not just draining the
+// buffer. A Flush failure means some publication is not acknowledged —
+// nothing may be committed after it.
 func TestCommitSkipsCommitWhenFlushFails(t *testing.T) {
 	em := &recordingEmitter{flushErr: errors.New("producer flush failed")}
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, &stubSubmitter{}, em)
@@ -1497,8 +1497,8 @@ func TestCommitSkipsMarkCommittedOnTransportError(t *testing.T) {
 		"неудавшийся коммит не должен помечаться выполненным")
 }
 
-// Ошибка уровня партиции не поднимается в err коллбэка — без её проверки
-// офсет был бы помечен закоммиченным, не будучи им.
+// A partition-level error is not surfaced in the callback's err — without checking it,
+// the offset would be marked committed without actually being so.
 func TestCommitSkipsMarkCommittedOnPartitionError(t *testing.T) {
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, &stubSubmitter{}, &recordingEmitter{})
 	cl := clientOf(t, s)
@@ -1552,7 +1552,7 @@ func TestCommitPublishesCommitLagMetric(t *testing.T) {
 		"fully caught up: lag must return to 0, not go stale at the previous value")
 }
 
-// Forget обнуляет состояние партиции, поэтому коммит обязан идти первым.
+// Forget zeroes out the partition's state, so the commit must go first.
 func TestOnRevokedCommitsBeforeForget(t *testing.T) {
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, &stubSubmitter{}, &recordingEmitter{})
 	rec := srcRec(0, 0)

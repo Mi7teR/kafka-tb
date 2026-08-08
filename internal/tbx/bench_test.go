@@ -56,7 +56,7 @@ func BenchmarkBatcherAssemble(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			if _, err := bt.Submit(ctx, cmd); err != nil {
-				// b.Error, а не b.Fatal: FailNow из не-бенчмарочной горутины — UB.
+				// b.Error, not b.Fatal: FailNow from a non-benchmark goroutine is UB.
 				b.Error(err)
 				return
 			}

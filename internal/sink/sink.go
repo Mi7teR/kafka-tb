@@ -29,24 +29,24 @@ const (
 	defaultCommitPeriod    = time.Second
 	defaultRetryPeriod     = time.Second
 	defaultShutdownTimeout = 10 * time.Second
-	// defaultBatchBudget ограничивает время, на которое обработка одной
-	// пачки держит блокировку ребаланса. Дефолтный rebalance timeout
-	// franz-go — 60s; запас нужен, потому что бюджет проверяется только
-	// между попытками, а сама попытка тоже занимает время.
+	// defaultBatchBudget bounds the time processing one
+	// batch is allowed to hold the rebalance block. franz-go's default rebalance
+	// timeout is 60s; margin is needed because the budget is checked only
+	// between attempts, and the attempt itself also takes time.
 	defaultBatchBudget = 30 * time.Second
 )
 
-// Submitter — то, что умеет применять команду. В проде это *tbx.Batcher.
-// Постановка не ждёт исход: ровно один SubmitResult приходит в возвращённый
-// канал, и именно это позволяет держать в батчере больше одной команды сразу.
+// Submitter is whatever can apply a command. In production this is *tbx.Batcher.
+// Submission does not wait for the outcome: exactly one SubmitResult arrives on the returned
+// channel, and this is precisely what allows keeping more than one command in the batcher at a time.
 type Submitter interface {
 	SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan tbx.SubmitResult, error)
 }
 
-// offsetClient — та часть клиента Kafka, которой синк двигает офсеты.
-// Выделена интерфейсом ради тестируемости processBatch/commit/OnRevoked:
-// без неё эти пути невозможно прогнать без живого брокера.
-// *kgo.Client реализует её как есть.
+// offsetClient is the part of the Kafka client the sink uses to move offsets.
+// It is factored into an interface for the testability of processBatch/commit/OnRevoked:
+// without it these paths cannot be run without a live broker.
+// *kgo.Client implements it as-is.
 type offsetClient interface {
 	CommitOffsetsSync(
 		ctx context.Context,
@@ -75,10 +75,10 @@ type Sink struct {
 	batchBudget     time.Duration
 	shutdownTimeout time.Duration
 
-	// commitMu сериализует коммит. Run и OnRevoked — разные горутины, а
-	// Commitable/MarkCommitted обязаны идти парой: между ними нельзя вклинить
-	// второй Commitable, иначе тот же офсет уедет в брокер дважды, а
-	// MarkCommitted второго вызова затрёт ватермарк первого.
+	// commitMu serializes committing. Run and OnRevoked are different goroutines, and
+	// Commitable/MarkCommitted must go in pairs: a second Commitable must not be wedged
+	// between them, otherwise the same offset would go to the broker twice, and
+	// the second call's MarkCommitted would overwrite the first one's watermark.
 	commitMu sync.Mutex
 }
 
@@ -116,8 +116,8 @@ func New(
 	}
 }
 
-// newForTest собирает синк без polling-клиента: цикл Run проверяется
-// интеграционно, а всё, что двигает офсеты, ходит через offsetClient.
+// newForTest assembles a sink without a polling client: the Run loop is verified
+// via integration tests, while everything that moves offsets goes through offsetClient.
 func newForTest(
 	decoders codec.Registry, sub Submitter, em emitterIface, oc offsetClient, log *slog.Logger,
 ) (*Sink, error) {
@@ -136,17 +136,17 @@ func newForTest(
 	}, nil
 }
 
-// Run крутит цикл до отмены контекста.
+// Run spins the loop until the context is cancelled.
 func (s *Sink) Run(ctx context.Context) {
 	commitTicker := time.NewTicker(s.commitPeriod)
 	defer commitTicker.Stop()
 
 	for {
-		// Опрос ограничен по времени: с бесконечным Poll на тихом топике
-		// периодический коммит не наступал бы до следующей пачки, и
-		// последняя обработанная запись висела бы незакоммиченной.
-		// Коммитить из отдельной горутины нельзя: SetOffsets в abandon
-		// нельзя звать одновременно с коммитом (см. go doc SetOffsets).
+		// Polling is time-bounded: with an unbounded Poll on a quiet topic, the
+		// periodic commit would not arrive until the next batch, and
+		// the last processed record would hang uncommitted.
+		// Committing from a separate goroutine is not allowed: SetOffsets in abandon
+		// must not be called concurrently with a commit (see go doc SetOffsets).
 		pollCtx, cancel := context.WithTimeout(ctx, s.commitPeriod)
 		fetches := s.cl.PollRecords(pollCtx, s.pollSize)
 		cancel()
@@ -154,8 +154,8 @@ func (s *Sink) Run(ctx context.Context) {
 			return
 		}
 		fetches.EachError(func(t string, p int32, err error) {
-			// Отмена — это наш собственный дедлайн опроса или штатное
-			// завершение, а не сбой fetch'а.
+			// Cancellation is our own poll deadline or a routine
+			// shutdown, not a fetch failure.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
@@ -163,17 +163,17 @@ func (s *Sink) Run(ctx context.Context) {
 				slog.Int("partition", int(p)), slog.String("error", err.Error()))
 		})
 
-		// AllowRebalance снимается всегда: клиент собран с
-		// BlockRebalanceOnPoll, и пропущенный вызов — хоть на успешном
-		// пути, хоть на панике — навсегда подвешивает группу.
+		// AllowRebalance is always released: the client is built with
+		// BlockRebalanceOnPoll, and a skipped call — whether on the success
+		// path or on panic — permanently wedges the group.
 		func() {
 			defer s.cl.AllowRebalance()
 			s.processBatch(ctx, fetches.Records())
 		}()
 
 		if ctx.Err() != nil {
-			// Финальный коммит уже отменённым контекстом не пройдёт, но и
-			// висеть на недоступном брокере до бесконечности не должен.
+			// The final commit will not go through with an already-cancelled context, but it also
+			// must not hang on an unreachable broker forever.
 			shutCtx, cancelShut := context.WithTimeout(
 				context.WithoutCancel(ctx), s.shutdownTimeout)
 			s.commit(shutCtx, slog.LevelError)
@@ -188,14 +188,14 @@ func (s *Sink) Run(ctx context.Context) {
 	}
 }
 
-// processBatch обрабатывает пачку записей опроса. Записи группируются по
-// (topic, partition), и каждая группа едет своей горутиной: порядок осмыслен
-// только внутри партиции, между партициями его никогда не гарантировали.
+// processBatch processes one poll's batch of records. Records are grouped by
+// (topic, partition), and each group travels on its own goroutine: order is meaningful
+// only within a partition — it was never guaranteed between partitions.
 //
-// Все горутины джойнятся до возврата. Иначе нельзя: вызывающий сразу после
-// возврата снимает блокировку ребаланса (AllowRebalance), а abandonBatch ниже
-// двигает офсеты через SetOffsets — и то и другое безопасно только пока
-// блокировка ещё держится и только с этой горутины.
+// All goroutines are joined before returning. It cannot be otherwise: the caller, right after
+// the return, releases the rebalance block (AllowRebalance), and abandonBatch below
+// moves offsets via SetOffsets — both are safe only while the
+// block is still held and only from this goroutine.
 func (s *Sink) processBatch(ctx context.Context, records []*kgo.Record) {
 	for _, rec := range records {
 		s.offsets.Track(rec)
@@ -210,14 +210,14 @@ func (s *Sink) processBatch(ctx context.Context, records []*kgo.Record) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// Паника отдельной горутины проходит мимо любого defer вызывающего
-			// — в том числе мимо AllowRebalance, который обещан «хоть на
-			// панике», — и убивает процесс целиком. Ловится она поэтому здесь.
-			// prepare и finish ловят свои паники сами; сюда доходит то, что
-			// мимо них: await, offsets.Done и повторная паника в отложенной
-			// публикации самого finish. Партиция считается брошенной: её
-			// записи остаются непомеченными и потому незакоммиченными, а
-			// вызывающий перемотает её назад.
+			// A panic in a separate goroutine bypasses any defer of the caller —
+			// including AllowRebalance, which is promised "even on
+			// panic" — and kills the whole process. That is why it is caught here.
+			// prepare and finish catch their own panics; what reaches here is what gets
+			// past them: await, offsets.Done, and a repeated panic in finish's own
+			// deferred publication. The partition is considered abandoned: its
+			// records remain unmarked and therefore uncommitted, and
+			// the caller will rewind it.
 			defer func() {
 				r := recover()
 				if r == nil {
@@ -235,20 +235,20 @@ func (s *Sink) processBatch(ctx context.Context, records []*kgo.Record) {
 	}
 	wg.Wait()
 
-	// При отмене контекста перематывать нечего: процесс уходит, а
-	// незавершённые офсеты и так упираются в ватермарк и не коммитятся.
+	// On context cancellation there is nothing to rewind: the process is shutting down, and
+	// unfinished offsets already sit against the watermark and are not committed anyway.
 	if abandoned.Load() && ctx.Err() == nil {
-		// Бюджет пачки исчерпан или запись стабильно падает: дальше держать
-		// ребаланс нельзя. Перематываются ровно те партиции, у которых
-		// остались непроверенные записи, — разобранная до конца партиция в
-		// Pending не попадает.
+		// The batch budget ran out, or a record is failing persistently: the rebalance
+		// block can no longer be held. Exactly the partitions that still have
+		// unprocessed records are rewound — a partition fully drained does not
+		// end up in Pending.
 		s.abandonBatch()
 	}
 }
 
-// groupByPartition режет опрос на пробеги по партициям, сохраняя порядок
-// поступления записей: внутри партиции это порядок офсетов, а именно на нём
-// держится порядок постановки в батчер.
+// groupByPartition cuts the poll into per-partition runs, preserving the record arrival
+// order: within a partition this is offset order, and that is exactly what the
+// submission order to the batcher rests on.
 func groupByPartition(records []*kgo.Record) [][]*kgo.Record {
 	var groups [][]*kgo.Record
 	index := make(map[partitionKey]int)
@@ -265,16 +265,16 @@ func groupByPartition(records []*kgo.Record) [][]*kgo.Record {
 	return groups
 }
 
-// runPartition доводит записи одной партиции до конца, повторяя пробег с той
-// записи, на которой он сорвался. Возвращает false, если партицию пришлось
-// бросить — бюджет исчерпан или контекст отменён; её непроверенные записи
-// остаются непомеченными, и вызывающий перематывает партицию.
+// runPartition drives one partition's records to completion, retrying the run from the
+// record it broke on. Returns false if the partition had to be
+// abandoned — budget exhausted or context cancelled; its unprocessed records
+// remain unmarked, and the caller rewinds the partition.
 //
-// Ретрай начинается именно с упавшей записи, а не с середины: следующие за ней
-// уже поставленные команды тоже перепоставляются, поэтому порядок применения
-// внутри партиции остаётся порядком офсетов и на повторном пробеге. Повторное
-// применение уже применённой команды безвредно — id стабильны между попытками,
-// а TransferExists/AccountExists трактуются как StatusOK.
+// The retry starts specifically at the failed record, not partway through: the commands
+// already submitted after it are also resubmitted, so the application order
+// within the partition remains offset order on the retry run too. Reapplying
+// an already-applied command is harmless — ids are stable across attempts,
+// and TransferExists/AccountExists are treated as StatusOK.
 func (s *Sink) runPartition(ctx context.Context, recs []*kgo.Record, deadline time.Time) bool {
 	for len(recs) > 0 {
 		if ctx.Err() != nil {
@@ -289,8 +289,8 @@ func (s *Sink) runPartition(ctx context.Context, recs []*kgo.Record, deadline ti
 			if applied > 0 {
 				continue
 			}
-			// Ни ошибки, ни прогресса: pass оборвали бюджет или отмена.
-			// Отмену объяснит проверка в начале следующего витка.
+			// Neither an error nor progress: pass was cut short by the budget or a cancellation.
+			// A cancellation will be explained by the check at the top of the next iteration.
 			if ctx.Err() == nil {
 				return false
 			}
@@ -299,7 +299,7 @@ func (s *Sink) runPartition(ctx context.Context, recs []*kgo.Record, deadline ti
 		if ctx.Err() != nil {
 			return s.abandonOnShutdown(recs[0])
 		}
-		// Инфраструктура: та же запись повторяется, следующие ждут её.
+		// Infrastructure: the same record is retried, the following ones wait for it.
 		s.log.Error("record failed, retrying", slog.String("topic", recs[0].Topic),
 			slog.Int("partition", int(recs[0].Partition)),
 			slog.Int64("offset", recs[0].Offset), slog.String("error", err.Error()))
@@ -313,9 +313,9 @@ func (s *Sink) runPartition(ctx context.Context, recs []*kgo.Record, deadline ti
 	return true
 }
 
-// abandonOnShutdown объясняет, почему запись остаётся незакоммиченной, и всегда
-// возвращает false. Отмена контекста — штатное завершение, а не сбой: ретрая
-// всё равно не будет, и ERROR здесь поднял бы дежурного на ровном месте.
+// abandonOnShutdown explains why the record stays uncommitted, and always
+// returns false. Context cancellation is a routine shutdown, not a failure: there will
+// be no retry anyway, and an ERROR here would page the on-call for nothing.
 func (s *Sink) abandonOnShutdown(rec *kgo.Record) bool {
 	s.log.Info("shutting down, leaving record uncommitted for reprocessing",
 		slog.String("topic", rec.Topic), slog.Int("partition", int(rec.Partition)),
@@ -323,44 +323,44 @@ func (s *Sink) abandonOnShutdown(rec *kgo.Record) bool {
 	return false
 }
 
-// pass ставит в батчер префикс recs, ни на один исход не дожидаясь, потом
-// собирает исходы в том же порядке, выдавая брокеру публикации, и только
-// третьей фазой дожидается подтверждения этих публикаций и помечает записи
-// Done. Порядок постановки — это порядок применения в TigerBeetle, порядок
-// выдачи публикаций — порядок записей в results и DLQ; оба совпадают с
-// порядком офсетов партиции. Poison сюда тоже попадает: в батчер он не идёт,
-// но его DLQ откладывается до фазы сбора, иначе публикация партиции перестала
-// бы быть последовательной.
+// pass submits recs' prefix to the batcher without waiting for a single outcome, then
+// collects the outcomes in the same order, handing publications to the broker, and only
+// as a third phase waits for those publications to be acknowledged and marks records
+// Done. Submission order is application order in TigerBeetle; publication
+// hand-off order is the order of records in results and the DLQ; both match the
+// partition's offset order. Poison also passes through here: it does not go to the batcher,
+// but its DLQ publication is deferred to the collection phase, otherwise the partition's
+// publication would stop being sequential.
 //
-// Три фазы, а не две, именно ради подтверждения: дожидаться брокера сразу
-// после выдачи значило бы платить round-trip на запись — ровно то, что
-// пайплайнинг уже убрал у TigerBeetle. Выданные публикации летят параллельно,
-// поэтому общая фаза ожидания стоит максимума, а не суммы.
+// Three phases rather than two, specifically for the sake of acknowledgment: waiting for the broker right
+// after handing off would mean paying a round-trip per record — exactly what
+// pipelining has already removed for TigerBeetle. Handed-off publications fly in parallel,
+// so the combined wait phase costs the maximum, not the sum.
 //
-// Возвращает число ведущих записей, доведённых до окончательного исхода и
-// подтверждённых брокером, и инфраструктурную ошибку, которая это остановила:
-// ошибка принадлежит recs[applied]. Короткий возврат без ошибки означает, что
-// кончился бюджет пачки или процесс уходит — остальные записи остаются
-// непомеченными.
+// Returns the number of leading records driven to a final outcome and
+// acknowledged by the broker, and the infrastructure error that stopped this:
+// the error belongs to recs[applied]. A short return with no error means
+// the batch budget ran out or the process is shutting down — the remaining records stay
+// unmarked.
 func (s *Sink) pass(ctx context.Context, recs []*kgo.Record, deadline time.Time) (int, error) {
 	if len(recs) > s.maxInFlight {
 		recs = recs[:s.maxInFlight]
 	}
 	if len(recs) == 0 {
-		// Недостижимо: вызывающий не зовёт pass с пустым срезом, а sink.New
-		// прижимает maxInFlight к минимум единице, поэтому обрезка выше не
-		// может оставить ноль. Проверка стоит здесь как явный контракт: пустой
-		// пробег — это (0, nil), без построения контекста и срезов, и любое
-		// будущее обращение к recs[0] ниже уже защищено.
+		// Unreachable: the caller never calls pass with an empty slice, and sink.New
+		// clamps maxInFlight to at least one, so the truncation above cannot
+		// leave zero. The check stands here as an explicit contract: an empty
+		// run is (0, nil), with no context or slices built, and any
+		// future access to recs[0] below is already guarded.
 		return 0, nil
 	}
-	// Постановка ограничена бюджетом пачки, а не только отменой: SubmitAsync
-	// паркуется на очереди батчера, а очередь эта общая и заведомо переполняется
-	// — партиций много, у каждой свой maxInFlight. Пока TigerBeetle отвечает,
-	// очередь разбирается; как только он замолчал, батчер ретраит вечно, очередь
-	// не двигается, и постановка без дедлайна держала бы блокировку ребаланса
-	// сколь угодно долго. Исход уже поставленной команды от этого контекста не
-	// зависит — его ждёт await по общему бюджету.
+	// Submission is bounded by the batch budget, not just by cancellation: SubmitAsync
+	// parks on the batcher's queue, and that queue is shared and can certainly overflow
+	// — there are many partitions, each with its own maxInFlight. As long as TigerBeetle responds,
+	// the queue drains; the moment it goes silent, the batcher retries forever, the queue
+	// stops moving, and submission without a deadline would hold the rebalance block
+	// indefinitely. The outcome of an already-submitted command does not depend on this
+	// context — await waits for it against the overall budget.
 	enqueueCtx, cancelEnqueue := context.WithDeadline(ctx, deadline)
 	defer cancelEnqueue()
 	prep := make([]prepared, 0, len(recs))
@@ -370,23 +370,23 @@ func (s *Sink) pass(ctx context.Context, recs []*kgo.Record, deadline time.Time)
 		}
 		p := s.prepare(enqueueCtx, rec)
 		if p.err != nil && enqueueCtx.Err() != nil && ctx.Err() == nil {
-			// Постановку оборвал наш собственный дедлайн: это исчерпанный
-			// бюджет пачки, а не сбой записи. Ошибку не поднимаем — ретраить
-			// её незачем, вызывающий бросит партицию и перемотает её.
+			// Submission was cut short by our own deadline: this is an exhausted
+			// batch budget, not a record failure. We do not raise the error — there is no point
+			// retrying it, the caller will abandon the partition and rewind it.
 			break
 		}
 		prep = append(prep, p)
 		if p.err != nil {
-			// Постановка сорвалась. Следующие записи партиции ставить нельзя:
-			// они применились бы в TigerBeetle раньше упавшей, а упавшая — на
-			// повторе, то есть после них. Порядок применения внутри партиции
-			// обязан быть порядком офсетов, поэтому пробег останавливается
-			// здесь, а уже поставленный префикс собирается как обычно.
+			// Submission failed. The partition's following records must not be submitted:
+			// they would apply in TigerBeetle before the failed one, while the failed one applies
+			// on retry, i.e. after them. The application order within a partition
+			// must be offset order, so the run stops
+			// here, and the prefix already submitted is collected as usual.
 			break
 		}
 	}
-	// issued — публикации записей в порядке офсетов; issued[i] принадлежит
-	// recs[i]. Собираются, а не дожидаются на месте: см. комментарий выше.
+	// issued holds records' publications in offset order; issued[i] belongs to
+	// recs[i]. They are collected rather than awaited in place: see the comment above.
 	issued := make([]issuedPubs, 0, len(prep))
 	var failErr error
 	for i, p := range prep {
@@ -394,18 +394,18 @@ func (s *Sink) pass(ctx context.Context, recs []*kgo.Record, deadline time.Time)
 		if p.ch != nil {
 			var ok bool
 			if res, ok = s.await(ctx, p.ch, deadline); !ok {
-				// Бюджет пачки или отмена: остальные записи не публикуются
-				// вовсе, а уже выданные всё равно обязаны быть подтверждены
-				// ниже — иначе их офсеты нельзя двигать.
+				// Batch budget or cancellation: the remaining records are not published
+				// at all, while the ones already handed off must still be acknowledged
+				// below — otherwise their offsets cannot be moved.
 				break
 			}
 		}
 		pub, err := s.finish(ctx, recs[i], p, res)
 		if err != nil {
-			// Ошибка принадлежит recs[i], но объявить её можно только после
-			// того, как подтвердятся публикации записей до неё: pass обязана
-			// вернуть индекс первой незавершённой записи, а ей может
-			// оказаться и более ранняя, чья публикация не доехала.
+			// The error belongs to recs[i], but it can only be declared after
+			// the publications of the records before it have been acknowledged: pass must
+			// return the index of the first unfinished record, and that may
+			// turn out to be an earlier one whose publication did not go through.
 			failErr = err
 			break
 		}
@@ -419,15 +419,15 @@ func (s *Sink) pass(ctx context.Context, recs []*kgo.Record, deadline time.Time)
 	return applied, failErr
 }
 
-// confirm дожидается подтверждения выданных публикаций в порядке офсетов и
-// помечает Done ровно тот ведущий префикс записей, чьи публикации брокер
-// подтвердил. Запись, чья публикация не подтверждена, Done не становится ни
-// при каких обстоятельствах: её офсет не закоммитится, партицию перемотают, и
-// запись обработается заново — потерять её в DLQ нельзя.
+// confirm waits for the acknowledgment of handed-off publications in offset order and
+// marks Done exactly the leading prefix of records whose publications the broker
+// has acknowledged. A record whose publication is not acknowledged never becomes
+// Done under any circumstances: its offset will not be committed, the partition will be rewound, and
+// the record will be processed again — it must not be lost in the DLQ.
 //
-// Ожидание ограничено бюджетом пачки: franz-go ретраит публикацию до победного,
-// и без дедлайна молчащий брокер держал бы блокировку ребаланса сколь угодно
-// долго.
+// Waiting is bounded by the batch budget: franz-go retries a publication until it succeeds,
+// and without a deadline a silent broker would hold the rebalance block
+// indefinitely.
 func (s *Sink) confirm(
 	ctx context.Context, recs []*kgo.Record, issued []issuedPubs, deadline time.Time,
 ) (int, error) {
@@ -443,27 +443,27 @@ func (s *Sink) confirm(
 				continue
 			}
 			if waitCtx.Err() != nil && errors.Is(err, waitCtx.Err()) {
-				// Ответа не дождались: бюджет пачки кончился или процесс
-				// уходит. Сбоем записи это не является — ретраить нечего,
-				// партицию перемотают целиком. Сверка с самой ошибкой
-				// обязательна: настоящий отказ брокера, пришедший ровно на
-				// истёкшем дедлайне, обязан быть виден как отказ, а не
-				// потеряться в общем «не дождались».
+				// No response was received in time: the batch budget ran out or the process
+				// is shutting down. This is not a record failure — there is nothing to retry,
+				// the whole partition will be rewound. Cross-checking against the error itself
+				// is mandatory: a real broker failure that happened to arrive right at
+				// the expired deadline must be visible as a failure, not
+				// lost in the general "no response in time".
 				return i, nil
 			}
 			s.metrics.IncRecords("blocked")
 			return i, err
 		}
-		// Считается здесь, а не при выдаче публикации: до подтверждения
-		// обработка записи не окончательна — она ещё может уехать на повтор,
-		// и тогда ok/rejected посчитались бы дважды.
+		// Counted here, not at publication hand-off: before acknowledgment
+		// a record's processing is not final — it can still be sent for a retry,
+		// and then ok/rejected would be counted twice.
 		s.count(pub)
 		s.offsets.Done(recs[i])
 	}
 	return len(issued), nil
 }
 
-// count фиксирует окончательный исход подтверждённой записи.
+// count records the final outcome of an acknowledged record.
 func (s *Sink) count(pub issuedPubs) {
 	if pub.isPoison {
 		s.metrics.IncRecords("poison")
@@ -480,11 +480,11 @@ func (s *Sink) count(pub issuedPubs) {
 	}
 }
 
-// await ждёт исход одной команды. Возвращает false, если ждать перестали —
-// бюджет пачки кончился или процесс уходит; запись остаётся непроверенной и
-// потому незакоммиченной. Уже пришедший исход имеет приоритет над обоими
-// поводами уйти: бросить его значило бы соврать про применённую работу там,
-// где правда уже на руках.
+// await waits for one command's outcome. Returns false if waiting was abandoned —
+// the batch budget ran out or the process is shutting down; the record stays unprocessed and
+// therefore uncommitted. An outcome that has already arrived takes priority over both
+// reasons to leave: discarding it would mean lying about applied work when
+// the truth is already in hand.
 func (s *Sink) await(ctx context.Context, ch <-chan tbx.SubmitResult, deadline time.Time) (tbx.SubmitResult, bool) {
 	select {
 	case res := <-ch:
@@ -503,18 +503,18 @@ func (s *Sink) await(ctx context.Context, ch <-chan tbx.SubmitResult, deadline t
 	}
 }
 
-// abandonBatch бросает недоработанную пачку и перематывает партиции назад.
-// Уже вычитанные записи сами по себе больше не придут, поэтому без
-// перемотки брошенный офсет остался бы в pending навсегда: партиция не
-// коммитилась бы до конца жизни процесса, а память под done росла бы.
-// Forget ставит тумбстон, следующий Track ту же партицию оживит.
+// abandonBatch abandons an unfinished batch and rewinds partitions back.
+// Records already fetched will not arrive again on their own, so without a
+// rewind an abandoned offset would stay in pending forever: the partition would never
+// commit for the rest of the process's life, and the memory under done would keep growing.
+// Forget places a tombstone; the next Track for that same partition will revive it.
 func (s *Sink) abandonBatch() {
 	pending := s.offsets.Pending()
 	if len(pending) == 0 {
 		return
 	}
-	// SetOffsets безопасен именно здесь: ребаланс ещё заблокирован Poll'ом,
-	// а коммит идёт из этой же горутины и сейчас не выполняется.
+	// SetOffsets is safe specifically here: the rebalance is still blocked by Poll,
+	// and a commit runs from this same goroutine and is not in progress right now.
 	s.oc.SetOffsets(pending)
 	for topic, parts := range pending {
 		for partition, eo := range parts {
@@ -527,7 +527,7 @@ func (s *Sink) abandonBatch() {
 	}
 }
 
-// backoff возвращает false, если ждать больше незачем — контекст отменён.
+// backoff returns false if there is no point waiting any longer — the context is cancelled.
 func (s *Sink) backoff(ctx context.Context) bool {
 	t := time.NewTimer(s.retryPeriod)
 	defer t.Stop()
@@ -539,23 +539,23 @@ func (s *Sink) backoff(ctx context.Context) bool {
 	}
 }
 
-// prepared — состояние одной поставленной записи: либо канал исхода, либо уже
-// принятое решение, до батчера. Публикация не делается здесь ни в одном
-// случае: её порядок обязан совпадать с порядком офсетов, а фаза постановки
-// намеренно не ждёт исходы и потому не может ничего публиковать по порядку.
+// prepared is the state of one submitted record: either an outcome channel, or a
+// decision already made before the batcher. No publication is done here in either
+// case: its order must match offset order, and the submission phase
+// deliberately does not wait for outcomes and therefore cannot publish anything in order.
 type prepared struct {
-	// ch — канал ровно одного исхода; nil, если запись в батчер не пошла.
+	// ch is the channel for exactly one outcome; nil if the record never went to the batcher.
 	ch <-chan tbx.SubmitResult
-	// poison называет ошибку для DLQ записи, которая до батчера не дошла и
-	// никогда не дойдёт. Пусто, если запись поставлена.
+	// poison names the error for the DLQ of a record that never reached the batcher and
+	// never will. Empty if the record was submitted.
 	poison string
 	detail string
-	// err — инфраструктурный сбой самой постановки.
+	// err is an infrastructure failure of the submission itself.
 	err error
 }
 
-// prepare декодирует запись и ставит её команду в батчер, не дожидаясь исхода.
-// Паника — дефект в обработке этого сообщения, а не всего потока.
+// prepare decodes the record and submits its command to the batcher, without waiting for the outcome.
+// A panic is a defect in handling this message, not the whole stream.
 func (s *Sink) prepare(ctx context.Context, rec *kgo.Record) (p prepared) {
 	defer func() {
 		r := recover()
@@ -574,8 +574,8 @@ func (s *Sink) prepare(ctx context.Context, rec *kgo.Record) (p prepared) {
 
 	cmd, derr := dec.Decode(rec.Value)
 	if derr != nil {
-		// Контракт codec.Decoder: любая ошибка декодинга — poison. Считать
-		// её инфраструктурной значило бы повторять запись вечно.
+		// codec.Decoder's contract: any decoding error is poison. Treating
+		// it as infrastructural would mean retrying the record forever.
 		return prepared{poison: "decode", detail: derr.Error()}
 	}
 
@@ -589,44 +589,44 @@ func (s *Sink) prepare(ctx context.Context, rec *kgo.Record) (p prepared) {
 	return prepared{ch: ch}
 }
 
-// issuedPubs — публикации одной записи, выданные брокеру, но ещё не
-// подтверждённые, вместе с тем, что нужно посчитать, когда они подтвердятся.
-// Пустой pubs невозможен: у каждой дошедшей до публикации записи есть либо
-// results, либо DLQ.
+// issuedPubs holds one record's publications, handed off to the broker but not yet
+// acknowledged, together with what needs to be counted once they are acknowledged.
+// An empty pubs is impossible: every record that reaches publication has either
+// results or a DLQ entry.
 type issuedPubs struct {
 	pubs []*emit.Publication
-	// isPoison отличает запись, которая никогда не применится, от применённой:
-	// от этого флага, а не от значения poison, зависит, какую ветку count
-	// берёт для метрики. poison — только текст ошибки для DLQ и метрики;
-	// заведение его как единственного флага позволило бы пустому errName
-	// молча провалиться в ветку outcomes.
+	// isPoison distinguishes a record that will never be applied from one that was:
+	// which branch count takes for the metric depends on this flag, not on the
+	// poison value. poison is only the error text for the DLQ and metric;
+	// making it the sole flag would let an empty errName
+	// silently fall through into the outcomes branch.
 	isPoison bool
-	// poison называет ошибку для DLQ записи, которая никогда не применится.
-	// Осмыслен только когда isPoison — true.
+	// poison names the error for the DLQ of a record that will never be applied.
+	// Meaningful only when isPoison is true.
 	poison string
-	// outcomes — исходы применённой команды; nil у poison.
+	// outcomes holds the applied command's outcomes; nil for poison.
 	outcomes []tbx.Outcome
 }
 
-// finish выдаёт брокеру публикации записи, не дожидаясь подтверждения, и
-// возвращает их. Ошибка означает инфраструктурную проблему до публикации:
-// офсет остаётся на месте, запись будет обработана снова. Отсутствие ошибки
-// ещё не значит, что офсет можно двигать, — это решает confirm.
+// finish hands the record's publications to the broker without waiting for acknowledgment, and
+// returns them. An error means an infrastructure problem before publication:
+// the offset stays put, the record will be processed again. The absence of an error
+// does not yet mean the offset can be moved — confirm decides that.
 func (s *Sink) finish(
 	ctx context.Context, rec *kgo.Record, p prepared, res tbx.SubmitResult,
 ) (pub issuedPubs, err error) {
-	// pubs — публикации, уже выданные брокеру к моменту паники, если она
-	// случится ниже. Паника в recover заменяет исход, но не имеет права
-	// стереть то, что уже улетело: та публикация всё равно долетит и обязана
-	// быть дождана, иначе Done наступит по одному только ack поисонового DLQ,
-	// пока эта первая публикация повисла неучтённой.
+	// pubs holds the publications already handed to the broker by the time a panic
+	// happens below, if it does. A panic caught by recover replaces the outcome, but has no right to
+	// erase what has already been sent: that publication will still land and must
+	// be waited for, otherwise Done would happen based solely on the poison DLQ's ack,
+	// while this first publication hangs unaccounted for.
 	var pubs []*emit.Publication
 	defer func() {
 		r := recover()
 		if r == nil {
 			return
 		}
-		// Паника — дефект в обработке этого сообщения, а не всего потока.
+		// A panic is a defect in handling this message, not the whole stream.
 		s.log.Error("panic handling record", slog.Any("panic", r),
 			slog.String("topic", rec.Topic), slog.Int64("offset", rec.Offset))
 		poison := s.emitPoison(ctx, rec, "panic", fmt.Sprint(r))
@@ -642,9 +642,9 @@ func (s *Sink) finish(
 		return issuedPubs{}, p.err
 	}
 	if res.Err != nil {
-		// Настоящий батчер отказывает слишком большой команде прямо на
-		// постановке, но Submitter вправе сообщить это и исходом; трактуем
-		// одинаково, откуда бы ни пришло.
+		// The real batcher rejects a too-large command right at
+		// submission, but a Submitter is entitled to report this as an outcome instead; we treat it
+		// the same regardless of where it came from.
 		if errors.Is(res.Err, tbx.ErrCommandTooLarge) {
 			return s.emitPoison(ctx, rec, "command_too_large", res.Err.Error()), nil
 		}
@@ -664,9 +664,9 @@ func (s *Sink) finish(
 	return issuedPubs{pubs: pubs, outcomes: res.Outcomes}, nil
 }
 
-// emitPoison выдаёт брокеру запись, которая никогда не будет применена.
-// Двигать её офсет можно только после того, как confirm дождётся подтверждения
-// этой публикации.
+// emitPoison hands the broker a record that will never be applied.
+// Its offset can be moved only after confirm has waited for the acknowledgment of
+// this publication.
 func (s *Sink) emitPoison(ctx context.Context, rec *kgo.Record, errName, detail string) issuedPubs {
 	return issuedPubs{
 		pubs:     []*emit.Publication{s.em.DLQ(ctx, rec, emit.ReasonPoison, errName, detail)},
@@ -675,16 +675,16 @@ func (s *Sink) emitPoison(ctx context.Context, rec *kgo.Record, errName, detail 
 	}
 }
 
-// commit отдаёт брокеру непрерывный префикс обработанных офсетов.
-// Flush до коммита обязателен: закоммитить офсет записи, чей DLQ или results
-// ещё лежат в буфере продюсера, значит потерять её при падении процесса.
+// commit hands the broker a contiguous prefix of processed offsets.
+// A Flush before committing is mandatory: committing the offset of a record whose DLQ or results
+// publication is still sitting in the producer's buffer would mean losing it if the process crashes.
 //
-// level задаёт уровень лога провала коммита и передаётся вызывающей
-// стороной, а не выводится внутри: у OnRevoked провал коммита штатный —
-// это гонка revoke с закрытием клиента (контекст уже отменён), тот же офсет
-// уедет при следующей отдаче партиции. У периодического и shutdown-коммита
-// в Run провал означает, что брокер стабильно отклоняет коммиты, и это
-// обязано быть видно алертингу.
+// level sets the log level for a failed commit and is passed in by the
+// caller rather than decided internally: for OnRevoked a failed commit is routine —
+// it is a race between revoke and the client closing (the context is already cancelled), and the same offset
+// will go out on the partition's next assignment. For the periodic and shutdown commit
+// in Run, a failure means the broker is consistently rejecting commits, and this
+// must be visible to alerting.
 func (s *Sink) commit(ctx context.Context, level slog.Level) {
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
@@ -710,8 +710,8 @@ func (s *Sink) commit(ctx context.Context, level slog.Level) {
 				s.log.Log(ctx, level, "commit failed", slog.String("error", err.Error()))
 				return
 			}
-			// Ошибка уровня партиции не поднимается в err: без этой проверки
-			// незакоммиченный офсет был бы помечен как закоммиченный.
+			// A partition-level error is not surfaced in err: without this check,
+			// an uncommitted offset would be marked as committed.
 			for _, t := range resp.Topics {
 				for _, p := range t.Partitions {
 					perr := kerr.ErrorForCode(p.ErrorCode)
@@ -726,8 +726,8 @@ func (s *Sink) commit(ctx context.Context, level slog.Level) {
 			}
 		})
 	if failed {
-		// Ватермарк не двигаем целиком: повторный коммит того же офсета
-		// безвреден, а вот преждевременный MarkCommitted — нет.
+		// We do not move the watermark at all: recommitting the same offset
+		// is harmless, but a premature MarkCommitted is not.
 		return
 	}
 	s.offsets.MarkCommitted(offsets)
@@ -743,8 +743,8 @@ func (s *Sink) reportCommitLag() {
 	}
 }
 
-// OnRevoked коммитит перед отдачей партиций: после Forget состояние партиции —
-// тумбстон, и коммитить будет уже нечего.
+// OnRevoked commits before partitions are given up: after Forget a partition's state is
+// a tombstone, and there would be nothing left to commit.
 func (s *Sink) OnRevoked(ctx context.Context, revoked map[string][]int32) {
 	s.commit(ctx, slog.LevelWarn)
 	for topic, parts := range revoked {
@@ -754,8 +754,8 @@ func (s *Sink) OnRevoked(ctx context.Context, revoked map[string][]int32) {
 	}
 }
 
-// NewKafkaClient собирает консьюмера с ручным коммитом и блокировкой
-// ребаланса на время обработки: иначе можно закоммитить чужие партиции.
+// NewKafkaClient assembles a consumer with manual commit and a rebalance
+// block held during processing: otherwise it is possible to commit someone else's partitions.
 func NewKafkaClient(cfg *config.Config, onRevoked func(context.Context, map[string][]int32)) (*kgo.Client, error) {
 	topics := make([]string, 0, len(cfg.Kafka.Topics))
 	for _, t := range cfg.Kafka.Topics {

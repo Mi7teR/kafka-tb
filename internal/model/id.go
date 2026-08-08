@@ -10,8 +10,8 @@ import (
 
 var ErrZeroID = errors.New("id must not be zero")
 
-// ParseID переводит UUID-строку в Uint128. Байты UUID кладутся как есть,
-// обратное преобразование даёт ту же строку.
+// ParseID converts a UUID string to Uint128. The UUID bytes are placed as-is,
+// so the reverse conversion gives back the same string.
 func ParseID(s string) (types.Uint128, error) {
 	u, err := uuid.Parse(s)
 	if err != nil {

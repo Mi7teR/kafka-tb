@@ -13,9 +13,9 @@ import (
 	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
-// orderedAccountCmd/orderedTransferCmd — команды на одно событие, помеченные
-// общим порядковым номером: обе операции складываются в один порядок
-// применения, и по метке видно не только пересечение, но и инверсию.
+// orderedAccountCmd/orderedTransferCmd are single-event commands tagged with
+// a shared sequence number: both operations fold into one application
+// order, and the tag reveals not only overlap but also inversion.
 func orderedAccountCmd(seq uint64) *model.Command {
 	return &model.Command{
 		Op:       model.OpCreateAccounts,
@@ -32,10 +32,10 @@ func orderedTransferCmd(seq uint64) *model.Command {
 	}
 }
 
-// mixedBarrierClient — барьер, общий для обеих операций: он сводит вместе
-// вызовы CreateAccounts и CreateTransfers. Батчер обязан не свести их никогда,
-// сколько бы типов операций ни несла очередь. Записывает порядок применения с
-// пометкой операции ("a1", "t2").
+// mixedBarrierClient is a barrier shared between both operations: it brings
+// together calls to CreateAccounts and CreateTransfers. The batcher must never
+// bring them together, no matter how many operation types the queue carries. Records the
+// application order tagged by operation ("a1", "t2").
 type mixedBarrierClient struct {
 	n       int
 	timeout time.Duration
@@ -51,10 +51,10 @@ func newMixedBarrierClient(n int, timeout time.Duration) *mixedBarrierClient {
 	return &mixedBarrierClient{n: n, timeout: timeout, gate: make(chan struct{})}
 }
 
-// enter отпускает вызывающего, только когда в клиенте одновременно оказались n
-// вызовов. Если этого не случилось за timeout, вызов всё равно отпускается —
-// иначе батчер повис бы, — но факт «одновременности не было» остаётся в
-// timedout.
+// enter releases the caller only once n calls have arrived at the client
+// simultaneously. If that has not happened within timeout, the call is released
+// anyway — otherwise the batcher would hang — but the fact that "there was no
+// simultaneity" is preserved in timedout.
 func (c *mixedBarrierClient) enter() {
 	c.mu.Lock()
 	c.arrived++
@@ -139,19 +139,19 @@ func (c *mixedBarrierClient) QueryTransfers(types.QueryFilter) ([]types.Transfer
 func (c *mixedBarrierClient) Nop() error { return nil }
 func (c *mixedBarrierClient) Close()     {}
 
-// Батчер владеет порядком целиком, а не по типу операции: create_accounts и
-// create_transfers одной партиции обязаны примениться по очереди и в порядке
-// постановки. Это ровно та последовательность, которую пишет обычный продюсер, —
-// завести счёт и тут же с него списать; разъехавшись, она даёт
-// debit_account_not_found, то есть бизнес-отказ и DLQ для законного трансфера.
+// The batcher owns ordering as a whole, not per operation type: create_accounts and
+// create_transfers from one partition must apply in sequence and in the order they
+// were submitted. This is exactly the sequence an ordinary producer writes —
+// open an account and immediately debit it; if it comes apart, that yields
+// debit_account_not_found, i.e. a business rejection and a DLQ for a legitimate transfer.
 //
-// Синк ставит записи партиции конвейером, не дожидаясь исхода каждой, поэтому
-// тест ставит обе команды подряд через SubmitAsync — это и есть реальный
-// сценарий, а не искусственная гонка.
+// The sink submits a partition's records as a pipeline, without waiting for each one's
+// outcome, so the test submits both commands back-to-back via SubmitAsync — this is
+// the real scenario, not an artificial race.
 func TestBatcherMixedOpsNeverInFlightTogether(t *testing.T) {
 	fc := newMixedBarrierClient(2, 300*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
-	// max_batch_size=1: каждая команда уходит сразу, ждать linger не нужно.
+	// max_batch_size=1: each command goes out immediately, no need to wait for linger.
 	b := NewBatcher(fc, config.Batcher{MaxBatchSize: 1, Linger: time.Hour, MaxQueue: 8},
 		config.Retry{Initial: time.Millisecond, Max: 10 * time.Millisecond}, testLogger(), nil)
 	b.Start(ctx)

@@ -8,8 +8,8 @@ import (
 	"github.com/Mi7teR/kafka-tb/internal/config"
 )
 
-// Client — узкий интерфейс поверх клиента TigerBeetle.
-// Существует ради подмены в тестах: настоящий клиент требует живого кластера.
+// Client is a narrow interface over the TigerBeetle client.
+// It exists to allow substitution in tests: the real client requires a live cluster.
 type Client interface {
 	CreateAccounts([]types.Account) ([]types.CreateAccountResult, error)
 	CreateTransfers([]types.Transfer) ([]types.CreateTransferResult, error)

@@ -122,11 +122,11 @@ func Load(path string) (*Config, error) {
 	}
 	applyEnv(&cfg)
 	if cfg.Sink.MaxInFlightPerPartition == 0 {
-		// Дефолт прижимается к потолку батчера, а не навязывается: конфиг,
-		// написанный до появления этого поля, мог иметь очередь меньше
-		// дефолта, и падать на загрузке из-за значения, которого в нём нет,
-		// он не должен. Явно заданное значение выше потолка по-прежнему
-		// отвергается — там это ошибка автора, а не наш дефолт.
+		// The default is clamped to the batcher's ceiling rather than imposed outright:
+		// a config written before this field existed might have a queue smaller
+		// than the default, and it must not fail to load over a value it never
+		// specified. An explicitly set value above the ceiling is still
+		// rejected — that is the config author's mistake, not our default's.
 		cfg.Sink.MaxInFlightPerPartition = min(
 			DefaultMaxInFlightPerPartition, cfg.Batcher.MaxQueue+cfg.Batcher.MaxBatchSize)
 	}

@@ -6,24 +6,24 @@ import (
 	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
-// fakeClient записывает батчи как они пришли и умеет отдавать
-// заданные результаты и инфраструктурные ошибки.
+// fakeClient records batches as they arrive and can return
+// preset results and infrastructure errors.
 type fakeClient struct {
 	mu sync.Mutex
 
 	transferBatches [][]types.Transfer
 	accountBatches  [][]types.Account
 
-	// failNext[i] > 0 — вернуть ошибку столько раз подряд, потом успех.
+	// failNext[i] > 0 — return an error that many times in a row, then succeed.
 	failTimes int
 	err       error
 
-	// resultsFor вызывается на каждый батч трансферов.
+	// resultsFor is called for each batch of transfers.
 	resultsFor func(batch []types.Transfer) []types.CreateTransferResult
 
-	// enterTransfers/releaseTransfers позволяют тесту остановить клиент внутри
-	// вызова: он сообщает о входе и ждёт разрешения продолжить. Оба поля
-	// выставляются до Start и дальше только читаются.
+	// enterTransfers/releaseTransfers let a test pause the client inside a
+	// call: it reports entry and waits for permission to continue. Both fields
+	// are set before Start and only read thereafter.
 	enterTransfers   chan struct{}
 	releaseTransfers chan struct{}
 }

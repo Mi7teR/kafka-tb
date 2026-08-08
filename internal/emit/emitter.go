@@ -14,11 +14,11 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// Emitter публикует DLQ и results, не дожидаясь брокера: обе публикации
-// возвращают обещание, и только Wait по нему означает «брокер подтвердил».
-// Синхронная публикация стоила бы round-trip на запись, а офсет всё равно
-// нельзя двигать раньше подтверждения — поэтому ожидание вынесено из выдачи и
-// делается пачкой.
+// Emitter publishes to the DLQ and results without waiting for the broker: both publications
+// return a promise, and only Wait on it means "the broker has acknowledged". A
+// synchronous publication would cost a round-trip per record, and the offset cannot
+// be moved before acknowledgment anyway — so waiting is factored out of the hand-off and
+// done as a batch.
 type Emitter interface {
 	DLQ(ctx context.Context, rec *kgo.Record, reason Reason, errName, detail string) *Publication
 	Results(ctx context.Context, rec *kgo.Record, outcomes []tbx.Outcome) *Publication
@@ -26,36 +26,36 @@ type Emitter interface {
 	Close()
 }
 
-// Publication — обещание одной публикации. Выданная брокеру запись ещё не
-// записана: подтверждением считается только Wait, вернувший nil.
+// Publication is the promise of one publication. A record handed to the broker is not yet
+// written: only a Wait that returns nil counts as acknowledgment.
 type Publication struct {
-	// e — эмиттер, ведущий учёт незабранных ошибок для Flush. nil у
-	// Resolved: у публикации, которую никуда не выдавали, учитывать нечего.
+	// e is the emitter that tracks unclaimed errors for Flush. nil for
+	// Resolved: a publication that was never handed off anywhere has nothing to track.
 	e    *emitter
 	done chan struct{}
-	// err записывается ровно один раз, до close(done), и читается только
-	// после него: канал и даёт здесь happens-before.
+	// err is written exactly once, before close(done), and is read only
+	// after it: the channel is what provides happens-before here.
 	err   error
 	taken atomic.Bool
 }
 
-// Resolved отдаёт уже завершённое обещание с исходом err. Нужен там, где
-// публикация не дошла до брокера вовсе, — отключённый топик results, стабы в
-// тестах, — чтобы у вызывающего не было второго кода обработки.
+// Resolved returns an already-completed promise with outcome err. It is needed where
+// a publication never reached the broker at all — a disabled results topic, stubs in
+// tests — so that the caller does not need a second code path.
 func Resolved(err error) *Publication {
 	done := make(chan struct{})
 	close(done)
 	return &Publication{done: done, err: err}
 }
 
-// NewTestPublication отдаёт ещё не завершённое обещание и функцию, которой
-// его завершают ровно один раз. Экспортирован ради тестового двойника
-// Emitter в internal/sink (deferredEmitter), которому нужен настоящий
-// *Publication с управляемым по времени подтверждением — только так можно
-// проверить, что offsets.Done наступает исключительно после ack, а не на
-// самой выдаче публикации. Имя отделяет его от Resolved и produce —
-// единственных путей, которыми настоящий Emitter строит публикацию, — чтобы
-// не выглядеть частью производственного API.
+// NewTestPublication returns a not-yet-completed promise and a function that
+// completes it exactly once. Exported for the sake of the Emitter test double
+// in internal/sink (deferredEmitter), which needs a real
+// *Publication with timing under its control — this is the only way to
+// verify that offsets.Done happens exclusively after an ack, not at
+// the publication's hand-off itself. The name sets it apart from Resolved and produce —
+// the only paths by which the real Emitter constructs a publication — so it does
+// not look like part of the production API.
 func NewTestPublication() (*Publication, func(error)) {
 	p := &Publication{done: make(chan struct{})}
 	var once sync.Once
@@ -67,11 +67,11 @@ func NewTestPublication() (*Publication, func(error)) {
 	}
 }
 
-// Wait возвращает исход публикации: nil означает, что брокер её подтвердил и
-// офсет записи можно двигать. Уже пришедшее подтверждение имеет приоритет над
-// отменой ctx: бросить готовый ответ значило бы соврать про уже сделанную
-// работу. Ошибка ctx — не исход публикации, а отказ её дожидаться: запись
-// остаётся неподтверждённой и будет обработана снова.
+// Wait returns the publication's outcome: nil means the broker has acknowledged it and
+// the record's offset can be moved. An acknowledgment that has already arrived takes priority over
+// ctx cancellation: discarding a ready answer would mean lying about work already
+// done. A ctx error is not the publication's outcome but a refusal to wait for it: the record
+// remains unacknowledged and will be processed again.
 func (p *Publication) Wait(ctx context.Context) error {
 	select {
 	case <-p.done:
@@ -86,10 +86,10 @@ func (p *Publication) Wait(ctx context.Context) error {
 	}
 }
 
-// take отдаёт исход и снимает ошибку с учёта Flush: вызывающий её увидел и
-// обязан отреагировать сам, второй раз докладывать о ней некому. Без этого
-// одна стабильно падающая запись валила бы Flush вечно, а вместе с ним и
-// коммит всех остальных партиций.
+// take returns the outcome and removes the error from Flush's tracking: the caller has
+// seen it and must react on its own — there is no one left to report it a second time. Without this,
+// one persistently failing record would fail Flush forever, and along with it
+// the commit of every other partition.
 func (p *Publication) take() error {
 	if p.err != nil && p.e != nil && p.taken.CompareAndSwap(false, true) {
 		p.e.takeFailure(p)
@@ -120,16 +120,16 @@ type emitter struct {
 	cl  *kgo.Client
 	cfg config.Kafka
 
-	// mu защищает учёт провалившихся публикаций, чей исход никто не забрал.
-	// Именно они — и только они — обязаны валить Flush: коммит после такого
-	// Flush закоммитил бы офсет записи, которой в DLQ или results нет.
+	// mu guards the tracking of failed publications whose outcome no one has claimed.
+	// Exactly those — and only those — are allowed to fail Flush: a commit after such a
+	// Flush would commit the offset of a record that is in neither the DLQ nor results.
 	//
-	// Учёт ведётся по идентичности публикации (map, а не общим счётчиком):
-	// иначе Wait, пришедший уже после того, как Flush доложил и сбросил
-	// счётчик, декрементировал бы его вслепую и мог стереть ошибку другой,
-	// добавленной позже публикации. order хранит порядок появления ошибок
-	// только затем, чтобы Flush мог назвать самую раннюю ещё не снятую —
-	// это часть текста ошибки, а не часть решения «валить или нет».
+	// Tracking is keyed by publication identity (a map, not a shared counter):
+	// otherwise a Wait arriving after Flush has already reported and reset the
+	// counter would decrement it blindly and could erase the error of a different,
+	// later-added publication. order holds the order errors appeared in
+	// solely so Flush can name the earliest one still not claimed —
+	// that is part of the error text, not part of the "fail or not" decision.
 	mu      sync.Mutex
 	untaken map[*Publication]error
 	order   []*Publication
@@ -139,8 +139,8 @@ func New(cl *kgo.Client, cfg config.Kafka) Emitter {
 	return &emitter{cl: cl, cfg: cfg}
 }
 
-// DLQ публикует исходные байты без изменений: реплей должен быть возможен
-// без обратной сборки сообщения.
+// DLQ publishes the original bytes unchanged: replay must be possible
+// without reassembling the message from something else.
 func (e *emitter) DLQ(ctx context.Context, rec *kgo.Record, reason Reason, errName, detail string) *Publication {
 	out := &kgo.Record{
 		Topic: e.cfg.DLQTopic,
@@ -160,8 +160,8 @@ func (e *emitter) DLQ(ctx context.Context, rec *kgo.Record, reason Reason, errNa
 	return e.produce(ctx, out, "produce dlq")
 }
 
-// Results публикует исходы обработки команды. Пустой ResultsTopic отключает
-// поток результатов: публикация становится уже подтверждённым no-op'ом.
+// Results publishes a command's processing outcomes. An empty ResultsTopic disables
+// the results stream: the publication becomes an already-acknowledged no-op.
 func (e *emitter) Results(ctx context.Context, rec *kgo.Record, outcomes []tbx.Outcome) *Publication {
 	if e.cfg.ResultsTopic == "" {
 		return Resolved(nil)
@@ -181,13 +181,13 @@ func (e *emitter) Results(ctx context.Context, rec *kgo.Record, outcomes []tbx.O
 	return e.produce(ctx, &kgo.Record{Topic: e.cfg.ResultsTopic, Key: rec.Key, Value: body}, "produce results")
 }
 
-// produce выдаёт запись брокеру и возвращает обещание, не дожидаясь ответа.
-// Порядок записей внутри партиции у franz-go — порядок вызовов Produce,
-// поэтому порядок публикации задаётся здесь, а не порядком Wait.
+// produce hands the record to the broker and returns a promise without waiting for a response.
+// In franz-go, record order within a partition is Produce call order,
+// so publication order is set here, not by the order of Wait calls.
 func (e *emitter) produce(ctx context.Context, out *kgo.Record, what string) *Publication {
 	p := &Publication{e: e, done: make(chan struct{})}
-	// Коллбэк обязан быть быстрым и неблокирующим: franz-go вызывает все
-	// обещания последовательно одним воркером.
+	// The callback must be fast and non-blocking: franz-go invokes all
+	// promises sequentially from a single worker.
 	e.cl.Produce(ctx, out, func(_ *kgo.Record, err error) {
 		if err != nil {
 			p.err = fmt.Errorf("%s: %w", what, err)
@@ -198,9 +198,9 @@ func (e *emitter) produce(ctx context.Context, out *kgo.Record, what string) *Pu
 	return p
 }
 
-// failed отдаёт обещание, провалившееся ещё до брокера, — но на том же учёте,
-// что и провал самой публикации: потерять его молча нельзя ни в том, ни в
-// другом случае.
+// failed returns a promise that failed before reaching the broker at all — but on the same
+// tracking as a failure of the publication itself: it must not be silently lost either
+// way.
 func (e *emitter) failed(err error) *Publication {
 	p := Resolved(err)
 	p.e = e
@@ -208,8 +208,8 @@ func (e *emitter) failed(err error) *Publication {
 	return p
 }
 
-// addFailure заводит p на учёт Flush по собственной идентичности: два разных
-// провала не должны делить один слот и мешать снятию друг друга с учёта.
+// addFailure registers p with Flush's tracking by its own identity: two distinct
+// failures must not share one slot and interfere with each other's removal from tracking.
 func (e *emitter) addFailure(p *Publication, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -220,20 +220,20 @@ func (e *emitter) addFailure(p *Publication, err error) {
 	e.order = append(e.order, p)
 }
 
-// takeFailure снимает p с учёта Flush, если он там ещё числится. Если Flush
-// уже доложил именно эту ошибку и сбросил учёт, снимать нечего — вычитать по
-// общему счётчику здесь не в праве, иначе позднее Wait одной публикации
-// стёрло бы с учёта другую, добавленную уже после того сброса.
+// takeFailure removes p from Flush's tracking if it is still listed there. If Flush
+// has already reported this exact error and reset tracking, there is nothing to remove — decrementing
+// via a shared counter is not permitted here, otherwise one publication's late Wait
+// would erase a different one added after that reset.
 func (e *emitter) takeFailure(p *Publication) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.untaken, p)
 }
 
-// Flush опустошает буфер продюсера и докладывает о публикациях, которые
-// провалились, а их исход никто не забрал: коммит после такого Flush
-// закоммитил бы офсет записи, которой в DLQ или results нет. Учёт при этом
-// сбрасывается — доложенная ошибка не должна валить каждый следующий коммит.
+// Flush drains the producer's buffer and reports publications that
+// failed and whose outcome no one claimed: a commit after such a Flush
+// would commit the offset of a record that is in neither the DLQ nor results. Tracking is
+// reset in the process — a reported error must not fail every subsequent commit.
 func (e *emitter) Flush(ctx context.Context) error {
 	if err := e.cl.Flush(ctx); err != nil {
 		return fmt.Errorf("flush producer: %w", err)
@@ -243,9 +243,9 @@ func (e *emitter) Flush(ctx context.Context) error {
 	if len(e.untaken) == 0 {
 		return nil
 	}
-	// order может содержать записи, которые уже сняты take'ом (значит, их
-	// уже нет в untaken); firstErr — ошибка самой ранней из тех, что дожили
-	// до этого Flush непринятыми.
+	// order may contain entries already removed by take (meaning they are
+	// no longer in untaken); firstErr is the error of the earliest one that survived
+	// to this Flush unclaimed.
 	var firstErr error
 	for _, p := range e.order {
 		if err, ok := e.untaken[p]; ok {

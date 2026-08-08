@@ -12,35 +12,35 @@ type partitionKey struct {
 }
 
 type partitionState struct {
-	// pending — незавершённые офсеты, отображённые на leader epoch той
-	// записи: Pending обязан вернуть epoch, чтобы перемотка через
-	// SetOffsets не потеряла его. Отсутствие предположений о порядке:
-	// любой офсет может появиться и завершиться в любом порядке
-	// относительно остальных.
+	// pending holds unfinished offsets, mapped to that record's leader epoch:
+	// Pending must return the epoch, so that a rewind via
+	// SetOffsets does not lose it. No assumption about order:
+	// any offset can appear and finish in any order
+	// relative to the others.
 	pending map[int64]int32
-	// done — завершённые офсеты, отображённые на leader epoch той записи.
+	// done holds finished offsets, mapped to that record's leader epoch.
 	done map[int64]int32
-	// committed — последний офсет, отданный Commitable и подтверждённый
-	// MarkCommitted; -1 означает "ещё ничего не коммитили", чтобы не
-	// спутать с легитимным первым коммитом на офсете 0.
+	// committed is the last offset handed out by Commitable and confirmed by
+	// MarkCommitted; -1 means "nothing committed yet", so it is not
+	// confused with a legitimate first commit at offset 0.
 	committed int64
-	// highest — наибольший офсет, когда-либо переданный в Track для этой
-	// партиции. В отличие от committed, никогда не уменьшается и не
-	// подчищается: CommitLag не смог бы отличить "партиция полностью
-	// разобрана" от "по ней ничего не читали", опираясь только на
-	// pending/done, — оба пустеют в первом случае так же, как и во втором.
+	// highest is the largest offset ever passed to Track for this
+	// partition. Unlike committed, it never decreases and is never
+	// cleaned up: CommitLag would not be able to tell "the partition is fully
+	// drained" apart from "nothing has ever been read from it" if it relied only on
+	// pending/done — both are empty in the first case just as in the second.
 	highest int64
-	// forgotten помечает партицию, отозванную через Forget. Пока флаг
-	// установлен, Done ничего не делает — это гасит поздний Done от
-	// воркера, ещё работавшего в момент revoke. Track же, наоборот,
-	// снимает флаг и начинает партицию с чистого состояния: следующий
-	// Track означает, что группа переотдала партицию этому консьюмеру, и
-	// она снова легитимно читается.
+	// forgotten marks a partition revoked via Forget. While the flag is
+	// set, Done does nothing — this suppresses a late Done from a
+	// worker that was still running at the moment of revoke. Track, conversely,
+	// clears the flag and starts the partition with clean state: the next
+	// Track means the group has reassigned the partition to this consumer, and
+	// it is legitimately being read again.
 	forgotten bool
 }
 
-// Offsets отслеживает завершённость записей и отдаёт для коммита
-// только непрерывный префикс. Коммит дырки означал бы потерю сообщения.
+// Offsets tracks record completion and hands out for commit
+// only a contiguous prefix. Committing a gap would mean losing a message.
 type Offsets struct {
 	mu sync.Mutex
 	p  map[partitionKey]*partitionState
@@ -50,15 +50,15 @@ func NewOffsets() *Offsets {
 	return &Offsets{p: make(map[partitionKey]*partitionState)}
 }
 
-// Track регистрирует запись как «в работе». Порядок вызовов Track для
-// партиции не имеет значения — офсеты могут приходить в любом порядке.
+// Track registers a record as "in progress". The order of Track calls for a
+// partition does not matter — offsets can arrive in any order.
 //
-// Если партиция была помечена Forget, Track снимает тумбстон и заводит для
-// неё чистое состояние: партиция была переотдана этому консьюмеру заново
-// (cooperative-sticky ребалансировка), и она не должна оставаться мёртвой
-// навсегда. Свежий pending/done означает, что запоздавший Done с офсетом до
-// revoke сможет что-то сделать только если тот же офсет был прочитан заново
-// и получил свой собственный Track после ревайва.
+// If the partition was marked by Forget, Track clears the tombstone and gives it
+// clean state: the partition has been reassigned to this consumer again
+// (cooperative-sticky rebalancing), and it must not stay dead
+// forever. Fresh pending/done means a late Done with an offset from before
+// revoke can only do anything if that same offset was read again
+// and got its own Track after the revival.
 func (o *Offsets) Track(rec *kgo.Record) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -78,9 +78,9 @@ func (o *Offsets) Track(rec *kgo.Record) {
 	}
 }
 
-// Done переносит офсет из pending в done. Если офсета нет в pending
-// (повторный Done, Done без Track, либо партиция забыта/не существует),
-// вызов игнорируется — никакой счётчик не портится.
+// Done moves an offset from pending to done. If the offset is not in pending
+// (a repeated Done, a Done without a Track, or the partition is forgotten/does not exist),
+// the call is ignored — no counter gets corrupted.
 func (o *Offsets) Done(rec *kgo.Record) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -95,11 +95,11 @@ func (o *Offsets) Done(rec *kgo.Record) {
 	st.done[rec.Offset] = rec.LeaderEpoch
 }
 
-// Commitable отдаёт офсет следующей необработанной записи — ровно то,
-// что Kafka ожидает в OffsetCommit. Ватермарк — это min(pending), если
-// есть незавершённые записи (всё ниже безопасно, само pending — нет), а
-// если pending пуст — max(done)+1. Epoch берётся у записи на границе
-// (watermark-1) — именно она реально коммитится.
+// Commitable hands out the offset of the next unprocessed record — exactly
+// what Kafka expects in an OffsetCommit. The watermark is min(pending) if
+// there are unfinished records (everything below it is safe, pending itself is not), and
+// if pending is empty, max(done)+1. The epoch is taken from the record at the boundary
+// (watermark-1) — that is the one that is actually committed.
 func (o *Offsets) Commitable() map[string]map[int32]kgo.EpochOffset {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -119,7 +119,7 @@ func (o *Offsets) Commitable() map[string]map[int32]kgo.EpochOffset {
 		}
 		epoch, ok := st.done[watermark-1]
 		if !ok {
-			// Граничная запись ещё не завершена — коммитить нечего.
+			// The boundary record is not finished yet — there is nothing to commit.
 			continue
 		}
 		tp, ok := out[k.topic]
@@ -132,15 +132,15 @@ func (o *Offsets) Commitable() map[string]map[int32]kgo.EpochOffset {
 	return out
 }
 
-// Pending отдаёт для каждой партиции, где есть зарегистрированные, но не
-// завершённые записи, минимальный такой офсет — точку, с которой партицию
-// нужно перечитать, если брошенную пачку не доработали. EpochOffset.Epoch —
-// это franz-go'шный lastConsumedEpoch, epoch записи на offset-1, а не epoch
-// самой возвращаемой (ещё не прочитанной) записи; если offset-1 не
-// завершён (например, ничего не было прочитано до него этим консьюмером),
-// отдаём -1 — документированный сентинел franz-go, отключающий проверку
-// truncation detection для этой партиции.
-// Партиции без незавершённых записей и тумбстоны не попадают в результат.
+// Pending hands out, for every partition with records registered but not
+// finished, the minimum such offset — the point from which the partition
+// needs to be re-read if an abandoned batch was not finished. EpochOffset.Epoch
+// is franz-go's lastConsumedEpoch, the epoch of the record at offset-1, not the epoch
+// of the returned (not yet read) record itself; if offset-1 is not
+// finished (e.g. nothing was read before it by this consumer),
+// we hand out -1 — franz-go's documented sentinel that disables
+// truncation detection checking for this partition.
+// Partitions with no unfinished records, and tombstones, do not appear in the result.
 func (o *Offsets) Pending() map[string]map[int32]kgo.EpochOffset {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -164,9 +164,9 @@ func (o *Offsets) Pending() map[string]map[int32]kgo.EpochOffset {
 	return out
 }
 
-// MarkCommitted вызывается после успешного коммита, чтобы не слать
-// один и тот же офсет повторно, и чистит done от записей ниже нового
-// ватермарка, чтобы карта не росла бесконечно.
+// MarkCommitted is called after a successful commit, so as not to send
+// the same offset again, and it cleans done of records below the new
+// watermark, so the map does not grow without bound.
 func (o *Offsets) MarkCommitted(committed map[string]map[int32]kgo.EpochOffset) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -186,10 +186,10 @@ func (o *Offsets) MarkCommitted(committed map[string]map[int32]kgo.EpochOffset) 
 	}
 }
 
-// Forget помечает партицию как отозванную: состояние заменяется тумбстоном,
-// который гасит запоздавший Done от воркера, ещё не узнавшего про revoke.
-// Тумбстон не постоянный: следующий Track для той же партиции означает, что
-// группа переотдала её этому консьюмеру, и снимает тумбстон (см. Track).
+// Forget marks a partition as revoked: its state is replaced with a tombstone,
+// which suppresses a late Done from a worker that has not yet learned about the revoke.
+// The tombstone is not permanent: the next Track for the same partition means the
+// group has reassigned it to this consumer, and it clears the tombstone (see Track).
 func (o *Offsets) Forget(topic string, partition int32) {
 	o.mu.Lock()
 	defer o.mu.Unlock()

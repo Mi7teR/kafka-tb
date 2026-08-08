@@ -14,7 +14,7 @@ func FuzzParseAmount(f *testing.F) {
 		if err != nil {
 			return
 		}
-		// Успешный парс обязан переживать round-trip.
+		// A successful parse must survive a round-trip.
 		if got := FormatAmount(u, scale); got == "" {
 			t.Fatalf("empty format for %q", s)
 		}

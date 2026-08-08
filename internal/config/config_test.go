@@ -129,8 +129,8 @@ func TestLoadClampsDefaultMaxInFlightToCeiling(t *testing.T) {
 		"дефолт прижимается к max_queue + max_batch_size")
 }
 
-// Прижимается именно дефолт: явно заданное значение выше потолка — ошибка
-// автора конфига, и молча уменьшать его нельзя.
+// It is specifically the default that gets clamped: an explicitly set value
+// above the ceiling is the config author's mistake, and it must not be silently reduced.
 func TestLoadRejectsExplicitMaxInFlightAboveSmallCeiling(t *testing.T) {
 	body := replace(validCfg, "max_batch_size: 8189", "max_batch_size: 500")
 	body = replace(body, "  max_queue: 1000",

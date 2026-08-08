@@ -7,13 +7,13 @@ import (
 	"github.com/Mi7teR/kafka-tb/internal/model"
 )
 
-// Decoder превращает сырой payload сообщения в команду.
-// Любая ошибка декодинга — poison: ретрай её не исправит.
+// Decoder turns a message's raw payload into a command.
+// Any decoding error is poison: a retry will not fix it.
 type Decoder interface {
 	Decode(payload []byte) (*model.Command, error)
 }
 
-// Registry выбирает декодер по имени топика.
+// Registry selects a decoder by topic name.
 type Registry map[string]Decoder
 
 func (r Registry) For(topic string) (Decoder, error) {
@@ -24,8 +24,8 @@ func (r Registry) For(topic string) (Decoder, error) {
 	return d, nil
 }
 
-// NewRegistry строит декодеры для всех топиков из конфига.
-// Пока поддержан только json; другой codec отклоняется валидацией конфига.
+// NewRegistry builds decoders for every topic from the config.
+// Only json is supported for now; any other codec is rejected by config validation.
 func NewRegistry(topics []config.Topic, build func(codec string) (Decoder, error)) (Registry, error) {
 	r := make(Registry, len(topics))
 	for _, t := range topics {
