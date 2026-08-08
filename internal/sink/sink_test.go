@@ -3,6 +3,7 @@ package sink
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -29,56 +30,206 @@ type stubDecoder struct {
 
 func (s stubDecoder) Decode([]byte) (*model.Command, error) { return s.cmd, s.err }
 
+// result отдаёт канал, в котором уже лежит res: контракт SubmitAsync — ровно
+// один SubmitResult на принятую команду, и все стабы ниже отвечают им.
+func result(res tbx.SubmitResult) <-chan tbx.SubmitResult {
+	ch := make(chan tbx.SubmitResult, 1)
+	ch <- res
+	return ch
+}
+
 type stubSubmitter struct {
 	outcomes []tbx.Outcome
 	err      error
 	calls    int
 }
 
-func (s *stubSubmitter) Submit(context.Context, *model.Command) ([]tbx.Outcome, error) {
+func (s *stubSubmitter) SubmitAsync(context.Context, *model.Command) (<-chan tbx.SubmitResult, error) {
 	s.calls++
-	return s.outcomes, s.err
+	return result(tbx.SubmitResult{Outcomes: s.outcomes, Err: s.err}), nil
 }
 
 // scriptedSubmitter отдаёт заранее заданный результат на каждый вызов;
 // последний элемент errs повторяется. Нужен, чтобы отличить «упало и
-// починилось» от «падает всегда».
+// починилось» от «падает всегда». Расписание по номеру вызова осмысленно
+// только для одной партиции — для нескольких есть idSubmitter.
 type scriptedSubmitter struct {
 	outcomes []tbx.Outcome
 	errs     []error
 	calls    int
 }
 
-func (s *scriptedSubmitter) Submit(context.Context, *model.Command) ([]tbx.Outcome, error) {
+func (s *scriptedSubmitter) SubmitAsync(context.Context, *model.Command) (<-chan tbx.SubmitResult, error) {
 	err := s.errs[min(s.calls, len(s.errs)-1)]
 	s.calls++
 	if err != nil {
-		return nil, err
+		return result(tbx.SubmitResult{Err: err}), nil
 	}
-	return s.outcomes, nil
+	return result(tbx.SubmitResult{Outcomes: s.outcomes}), nil
 }
 
-// slowSubmitter всегда успешен, но перед возвратом ждёт delay. Нужен, чтобы
-// смоделировать пачку без единой инфраструктурной ошибки, которая тем не
-// менее коллективно медленная — бюджет должен ловить и такой случай, а не
-// только вечный ретрай.
+// slowSubmitter всегда успешен, но исход отдаёт только через delay — так
+// выглядит round-trip до TigerBeetle. Нужен, чтобы смоделировать пачку без
+// единой инфраструктурной ошибки, которая тем не менее коллективно медленная:
+// бюджет должен ловить и такой случай, а не только вечный ретрай.
 type slowSubmitter struct {
 	delay    time.Duration
 	outcomes []tbx.Outcome
 	calls    int
 }
 
-func (s *slowSubmitter) Submit(context.Context, *model.Command) ([]tbx.Outcome, error) {
-	time.Sleep(s.delay)
+func (s *slowSubmitter) SubmitAsync(context.Context, *model.Command) (<-chan tbx.SubmitResult, error) {
 	s.calls++
-	return s.outcomes, nil
+	ch := make(chan tbx.SubmitResult, 1)
+	outcomes := s.outcomes
+	delay := s.delay
+	go func() {
+		time.Sleep(delay)
+		ch <- tbx.SubmitResult{Outcomes: outcomes}
+	}()
+	return ch, nil
+}
+
+// idDecoder делает из байтов записи команду, чей единственный id — эти байты.
+// Нужен, как только партиции идут параллельно: сценарий, расписанный по
+// номеру вызова, перестаёт быть детерминированным, когда две партиции ставят
+// команды одновременно, — расписывать приходится по самой записи.
+type idDecoder struct{}
+
+func (idDecoder) Decode(v []byte) (*model.Command, error) {
+	return &model.Command{
+		Op:        model.OpCreateTransfers,
+		Transfers: []types.Transfer{{ID: types.ToUint128(1)}},
+		IDs:       []string{string(v)},
+	}, nil
+}
+
+// mixedDecoder — тот же idDecoder, но перечисленные id объявляет poison.
+type mixedDecoder struct{ poison map[string]bool }
+
+func (d mixedDecoder) Decode(v []byte) (*model.Command, error) {
+	if d.poison[string(v)] {
+		return nil, codec.Poison("bad json")
+	}
+	return idDecoder{}.Decode(v)
+}
+
+// idSubmitter отвечает успехом только на перечисленные в ok id и вечной
+// инфраструктурной ошибкой на всё остальное, а также записывает порядок
+// постановки — именно он задаёт порядок применения в TigerBeetle.
+type idSubmitter struct {
+	mu    sync.Mutex
+	ok    map[string]bool
+	order []string
+}
+
+func (s *idSubmitter) SubmitAsync(_ context.Context, cmd *model.Command) (<-chan tbx.SubmitResult, error) {
+	id := cmd.IDs[0]
+	s.mu.Lock()
+	s.order = append(s.order, id)
+	ok := s.ok[id]
+	s.mu.Unlock()
+	if !ok {
+		return result(tbx.SubmitResult{Err: errors.New("tigerbeetle unavailable")}), nil
+	}
+	return result(tbx.SubmitResult{
+		Outcomes: []tbx.Outcome{{Index: 0, ID: id, Status: tbx.StatusOK}},
+	}), nil
+}
+
+func (s *idSubmitter) submitted() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.order...)
+}
+
+// barrierSubmitter отвечает только после того, как в него одновременно зашли n
+// вызовов. При последовательной обработке партиций такого не случится никогда.
+type barrierSubmitter struct {
+	mu    sync.Mutex
+	seen  int
+	n     int
+	ready chan struct{}
+}
+
+func newBarrierSubmitter(n int) *barrierSubmitter {
+	return &barrierSubmitter{n: n, ready: make(chan struct{})}
+}
+
+func (b *barrierSubmitter) SubmitAsync(
+	ctx context.Context, cmd *model.Command,
+) (<-chan tbx.SubmitResult, error) {
+	b.mu.Lock()
+	b.seen++
+	if b.seen == b.n {
+		close(b.ready)
+	}
+	b.mu.Unlock()
+	select {
+	case <-b.ready:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return result(tbx.SubmitResult{
+		Outcomes: []tbx.Outcome{{Index: 0, ID: cmd.IDs[0], Status: tbx.StatusOK}},
+	}), nil
+}
+
+// blockingSubmitter принимает команду и не отвечает никогда: так выглядит
+// TigerBeetle, который перестал отвечать уже после постановки.
+type blockingSubmitter struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (b *blockingSubmitter) SubmitAsync(context.Context, *model.Command) (<-chan tbx.SubmitResult, error) {
+	b.mu.Lock()
+	b.calls++
+	b.mu.Unlock()
+	return make(chan tbx.SubmitResult), nil
+}
+
+func (b *blockingSubmitter) Calls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.calls
+}
+
+// cancellingSubmitter отвечает первым after записям сразу, а начиная со
+// следующей отменяет контекст и уходит в молчание — так выглядит SIGTERM
+// посреди опроса.
+type cancellingSubmitter struct {
+	mu     sync.Mutex
+	seen   int
+	after  int
+	cancel context.CancelFunc
+}
+
+func (g *cancellingSubmitter) SubmitAsync(_ context.Context, cmd *model.Command) (<-chan tbx.SubmitResult, error) {
+	g.mu.Lock()
+	g.seen++
+	n := g.seen
+	g.mu.Unlock()
+	if n > g.after {
+		g.cancel()
+		return make(chan tbx.SubmitResult), nil
+	}
+	return result(tbx.SubmitResult{
+		Outcomes: []tbx.Outcome{{Index: 0, ID: cmd.IDs[0], Status: tbx.StatusOK}},
+	}), nil
 }
 
 // recordingEmitter умеет отказывать выборочно: провал DLQ и провал Results —
-// разные ветки handle, и их нельзя проверить одним общим переключателем.
+// разные ветки finish, и их нельзя проверить одним общим переключателем.
+// Мьютекс обязателен: партиции публикуют параллельно.
 type recordingEmitter struct {
-	dlq         []dlqCall
-	results     int
+	mu      sync.Mutex
+	dlq     []dlqCall
+	results int
+	// published — сквозной журнал публикаций, и results, и DLQ, с офсетом
+	// исходной записи. Порядок публикации внутри партиции обязан быть
+	// порядком офсетов, и проверить это можно только по такому журналу.
+	published   []publication
 	failDLQ     error
 	failResults error
 }
@@ -88,23 +239,57 @@ type dlqCall struct {
 	errName string
 }
 
-func (r *recordingEmitter) DLQ(_ context.Context, _ *kgo.Record, reason emitReason, errName, _ string) error {
+type publication struct {
+	kind      string
+	partition int32
+	offset    int64
+}
+
+func (r *recordingEmitter) DLQ(_ context.Context, rec *kgo.Record, reason emitReason, errName, _ string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.failDLQ != nil {
 		return r.failDLQ
 	}
 	r.dlq = append(r.dlq, dlqCall{reason: string(reason), errName: errName})
+	r.published = append(r.published,
+		publication{kind: "dlq", partition: rec.Partition, offset: rec.Offset})
 	return nil
 }
 
-func (r *recordingEmitter) Results(context.Context, *kgo.Record, []tbx.Outcome) error {
+func (r *recordingEmitter) Results(_ context.Context, rec *kgo.Record, _ []tbx.Outcome) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.failResults != nil {
 		return r.failResults
 	}
 	r.results++
+	r.published = append(r.published,
+		publication{kind: "results", partition: rec.Partition, offset: rec.Offset})
 	return nil
 }
 func (r *recordingEmitter) Flush(context.Context) error { return nil }
 func (r *recordingEmitter) Close()                      {}
+
+func (r *recordingEmitter) resultsCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.results
+}
+
+// publishedFor отдаёт журнал публикаций одной партиции: между партициями
+// порядок не гарантируется и никогда не гарантировался.
+func (r *recordingEmitter) publishedFor(partition int32) []publication {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []publication
+	for _, p := range r.published {
+		if p.partition == partition {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 // stubClient подменяет *kgo.Client в тех двух вызовах, которыми синк двигает
 // офсеты. Без него processBatch/commit/OnRevoked невозможно прогнать.
@@ -170,8 +355,25 @@ func clientOf(t *testing.T, s *Sink) *stubClient {
 	return c
 }
 
+// recID именует запись так, чтобы стаб-батчер мог отличить одну от другой.
+func recID(partition int32, offset int64) string {
+	return fmt.Sprintf("%d/%d", partition, offset)
+}
+
 func srcRec(partition int32, offset int64) *kgo.Record {
-	return &kgo.Record{Topic: "src", Partition: partition, Offset: offset, LeaderEpoch: 3}
+	return &kgo.Record{
+		Topic: "src", Partition: partition, Offset: offset, LeaderEpoch: 3,
+		Value: []byte(recID(partition, offset)),
+	}
+}
+
+// handleOne прогоняет одну запись через боевой путь синка — постановка,
+// ожидание исхода, публикация — и отвечает тем же, чем отвечала обработка
+// одной записи до пайплайнинга: доведена ли она до конца и с какой ошибкой.
+func handleOne(t *testing.T, s *Sink, rec *kgo.Record) (bool, error) {
+	t.Helper()
+	applied, err := s.pass(context.Background(), []*kgo.Record{rec}, time.Now().Add(time.Minute))
+	return applied == 1, err
 }
 
 func TestHandlePoisonGoesToDLQ(t *testing.T) {
@@ -179,7 +381,7 @@ func TestHandlePoisonGoesToDLQ(t *testing.T) {
 	sub := &stubSubmitter{}
 	s := newSink(t, stubDecoder{err: codec.Poison("bad json")}, sub, em)
 
-	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src", Value: []byte("x")})
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src", Value: []byte("x")})
 	require.NoError(t, err)
 	require.True(t, done, "poison record must be marked done")
 	require.Len(t, em.dlq, 1)
@@ -194,7 +396,7 @@ func TestHandleRejectGoesToDLQAndResults(t *testing.T) {
 	}}
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
 
-	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.NoError(t, err)
 	require.True(t, done)
 	require.Len(t, em.dlq, 1)
@@ -208,7 +410,7 @@ func TestHandleSuccessEmitsResultsOnly(t *testing.T) {
 	sub := &stubSubmitter{outcomes: []tbx.Outcome{{Index: 0, ID: "id-0", Status: tbx.StatusOK}}}
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
 
-	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.NoError(t, err)
 	require.True(t, done)
 	require.Empty(t, em.dlq)
@@ -221,7 +423,7 @@ func TestHandleInfraErrorBlocks(t *testing.T) {
 	sub := &stubSubmitter{err: errors.New("tigerbeetle unavailable")}
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
 
-	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.Error(t, err)
 	require.False(t, done)
 	require.Empty(t, em.dlq)
@@ -233,7 +435,7 @@ func TestHandleCommandTooLargeGoesToDLQ(t *testing.T) {
 	sub := &stubSubmitter{err: tbx.ErrCommandTooLarge}
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
 
-	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.NoError(t, err)
 	require.True(t, done)
 	require.Len(t, em.dlq, 1)
@@ -247,7 +449,7 @@ func TestHandleDLQFailureBlocks(t *testing.T) {
 	em := &recordingEmitter{failDLQ: errors.New("broker down")}
 	s := newSink(t, stubDecoder{err: codec.Poison("bad json")}, &stubSubmitter{}, em)
 
-	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.Error(t, err)
 	require.False(t, done, "must not commit offset if DLQ write failed")
 }
@@ -256,7 +458,7 @@ func TestHandleDLQFailureBlocks(t *testing.T) {
 func TestHandleRecoversPanic(t *testing.T) {
 	em := &recordingEmitter{}
 	s := newSink(t, panicDecoder{}, &stubSubmitter{}, em)
-	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.NoError(t, err)
 	require.True(t, done)
 	require.Len(t, em.dlq, 1)
@@ -268,7 +470,7 @@ func TestHandleRecoversPanic(t *testing.T) {
 func TestHandlePanicWithDLQFailureBlocks(t *testing.T) {
 	em := &recordingEmitter{failDLQ: errors.New("broker down")}
 	s := newSink(t, panicDecoder{}, &stubSubmitter{}, em)
-	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.Error(t, err)
 	require.False(t, done)
 }
@@ -301,7 +503,7 @@ func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
 // logging "record failed, retrying" at ERROR would page someone for a clean
 // shutdown. This pins the fix: no ERROR-level record-failure log when the
 // context is already cancelled.
-func TestApplyRecordCancelledContextDoesNotLogError(t *testing.T) {
+func TestRunPartitionCancelledContextDoesNotLogError(t *testing.T) {
 	var logs []capturedLog
 	em := &recordingEmitter{}
 	sub := &stubSubmitter{err: errors.New("tigerbeetle unavailable")}
@@ -311,7 +513,7 @@ func TestApplyRecordCancelledContextDoesNotLogError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	rec := srcRec(0, 0)
-	ok := s.applyRecord(ctx, rec, time.Now().Add(time.Minute))
+	ok := s.runPartition(ctx, []*kgo.Record{rec}, time.Now().Add(time.Minute))
 
 	require.False(t, ok, "a cancelled context must abandon the record, not commit it")
 	require.NotEmpty(t, logs, "expected a shutdown log explaining the uncommitted record")
@@ -330,7 +532,7 @@ func (panicDecoder) Decode([]byte) (*model.Command, error) { panic("boom") }
 func TestHandleUnknownTopic(t *testing.T) {
 	em := &recordingEmitter{}
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, &stubSubmitter{}, em)
-	done, err := s.handle(context.Background(), &kgo.Record{Topic: "other"})
+	done, err := handleOne(t, s, &kgo.Record{Topic: "other"})
 	require.NoError(t, err)
 	require.True(t, done)
 	require.Len(t, em.dlq, 1)
@@ -344,7 +546,7 @@ func TestHandleAnyDecodeErrorIsPoison(t *testing.T) {
 	sub := &stubSubmitter{}
 	s := newSink(t, stubDecoder{err: errors.New("plain decode failure")}, sub, em)
 
-	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.NoError(t, err)
 	require.True(t, done)
 	require.Len(t, em.dlq, 1)
@@ -359,7 +561,7 @@ func TestHandleResultsFailureBlocks(t *testing.T) {
 	sub := &stubSubmitter{outcomes: []tbx.Outcome{{Index: 0, ID: "id-0", Status: tbx.StatusOK}}}
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
 
-	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.Error(t, err)
 	require.False(t, done, "offset must not move if results were not published")
 	require.Empty(t, em.dlq)
@@ -373,7 +575,7 @@ func TestHandleDLQFailureInsideRejectLoopBlocks(t *testing.T) {
 	}}
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
 
-	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.Error(t, err)
 	require.False(t, done)
 	require.Equal(t, 1, em.results, "results уже опубликованы — ветка именно про reject-цикл")
@@ -395,7 +597,7 @@ func TestHandleMetricsByOutcome(t *testing.T) {
 	}}
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
 	s.metrics = m
-	_, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	_, err := handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.NoError(t, err)
 	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("ok")))
 
@@ -404,14 +606,14 @@ func TestHandleMetricsByOutcome(t *testing.T) {
 	}}
 	s = newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, &recordingEmitter{})
 	s.metrics = m
-	_, err = s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	_, err = handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.NoError(t, err)
 	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("rejected")))
 	require.Equal(t, 1.0, testutil.ToFloat64(m.DLQTotal.WithLabelValues("reject", "exceeds_credits")))
 
 	s = newSink(t, stubDecoder{err: codec.Poison("bad json")}, &stubSubmitter{}, &recordingEmitter{})
 	s.metrics = m
-	_, err = s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	_, err = handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.NoError(t, err)
 	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("poison")))
 	require.Equal(t, 1.0, testutil.ToFloat64(m.DLQTotal.WithLabelValues("poison", "decode")))
@@ -419,7 +621,7 @@ func TestHandleMetricsByOutcome(t *testing.T) {
 	s = newSink(t, stubDecoder{cmd: oneTransferCmd()},
 		&stubSubmitter{err: errors.New("tigerbeetle unavailable")}, &recordingEmitter{})
 	s.metrics = m
-	_, err = s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	_, err = handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.Error(t, err)
 	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("blocked")))
 }
@@ -436,7 +638,7 @@ func TestHandleResultsFailureIncrementsBlockedOnceNotOK(t *testing.T) {
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
 	s.metrics = m
 
-	done, err := s.handle(context.Background(), &kgo.Record{Topic: "src"})
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.Error(t, err)
 	require.False(t, done)
 	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("blocked")))
@@ -504,11 +706,10 @@ func TestProcessBatchRetriesSameRecord(t *testing.T) {
 // пачка бросается, а её партиции перематываются назад и забываются.
 func TestProcessBatchAbandonsAndRewindsOnBudget(t *testing.T) {
 	em := &recordingEmitter{}
-	sub := &scriptedSubmitter{
-		outcomes: []tbx.Outcome{{Index: 0, ID: "id-0", Status: tbx.StatusOK}},
-		errs:     []error{nil, errors.New("tigerbeetle unavailable")},
-	}
-	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
+	// Расписание по записи, а не по номеру вызова: партиции теперь идут
+	// параллельно, и «первый вызов успешен» перестало быть детерминированным.
+	sub := &idSubmitter{ok: map[string]bool{recID(0, 10): true}}
+	s := newSink(t, idDecoder{}, sub, em)
 	s.retryPeriod = time.Millisecond
 	s.batchBudget = 20 * time.Millisecond
 
@@ -538,16 +739,22 @@ func TestProcessBatchAbandonsAndRewindsOnBudget(t *testing.T) {
 
 // C4: пачка без единой инфраструктурной ошибки — каждая запись успешна, но
 // медленная — обязана уложиться в бюджет так же, как и пачка, упирающаяся в
-// ретраи: бюджет проверяется в начале каждой итерации, а не только внутри
-// applyRecord.
+// ретраи: бюджет проверяется в начале каждого витка runPartition, а не только
+// на исходе конкретной записи.
 func TestProcessBatchAbandonsSlowSuccessfulBatch(t *testing.T) {
 	em := &recordingEmitter{}
 	sub := &slowSubmitter{
-		delay:    10 * time.Millisecond,
+		delay:    20 * time.Millisecond,
 		outcomes: []tbx.Outcome{{Index: 0, ID: "id-0", Status: tbx.StatusOK}},
 	}
 	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
-	s.batchBudget = 20 * time.Millisecond
+	s.batchBudget = 50 * time.Millisecond
+	// Одна запись в полёте: без этого пайплайнинг превращает эту пачку в
+	// быструю (все пять round-trip'ов идут параллельно) и бюджету нечего
+	// ловить. Проверяется здесь именно бюджет, а не пайплайнинг — за то, что
+	// бюджет действует и на записи в полёте, отвечает
+	// TestProcessBatchAbandonsWhileWaitingForOutcomes.
+	s.maxInFlight = 1
 
 	records := []*kgo.Record{srcRec(0, 0), srcRec(0, 1), srcRec(0, 2), srcRec(0, 3), srcRec(0, 4)}
 	done := make(chan struct{})
@@ -583,6 +790,165 @@ func TestProcessBatchDoesNotRewindOnCancel(t *testing.T) {
 
 	require.Empty(t, clientOf(t, s).setOffsets)
 	require.Equal(t, 2, s.offsets.InFlight())
+}
+
+// Порядок применения внутри партиции — это порядок постановки в батчер, а
+// батчер применяет команды в порядке очереди. Постановка идёт не дожидаясь
+// исходов, поэтому проверять нужно именно её порядок, а не порядок ответов.
+func TestProcessBatchPreservesSubmitOrderWithinPartition(t *testing.T) {
+	const n = 500
+	sub := &idSubmitter{ok: make(map[string]bool, n)}
+	records := make([]*kgo.Record, n)
+	want := make([]string, n)
+	wantPub := make([]publication, n)
+	for i := range records {
+		records[i] = srcRec(0, int64(i))
+		want[i] = recID(0, int64(i))
+		wantPub[i] = publication{kind: "results", offset: int64(i)}
+		sub.ok[want[i]] = true
+	}
+	em := &recordingEmitter{}
+	s := newSink(t, idDecoder{}, sub, em)
+
+	s.processBatch(context.Background(), records)
+
+	require.Equal(t, want, sub.submitted(), "постановка в батчер обязана идти по офсетам")
+	require.Equal(t, wantPub, em.publishedFor(0), "публикация исходов обязана идти по офсетам")
+	require.Zero(t, s.offsets.InFlight())
+	require.Equal(t, int64(n), s.offsets.Commitable()["src"][0].Offset)
+}
+
+// Партиции обязаны идти параллельно. Барьер сходится только если все четыре
+// горутины оказались в батчере одновременно; при последовательной обработке
+// первая упрётся в него навсегда, дождётся отмены и вернёт ошибку — тогда до
+// публикации не дойдёт ни одна запись.
+func TestProcessBatchRunsPartitionsConcurrently(t *testing.T) {
+	const parts = 4
+	sub := newBarrierSubmitter(parts)
+	records := make([]*kgo.Record, parts)
+	for i := range records {
+		records[i] = srcRec(int32(i), 0)
+	}
+	em := &recordingEmitter{}
+	s := newSink(t, idDecoder{}, sub, em)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.processBatch(ctx, records)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("processBatch не вернулась")
+	}
+
+	require.Equal(t, parts, em.resultsCount(),
+		"барьер не сошёлся: партиции обрабатываются последовательно")
+	require.Zero(t, s.offsets.InFlight())
+}
+
+// Poison в батчер не идёт, но публиковаться обязан на своём месте: порядок
+// исходов партиции — это порядок офсетов, poison там или не poison.
+func TestProcessBatchPublishesPoisonInOffsetOrder(t *testing.T) {
+	const n = 8
+	poison := map[string]bool{}
+	sub := &idSubmitter{ok: map[string]bool{}}
+	records := make([]*kgo.Record, n)
+	want := make([]publication, n)
+	for i := range records {
+		id := recID(0, int64(i))
+		records[i] = srcRec(0, int64(i))
+		if i%2 == 1 {
+			poison[id] = true
+			want[i] = publication{kind: "dlq", offset: int64(i)}
+			continue
+		}
+		sub.ok[id] = true
+		want[i] = publication{kind: "results", offset: int64(i)}
+	}
+	em := &recordingEmitter{}
+	s := newSink(t, mixedDecoder{poison: poison}, sub, em)
+
+	s.processBatch(context.Background(), records)
+
+	require.Equal(t, want, em.publishedFor(0))
+	require.Len(t, sub.submitted(), n/2, "poison не должен попадать в батчер вообще")
+	require.Zero(t, s.offsets.InFlight())
+	require.Equal(t, int64(n), s.offsets.Commitable()["src"][0].Offset)
+}
+
+// Отмена контекста посреди опроса: помечены Done ровно те записи, чей исход
+// пришёл и опубликован. Записи, поставленные, но не подтверждённые, остаются
+// в pending — коммитится только непрерывный префикс до первой из них, поэтому
+// после рестарта партиция перечитается ровно с неё. Перематывать через
+// SetOffsets здесь нечего: процесс уходит.
+func TestProcessBatchCancelledMidPollLeavesUnverifiedRecords(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sub := &cancellingSubmitter{after: 2, cancel: cancel}
+	em := &recordingEmitter{}
+	s := newSink(t, idDecoder{}, sub, em)
+
+	records := []*kgo.Record{srcRec(0, 0), srcRec(0, 1), srcRec(0, 2), srcRec(0, 3)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.processBatch(ctx, records)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("processBatch не вернулась после отмены контекста")
+	}
+
+	require.Equal(t, []publication{
+		{kind: "results", offset: 0},
+		{kind: "results", offset: 1},
+	}, em.publishedFor(0), "публикуются ровно записи с исходом")
+	require.Equal(t, 2, s.offsets.InFlight(), "запись без исхода не может быть Done")
+	require.Equal(t, int64(2), s.offsets.Commitable()["src"][0].Offset,
+		"коммитится только префикс подтверждённых записей")
+	require.Empty(t, clientOf(t, s).setOffsets)
+}
+
+// Бюджет обязан действовать и на записи, которые уже в полёте: постановка
+// прошла мгновенно, а TigerBeetle замолчал. Все записи поставлены до первого
+// ожидания — именно это и есть пайплайнинг — но ждать их дольше бюджета
+// нельзя, иначе ребаланс держится сколь угодно долго.
+func TestProcessBatchAbandonsWhileWaitingForOutcomes(t *testing.T) {
+	sub := &blockingSubmitter{}
+	em := &recordingEmitter{}
+	s := newSink(t, idDecoder{}, sub, em)
+	s.retryPeriod = time.Millisecond
+	s.batchBudget = 50 * time.Millisecond
+
+	records := []*kgo.Record{srcRec(0, 5), srcRec(0, 6), srcRec(1, 2)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.processBatch(context.Background(), records)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("processBatch не уложилась в бюджет — ожидание исходов не ограничено")
+	}
+
+	require.Equal(t, len(records), sub.Calls(),
+		"все записи обязаны быть поставлены не дожидаясь исходов")
+	require.Zero(t, em.resultsCount(), "исходов не было — публиковать нечего")
+	cl := clientOf(t, s)
+	require.Len(t, cl.setOffsets, 1, "брошенная пачка обязана перематываться")
+	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
+		"src": {
+			0: {Epoch: -1, Offset: 5},
+			1: {Epoch: -1, Offset: 2},
+		},
+	}, cl.setOffsets[0], "перематываются обе партиции, каждая со своей первой записи")
+	require.Zero(t, s.offsets.InFlight(), "брошенные партиции забыты")
 }
 
 func TestCommitSkipsMarkCommittedOnTransportError(t *testing.T) {

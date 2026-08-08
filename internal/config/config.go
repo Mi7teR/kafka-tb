@@ -13,6 +13,10 @@ import (
 
 const MaxBatchSize = 8189
 
+// DefaultMaxInFlightPerPartition is used when sink.max_in_flight_per_partition
+// is left unset.
+const DefaultMaxInFlightPerPartition = 1000
+
 type Mode string
 
 const (
@@ -35,6 +39,15 @@ type Batcher struct {
 	MaxBatchSize int           `yaml:"max_batch_size"`
 	Linger       time.Duration `yaml:"linger"`
 	MaxQueue     int           `yaml:"max_queue"`
+}
+
+type Sink struct {
+	// MaxInFlightPerPartition bounds how many of one partition's records the
+	// sink may have handed to the batcher without having accounted for their
+	// outcome yet. The bound is what keeps a cancellation or a failure from
+	// leaving an unbounded tail of records already applied to TigerBeetle but
+	// neither published nor committed.
+	MaxInFlightPerPartition int `yaml:"max_in_flight_per_partition"`
 }
 
 type Topic struct {
@@ -72,6 +85,7 @@ type Config struct {
 	Mode            Mode              `yaml:"mode"`
 	TigerBeetle     TigerBeetle       `yaml:"tigerbeetle"`
 	Batcher         Batcher           `yaml:"batcher"`
+	Sink            Sink              `yaml:"sink"`
 	Kafka           Kafka             `yaml:"kafka"`
 	Limits          Limits            `yaml:"limits"`
 	API             API               `yaml:"api"`
@@ -108,6 +122,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	applyEnv(&cfg)
+	if cfg.Sink.MaxInFlightPerPartition == 0 {
+		cfg.Sink.MaxInFlightPerPartition = DefaultMaxInFlightPerPartition
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -153,6 +170,17 @@ func (c *Config) validate() error {
 	}
 	if c.Batcher.MaxQueue <= 0 {
 		return fmt.Errorf("batcher.max_queue: must be > 0")
+	}
+	// The ceiling is max_queue + max_batch_size, not max_queue alone: a job
+	// dequeued into the batch being assembled frees its queue slot while its
+	// caller stays parked for the whole TigerBeetle round trip. Past that
+	// point the batcher's own enqueue blocks, so a larger bound here can never
+	// be reached and would only misdescribe the sink's real in-flight window.
+	if ceiling := c.Batcher.MaxQueue + c.Batcher.MaxBatchSize; c.Sink.MaxInFlightPerPartition <= 0 ||
+		c.Sink.MaxInFlightPerPartition > ceiling {
+		return fmt.Errorf(
+			"sink.max_in_flight_per_partition: want 1..%d (batcher.max_queue + batcher.max_batch_size), got %d",
+			ceiling, c.Sink.MaxInFlightPerPartition)
 	}
 	if c.Limits.MaxEventsPerMessage <= 0 || c.Limits.MaxEventsPerMessage > MaxBatchSize {
 		return fmt.Errorf("limits.max_events_per_message: want 1..%d", MaxBatchSize)

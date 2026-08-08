@@ -112,6 +112,38 @@ func TestLoadRejectsEmptyMetricsAddr(t *testing.T) {
 	require.ErrorContains(t, err, "metrics_addr")
 }
 
+// sink.max_in_flight_per_partition is optional: an existing config that never
+// heard of it must keep loading, with a bound that actually submits something.
+func TestLoadDefaultsMaxInFlightPerPartition(t *testing.T) {
+	cfg, err := Load(writeCfg(t, validCfg))
+	require.NoError(t, err)
+	require.Equal(t, DefaultMaxInFlightPerPartition, cfg.Sink.MaxInFlightPerPartition)
+}
+
+// The reachable ceiling is max_queue + max_batch_size, not max_queue: a job
+// dequeued into the batch under assembly frees its queue slot while its caller
+// stays parked for the whole TigerBeetle call. A bound above that can never be
+// reached, so it is a config error rather than a silently useless setting.
+func TestLoadRejectsUnreachableMaxInFlightPerPartition(t *testing.T) {
+	body := replace(validCfg, "  max_queue: 1000",
+		"  max_queue: 1000\nsink:\n  max_in_flight_per_partition: 9190")
+	_, err := Load(writeCfg(t, body))
+	require.ErrorContains(t, err, "sink.max_in_flight_per_partition")
+
+	body = replace(validCfg, "  max_queue: 1000",
+		"  max_queue: 1000\nsink:\n  max_in_flight_per_partition: 9189")
+	cfg, err := Load(writeCfg(t, body))
+	require.NoError(t, err, "ровно потолок max_queue + max_batch_size ещё достижим")
+	require.Equal(t, 9189, cfg.Sink.MaxInFlightPerPartition)
+}
+
+func TestLoadRejectsNegativeMaxInFlightPerPartition(t *testing.T) {
+	body := replace(validCfg, "  max_queue: 1000",
+		"  max_queue: 1000\nsink:\n  max_in_flight_per_partition: -1")
+	_, err := Load(writeCfg(t, body))
+	require.ErrorContains(t, err, "sink.max_in_flight_per_partition")
+}
+
 func TestEnvOverride(t *testing.T) {
 	t.Setenv("KAFKATB_MODE", "sink")
 	cfg, err := Load(writeCfg(t, validCfg))

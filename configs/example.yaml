@@ -12,6 +12,13 @@ batcher:
   max_batch_size: 8189
   linger: 5ms
   max_queue: 1000
+# Sink pipelining
+sink:
+  # How many of one partition's records may be in flight (submitted to the
+  # batcher, outcome not yet accounted for). Must not exceed
+  # batcher.max_queue + batcher.max_batch_size — beyond that the batcher's own
+  # enqueue blocks first. Defaults to 1000 when unset.
+  max_in_flight_per_partition: 1000
 # Kafka consumer/producer settings
 kafka:
   brokers: ["localhost:9092"]
