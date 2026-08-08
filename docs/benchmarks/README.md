@@ -226,7 +226,7 @@ n=3,000, single run per value):
 | `linger` | Throughput | Mean batch |
 |---|---|---|
 | 1ms | **22,281.0 rec/sec** | 428.7 |
-| 5ms (current default) | 16,701.4 rec/sec | 428.7 |
+| 5ms (default at the time) | 16,701.4 rec/sec | 428.7 |
 | 50ms | 10,102.0 rec/sec | 750.2 |
 
 Clean and monotonic — 1.33x faster at 1ms than 5ms, 2.21x faster than 50ms —
@@ -241,15 +241,16 @@ even then the added coalescing doesn't pay for the wait: throughput is still
 worse than the 1ms row.
 
 **Recommendation: the data supports `linger: 1ms`** as a better default than
-the current `5ms`, for this workload shape. Two caveats before treating this
+the then-current `5ms`, for this workload shape. Two caveats before treating this
 as settled: each value was run once (not repeated), and the test produces
 its whole volume in one burst (`ProduceSync` of the full batch at once) —
 the best case for pipelined submission to saturate batches on its own. A
 slower, steadier arrival rate closer to real production traffic could
 plausibly still benefit from a longer linger, and this report has no data on
-that shape. **`configs/example.yaml` still defaults to `linger: 5ms` — this
-recommendation was not applied to the config as part of this measurement
-task.**
+that shape. **This recommendation has since been applied:
+`configs/example.yaml` now defaults to `linger: 1ms`**, with the caveats above
+standing — a steadier arrival rate than this burst-shaped test could still
+favour a longer window.
 
 The re-run above lands on the same 1ms-is-best conclusion as the original
 serial-sink analysis kept below, but for a different, now-verified
