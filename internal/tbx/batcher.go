@@ -3,11 +3,9 @@ package tbx
 import (
 	"context"
 	"errors"
-	"hash/maphash"
 	"log/slog"
 	"math/rand"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Mi7teR/kafka-tb/internal/config"
@@ -38,13 +36,8 @@ type SubmitResult struct {
 }
 
 // Batcher — единственная дверь в TigerBeetle.
-// Держит shards независимых воркеров; у воркера в любой момент не больше одного
-// батча в полёте. Команда попадает к воркеру по хешу своего ключа порядка — по
-// ключу и только по нему, безотносительно типа операции, — поэтому две команды
-// с одним ключом никогда не летят одновременно, даже когда одна создаёт счета,
-// а другая переводит с них. А значит, порядок применения внутри ключа совпадает
-// с порядком Submit. Между разными ключами порядок не гарантируется: ровно этим
-// разменом и покупается параллелизм, недоступный одному воркеру.
+// Держит по одному in-flight батчу на каждый тип операции, чем гарантирует,
+// что порядок применения совпадает с порядком Submit.
 type Batcher struct {
 	client  Client
 	cfg     config.Batcher
@@ -52,25 +45,8 @@ type Batcher struct {
 	log     *slog.Logger
 	metrics *obs.Metrics
 
-	// queues — по одной очереди на воркер, обе операции в ней вперемешку.
-	// Очередь на шард, а не общая: общая снова свела бы разные ключи в одну
-	// точку сериализации. Одна очередь на шард, а не по одной на тип операции:
-	// две очереди — это два воркера, а два воркера на ключ и есть та самая
-	// одновременность, которой быть не должно.
-	shards int
-	queues []chan *job
-
-	// rr раздаёт воркеров командам без ключа. Круг, а не хеш пустой строки:
-	// иначе весь API-трафик встал бы в один воркер и сериализовался об него.
-	rr atomic.Uint64
-	// seed — соль хеша ключа. На процесс, а не на сборку: привязка должна
-	// держаться внутри жизни батчера, а совпадение шардов между процессами
-	// не значит ничего.
-	seed maphash.Seed
-	// pickShard существует полем, а не прямым вызовом, только ради контрольного
-	// теста: проверка порядка чего-то стоит лишь тогда, когда батчер с
-	// выключенной привязкой её проваливает. В проде это всегда hashShard.
-	pickShard func(key string) int
+	transfers chan *job
+	accounts  chan *job
 
 	// stop — единственный сигнал остановки, общий для всех участников.
 	// Закрывается ровно один раз: либо из Close(), либо при отмене контекста
@@ -97,42 +73,17 @@ type Batcher struct {
 }
 
 func NewBatcher(c Client, cfg config.Batcher, retry config.Retry, log *slog.Logger, metrics *obs.Metrics) *Batcher {
-	// Конфиг, собранный в коде, а не загруженный через config.Load, не проходит
-	// его дефолтов, а ноль воркеров — это батчер, который никогда никого не
-	// разгребёт.
-	shards := cfg.Shards
-	if shards <= 0 {
-		shards = config.DefaultBatcherShards
+	return &Batcher{
+		client:    c,
+		cfg:       cfg,
+		retry:     retry,
+		log:       log,
+		metrics:   metrics,
+		transfers: make(chan *job, cfg.MaxQueue),
+		accounts:  make(chan *job, cfg.MaxQueue),
+		stop:      make(chan struct{}),
+		finished:  make(chan struct{}),
 	}
-	b := &Batcher{
-		client:   c,
-		cfg:      cfg,
-		retry:    retry,
-		log:      log,
-		metrics:  metrics,
-		shards:   shards,
-		queues:   make([]chan *job, shards),
-		seed:     maphash.MakeSeed(),
-		stop:     make(chan struct{}),
-		finished: make(chan struct{}),
-	}
-	for i := 0; i < shards; i++ {
-		// max_queue — на воркер: очередь одного ключа не должна упираться в
-		// заполненность чужой.
-		b.queues[i] = make(chan *job, cfg.MaxQueue)
-	}
-	b.pickShard = b.hashShard
-	return b
-}
-
-// hashShard выбирает воркера по ключу порядка. Один ключ — всегда один воркер:
-// на этом, и только на этом, держится обещание «две команды одного ключа
-// никогда не в полёте одновременно».
-func (b *Batcher) hashShard(key string) int {
-	if key == "" {
-		return int(b.rr.Add(1) % uint64(b.shards))
-	}
-	return int(maphash.String(b.seed, key) % uint64(b.shards))
 }
 
 // Start запускает циклы отправки. Вызывается ровно один раз и строго до Close;
@@ -140,16 +91,11 @@ func (b *Batcher) hashShard(key string) int {
 func (b *Batcher) Start(ctx context.Context) {
 	// Отмена контекста — это тот же shutdown, что и Close().
 	b.unwatch = context.AfterFunc(ctx, b.signalStop)
-	b.wg.Add(b.shards)
-	for i := 0; i < b.shards; i++ {
-		queue := b.queues[i]
-		go func() { defer b.wg.Done(); b.loop(queue) }()
-	}
+	b.wg.Add(2)
+	go func() { defer b.wg.Done(); b.loop(b.transfers, b.sendTransfers) }()
+	go func() { defer b.wg.Done(); b.loop(b.accounts, b.sendAccounts) }()
 	// Наблюдатель живёт здесь, а не в Close: путь остановки по отмене контекста
 	// не проходит через Close, но отправителей отпускать обязан так же.
-	// wg накрывает все воркеры разом, поэтому finished закрывается только
-	// после выхода последнего из них — и отправитель, ждущий исход, не получит
-	// ErrClosed, пока хоть кто-то ещё способен ему ответить.
 	go func() { b.wg.Wait(); b.signalFinished() }()
 }
 
@@ -171,12 +117,10 @@ func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan S
 		return nil, ErrCommandTooLarge
 	}
 	j := &job{cmd: cmd, done: make(chan SubmitResult, 1)}
-	// Шард выбирается по одному лишь ключу: тип операции в маршрутизацию не
-	// входит намеренно. Развести create_accounts и create_transfers одного
-	// ключа по разным воркерам значило бы отправить их одновременно — и
-	// трансфер со счёта, который ещё не создан, вернул бы
-	// debit_account_not_found, то есть бизнес-отказ и DLQ для законной записи.
-	queue := b.queues[b.pickShard(cmd.Key)]
+	queue := b.transfers
+	if cmd.Op == model.OpCreateAccounts {
+		queue = b.accounts
+	}
 
 	// Быстрый отказ, когда батчер уже остановлен: иначе select ниже выбирал бы
 	// между stop и свободным местом в очереди случайно.
@@ -211,7 +155,7 @@ func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan S
 			// вот-вот вернуть исход. Ответить в этот момент ErrClosed — соврать
 			// про применённую работу; вызывающий не обязан повторять запрос с
 			// тем же id и восстановить правду ему неоткуда.
-			// finished же закрывается после выхода всех воркеров, то есть когда
+			// finished же закрывается после выхода обоих циклов, то есть когда
 			// ответить этой команде уже некому.
 			//
 			// Гонка «исход доставлен ровно в момент выхода циклов» реальна:
@@ -284,17 +228,11 @@ func (b *Batcher) signalFinished() {
 	b.finishedOnce.Do(func() { close(b.finished) })
 }
 
-// loop копит подряд идущие команды одной операции и отправляет накопленное,
-// когда операция сменилась, набрался max_batch_size или истёк linger — что
-// наступит раньше. Смена операции — такой же повод отправить, как и остальные
-// два: один запрос к TigerBeetle несёт события ровно одного типа, смешать
-// счета с трансферами нельзя. Отправка идёт строго последовательно, поэтому
-// порядок применения совпадает с порядком постановки и на стыке операций тоже.
-func (b *Batcher) loop(queue chan *job) {
+// loop собирает батч по правилу «max_batch_size или linger, что раньше».
+func (b *Batcher) loop(queue chan *job, send func([]*job) error) {
 	var (
 		batch []*job
 		size  int
-		op    model.Op
 		timer *time.Timer
 		tick  <-chan time.Time
 	)
@@ -309,7 +247,7 @@ func (b *Batcher) loop(queue chan *job) {
 			return
 		}
 		stopTimer()
-		if err := b.send(op, batch); err != nil {
+		if err := send(batch); err != nil {
 			b.failAll(batch, err)
 		}
 		batch, size = nil, 0
@@ -324,16 +262,10 @@ func (b *Batcher) loop(queue chan *job) {
 			b.drain(queue, ErrClosed)
 			return
 		case j := <-queue:
-			// Пробег одной операции кончился — отправляем его целиком, следующий
-			// начинается с этой команды.
-			if len(batch) > 0 && j.cmd.Op != op {
-				flush()
-			}
 			// Команда не влезает в остаток — отправляем накопленное и начинаем новый батч.
 			if size+j.cmd.Len() > b.cfg.MaxBatchSize {
 				flush()
 			}
-			op = j.cmd.Op
 			batch = append(batch, j)
 			size += j.cmd.Len()
 			if size >= b.cfg.MaxBatchSize {
@@ -348,14 +280,6 @@ func (b *Batcher) loop(queue chan *job) {
 			flush()
 		}
 	}
-}
-
-// send выбирает запрос по операции накопленного пробега.
-func (b *Batcher) send(op model.Op, jobs []*job) error {
-	if op == model.OpCreateAccounts {
-		return b.sendAccounts(jobs)
-	}
-	return b.sendTransfers(jobs)
 }
 
 func (b *Batcher) drain(queue chan *job, err error) {

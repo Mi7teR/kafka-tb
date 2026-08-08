@@ -36,18 +36,6 @@ func markedTransferCmd(marker uint64, n int) *model.Command {
 // подряд и в исходном порядке событий; внутри команды linked снят ровно на
 // последнем событии; ни одна команда не потеряна и не отправлена дважды.
 func TestBatcherPackingInvariants(t *testing.T) {
-	// Ключ порядка меняет только раскладку команд по воркерам, но не правила
-	// упаковки: инварианты обязаны держаться и когда все команды достались
-	// одному воркеру, и когда батчер разложил их по всем шардам.
-	for _, tc := range []struct{ name, key string }{
-		{"one worker", "one-worker"},
-		{"spread across shards", ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) { checkPackingInvariants(t, tc.key) })
-	}
-}
-
-func checkPackingInvariants(t *testing.T, key string) {
 	const maxBatch = 64
 	seed := time.Now().UnixNano()
 	t.Logf("seed=%d", seed)
@@ -74,9 +62,7 @@ func checkPackingInvariants(t *testing.T, key string) {
 		wg.Add(1)
 		go func(i, n int) {
 			defer wg.Done()
-			cmd := markedTransferCmd(uint64(i+1), n)
-			cmd.Key = key
-			out, err := b.Submit(context.Background(), cmd)
+			out, err := b.Submit(context.Background(), markedTransferCmd(uint64(i+1), n))
 			// assert, а не require: FailNow из не-тестовой горутины — UB.
 			assert.NoError(t, err)
 			assert.Len(t, out, n)

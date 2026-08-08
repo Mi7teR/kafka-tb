@@ -17,9 +17,6 @@ const MaxBatchSize = 8189
 // is left unset.
 const DefaultMaxInFlightPerPartition = 1000
 
-// DefaultBatcherShards is used when batcher.shards is left unset.
-const DefaultBatcherShards = 4
-
 type Mode string
 
 const (
@@ -41,20 +38,12 @@ type TigerBeetle struct {
 type Batcher struct {
 	MaxBatchSize int           `yaml:"max_batch_size"`
 	Linger       time.Duration `yaml:"linger"`
-	// MaxQueue is the depth of one worker's queue, not of the batcher as a
-	// whole. A worker holds max_queue commands queued plus up to
-	// max_batch_size more in the batch it is assembling or sending, so the
-	// process can hold up to (max_queue + max_batch_size) × shards commands —
-	// 36,756 at the defaults, not 1,000.
+	// MaxQueue is the depth of ONE worker's queue, not of the batcher as a
+	// whole. The batcher runs one worker per operation type — two — and a
+	// worker holds MaxQueue commands queued plus up to MaxBatchSize events in
+	// the batch it is assembling or sending. The process can therefore hold up
+	// to (MaxQueue + MaxBatchSize) × 2 in the batcher: 18,378 at the defaults.
 	MaxQueue int `yaml:"max_queue"`
-	// Shards is how many independent workers the batcher runs. A command is
-	// routed to one of them by the hash of its ordering key alone, regardless
-	// of operation type, so commands sharing a key are never in flight at the
-	// same time and keep their submit order — including a create_accounts
-	// followed by a create_transfers on the same key. Different keys pipeline.
-	// One shard restores the old behaviour: a single in-flight request,
-	// everything serialised behind it.
-	Shards int `yaml:"shards"`
 }
 
 type Sink struct {
@@ -142,9 +131,6 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	applyEnv(&cfg)
-	if cfg.Batcher.Shards == 0 {
-		cfg.Batcher.Shards = DefaultBatcherShards
-	}
 	if cfg.Sink.MaxInFlightPerPartition == 0 {
 		// Дефолт прижимается к потолку батчера, а не навязывается: конфиг,
 		// написанный до появления этого поля, мог иметь очередь меньше
@@ -200,25 +186,19 @@ func (c *Config) validate() error {
 	if c.Batcher.MaxQueue <= 0 {
 		return fmt.Errorf("batcher.max_queue: must be > 0")
 	}
-	if c.Batcher.Shards <= 0 {
-		return fmt.Errorf("batcher.shards: must be > 0")
-	}
-	// max_queue + max_batch_size is what a single partition could ever get in
-	// flight: all of one partition's records carry the same ordering key, so
-	// they queue on one worker, and a job dequeued into the batch being
+	// max_queue + max_batch_size is what a single partition, alone in the
+	// process, could ever get in flight: a job dequeued into the batch being
 	// assembled frees its queue slot while its caller stays parked for the whole
-	// TigerBeetle round trip. Since max_queue is now per worker, that ceiling is
-	// genuinely reachable when a partition has its worker to itself. It is still
-	// not a protective limit: partitions whose keys hash to the same worker
-	// share its queue, and then the enqueue blocks below the ceiling. The check
-	// only rejects a number that could never describe anything real.
+	// TigerBeetle round trip. It is not a protective limit — the batcher's queue
+	// is global while this setting is per-partition, so with several assigned
+	// partitions the enqueue blocks at a fraction of it. The check only rejects
+	// a number that could never describe anything real.
 	if ceiling := c.Batcher.MaxQueue + c.Batcher.MaxBatchSize; c.Sink.MaxInFlightPerPartition <= 0 ||
 		c.Sink.MaxInFlightPerPartition > ceiling {
 		return fmt.Errorf(
-			"sink.max_in_flight_per_partition: want 1..%d — a partition's records all share one"+
-				" ordering key and therefore one batcher worker, so it can hold no more than"+
-				" batcher.max_queue + batcher.max_batch_size in flight, and partitions sharing"+
-				" a worker block the enqueue below that; got %d",
+			"sink.max_in_flight_per_partition: want 1..%d — no single partition can hold more"+
+				" than batcher.max_queue + batcher.max_batch_size in flight, and with several"+
+				" partitions the shared batcher queue blocks the enqueue well below that; got %d",
 			ceiling, c.Sink.MaxInFlightPerPartition)
 	}
 	if c.Limits.MaxEventsPerMessage <= 0 || c.Limits.MaxEventsPerMessage > MaxBatchSize {

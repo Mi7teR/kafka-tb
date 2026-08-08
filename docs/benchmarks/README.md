@@ -107,6 +107,43 @@ column's conclusion rather than just extending it:
   4,000 — plausibly a plateau, but only one run each, so not strong evidence
   either way (`perf-sharded.md` §7).
 
+### Decision: batcher sharding was reverted
+
+Sharding was implemented (`b9c4bfb`, `173d712`), measured (the fourth column
+above and `perf-sharded.md`), and then reverted. The measurements are left
+above exactly as they were taken; this section records what was concluded
+from them.
+
+What the numbers said:
+
+- **1 partition: 16,343 → 16,459 rec/sec** — inside the run-to-run noise, and
+  expected: one partition is one ordering key, so it lands on one shard
+  whatever `shards` is set to.
+- **12 partitions: 1.36x** vs 1 partition, against ~1.0x parity before
+  sharding. The only column where sharding did anything.
+- **The `shards` sweep contradicted the premise.** 1 shard → 22,944 rec/sec,
+  4 → 18,861, 8 → 20,968, 16 → 22,276. One shard was the fastest value
+  measured. The sweep is noisy — a single run per value, only 4-18
+  TigerBeetle calls per run — so it does not establish that sharding is
+  *harmful*. It does mean nothing in the data supports sharding.
+
+What it cost: real complexity in `internal/tbx/batcher.go`, the most
+safety-critical file in the project, plus a concurrency defect that only code
+review caught — commands sharing an ordering key but differing in operation
+type were routed to separate worker pools and could fly concurrently, so a
+`create_accounts` and a transfer debiting that account could reach TigerBeetle
+out of order and come back `debit_account_not_found`: a business rejection,
+dead-lettered and committed, never retried. `173d712` fixed that, but it is
+the kind of defect the design invites. An unproven benefit does not buy it.
+
+**The question is open, not settled.** The one measurement that would decide
+it was never run: a repeated, properly-sampled sweep at higher partition
+counts — enough TigerBeetle calls per run for the numbers to mean something —
+with `linger: 1ms` in place, since the linger change alters exactly the
+mechanism (how full a batch gets while the previous one is in flight) that
+sharding was meant to exploit. Anyone revisiting this should run that first;
+the revert is a response to absent evidence, not to evidence of harm.
+
 ## End-to-end load scenarios
 
 **What was actually measured:** all six scenarios below were run, but scaled
