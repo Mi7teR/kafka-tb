@@ -3,9 +3,11 @@ package tbx
 import (
 	"context"
 	"errors"
+	"hash/maphash"
 	"log/slog"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mi7teR/kafka-tb/internal/config"
@@ -36,8 +38,12 @@ type SubmitResult struct {
 }
 
 // Batcher — единственная дверь в TigerBeetle.
-// Держит по одному in-flight батчу на каждый тип операции, чем гарантирует,
-// что порядок применения совпадает с порядком Submit.
+// Держит shards независимых воркеров на каждый тип операции; у воркера в любой
+// момент не больше одного батча в полёте. Команда попадает к воркеру по хешу
+// своего ключа порядка, поэтому две команды с одним ключом никогда не летят
+// одновременно — а значит, порядок применения внутри ключа совпадает с
+// порядком Submit. Между разными ключами порядок не гарантируется: ровно этим
+// разменом и покупается параллелизм, недоступный одному воркеру.
 type Batcher struct {
 	client  Client
 	cfg     config.Batcher
@@ -45,8 +51,23 @@ type Batcher struct {
 	log     *slog.Logger
 	metrics *obs.Metrics
 
-	transfers chan *job
-	accounts  chan *job
+	// transfers/accounts — по очереди на воркер. Очередь на шард, а не общая:
+	// общая очередь снова свела бы разные ключи в одну точку сериализации.
+	shards    int
+	transfers []chan *job
+	accounts  []chan *job
+
+	// rr раздаёт воркеров командам без ключа. Круг, а не хеш пустой строки:
+	// иначе весь API-трафик встал бы в один воркер и сериализовался об него.
+	rr atomic.Uint64
+	// seed — соль хеша ключа. На процесс, а не на сборку: привязка должна
+	// держаться внутри жизни батчера, а совпадение шардов между процессами
+	// не значит ничего.
+	seed maphash.Seed
+	// pickShard существует полем, а не прямым вызовом, только ради контрольного
+	// теста: проверка порядка чего-то стоит лишь тогда, когда батчер с
+	// выключенной привязкой её проваливает. В проде это всегда hashShard.
+	pickShard func(key string) int
 
 	// stop — единственный сигнал остановки, общий для всех участников.
 	// Закрывается ровно один раз: либо из Close(), либо при отмене контекста
@@ -73,17 +94,44 @@ type Batcher struct {
 }
 
 func NewBatcher(c Client, cfg config.Batcher, retry config.Retry, log *slog.Logger, metrics *obs.Metrics) *Batcher {
-	return &Batcher{
+	// Конфиг, собранный в коде, а не загруженный через config.Load, не проходит
+	// его дефолтов, а ноль воркеров — это батчер, который никогда никого не
+	// разгребёт.
+	shards := cfg.Shards
+	if shards <= 0 {
+		shards = config.DefaultBatcherShards
+	}
+	b := &Batcher{
 		client:    c,
 		cfg:       cfg,
 		retry:     retry,
 		log:       log,
 		metrics:   metrics,
-		transfers: make(chan *job, cfg.MaxQueue),
-		accounts:  make(chan *job, cfg.MaxQueue),
+		shards:    shards,
+		transfers: make([]chan *job, shards),
+		accounts:  make([]chan *job, shards),
+		seed:      maphash.MakeSeed(),
 		stop:      make(chan struct{}),
 		finished:  make(chan struct{}),
 	}
+	for i := 0; i < shards; i++ {
+		// max_queue — на воркер: очередь одного ключа не должна упираться в
+		// заполненность чужой.
+		b.transfers[i] = make(chan *job, cfg.MaxQueue)
+		b.accounts[i] = make(chan *job, cfg.MaxQueue)
+	}
+	b.pickShard = b.hashShard
+	return b
+}
+
+// hashShard выбирает воркера по ключу порядка. Один ключ — всегда один воркер:
+// на этом, и только на этом, держится обещание «две команды одного ключа
+// никогда не в полёте одновременно».
+func (b *Batcher) hashShard(key string) int {
+	if key == "" {
+		return int(b.rr.Add(1) % uint64(b.shards))
+	}
+	return int(maphash.String(b.seed, key) % uint64(b.shards))
 }
 
 // Start запускает циклы отправки. Вызывается ровно один раз и строго до Close;
@@ -91,11 +139,17 @@ func NewBatcher(c Client, cfg config.Batcher, retry config.Retry, log *slog.Logg
 func (b *Batcher) Start(ctx context.Context) {
 	// Отмена контекста — это тот же shutdown, что и Close().
 	b.unwatch = context.AfterFunc(ctx, b.signalStop)
-	b.wg.Add(2)
-	go func() { defer b.wg.Done(); b.loop(b.transfers, b.sendTransfers) }()
-	go func() { defer b.wg.Done(); b.loop(b.accounts, b.sendAccounts) }()
+	b.wg.Add(2 * b.shards)
+	for i := 0; i < b.shards; i++ {
+		transfers, accounts := b.transfers[i], b.accounts[i]
+		go func() { defer b.wg.Done(); b.loop(transfers, b.sendTransfers) }()
+		go func() { defer b.wg.Done(); b.loop(accounts, b.sendAccounts) }()
+	}
 	// Наблюдатель живёт здесь, а не в Close: путь остановки по отмене контекста
 	// не проходит через Close, но отправителей отпускать обязан так же.
+	// wg накрывает все воркеры разом, поэтому finished закрывается только
+	// после выхода последнего из них — и отправитель, ждущий исход, не получит
+	// ErrClosed, пока хоть кто-то ещё способен ему ответить.
 	go func() { b.wg.Wait(); b.signalFinished() }()
 }
 
@@ -117,10 +171,11 @@ func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan S
 		return nil, ErrCommandTooLarge
 	}
 	j := &job{cmd: cmd, done: make(chan SubmitResult, 1)}
-	queue := b.transfers
+	queues := b.transfers
 	if cmd.Op == model.OpCreateAccounts {
-		queue = b.accounts
+		queues = b.accounts
 	}
+	queue := queues[b.pickShard(cmd.Key)]
 
 	// Быстрый отказ, когда батчер уже остановлен: иначе select ниже выбирал бы
 	// между stop и свободным местом в очереди случайно.

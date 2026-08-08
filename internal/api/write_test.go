@@ -264,3 +264,20 @@ func TestCreateTransfersPendingIDRequiredForPostPendingTransfer(t *testing.T) {
 
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }
+
+// Два независимых запроса к API не упорядочены между собой и никогда не были.
+// Пустой ключ порядка — это утверждение именно об этом: батчер раздаёт такие
+// команды разным воркерам по кругу, вместо того чтобы выстраивать весь API в
+// одну очередь за чьей-то партицией.
+func TestWritePathLeavesOrderKeyEmpty(t *testing.T) {
+	sub := &stubSubmitter{}
+	s := newTestServer(sub)
+
+	_, err := s.CreateTransfers(context.Background(), req())
+	require.NoError(t, err)
+	require.Empty(t, sub.got.Key, "запрос API не упорядочен ни с чем")
+
+	_, err = s.CreateAccounts(context.Background(), accountReq())
+	require.NoError(t, err)
+	require.Empty(t, sub.got.Key, "запрос API не упорядочен ни с чем")
+}

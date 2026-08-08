@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -347,20 +348,23 @@ func (s *Sink) pass(ctx context.Context, recs []*kgo.Record, deadline time.Time)
 		recs = recs[:s.maxInFlight]
 	}
 	// Постановка ограничена бюджетом пачки, а не только отменой: SubmitAsync
-	// паркуется на очереди батчера, а очередь эта общая и заведомо переполняется
-	// — партиций много, у каждой свой maxInFlight. Пока TigerBeetle отвечает,
+	// паркуется на очереди воркера батчера, а её делят все партиции, чей ключ
+	// лёг на этот воркер, — у каждой свой maxInFlight. Пока TigerBeetle отвечает,
 	// очередь разбирается; как только он замолчал, батчер ретраит вечно, очередь
 	// не двигается, и постановка без дедлайна держала бы блокировку ребаланса
 	// сколь угодно долго. Исход уже поставленной команды от этого контекста не
 	// зависит — его ждёт await по общему бюджету.
 	enqueueCtx, cancelEnqueue := context.WithDeadline(ctx, deadline)
 	defer cancelEnqueue()
+	// Ключ порядка один на весь пробег: groupByPartition уже гарантировал, что
+	// все записи здесь из одной партиции.
+	key := orderKey(recs[0])
 	prep := make([]prepared, 0, len(recs))
 	for _, rec := range recs {
 		if ctx.Err() != nil || !time.Now().Before(deadline) {
 			break
 		}
-		p := s.prepare(enqueueCtx, rec)
+		p := s.prepare(enqueueCtx, rec, key)
 		if p.err != nil && enqueueCtx.Err() != nil && ctx.Err() == nil {
 			// Постановку оборвал наш собственный дедлайн: это исчерпанный
 			// бюджет пачки, а не сбой записи. Ошибку не поднимаем — ретраить
@@ -546,9 +550,18 @@ type prepared struct {
 	err error
 }
 
+// orderKey — ключ порядка команды для батчера. Партиция и есть та единица,
+// внутри которой порядок обязателен: её записи применяются в порядке офсетов,
+// а между партициями порядка никогда не было. Батчер держит команды одного
+// ключа у одного воркера, поэтому две записи партиции не окажутся в полёте
+// одновременно, а записи разных партиций пойдут параллельно.
+func orderKey(rec *kgo.Record) string {
+	return rec.Topic + "/" + strconv.Itoa(int(rec.Partition))
+}
+
 // prepare декодирует запись и ставит её команду в батчер, не дожидаясь исхода.
 // Паника — дефект в обработке этого сообщения, а не всего потока.
-func (s *Sink) prepare(ctx context.Context, rec *kgo.Record) (p prepared) {
+func (s *Sink) prepare(ctx context.Context, rec *kgo.Record, key string) (p prepared) {
 	defer func() {
 		r := recover()
 		if r == nil {
@@ -570,6 +583,7 @@ func (s *Sink) prepare(ctx context.Context, rec *kgo.Record) (p prepared) {
 		// её инфраструктурной значило бы повторять запись вечно.
 		return prepared{poison: "decode", detail: derr.Error()}
 	}
+	cmd.Key = key
 
 	ch, serr := s.sub.SubmitAsync(ctx, cmd)
 	if serr != nil {

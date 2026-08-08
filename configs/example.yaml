@@ -11,7 +11,18 @@ tigerbeetle:
 batcher:
   max_batch_size: 8189
   linger: 5ms
+  # Queue depth of ONE worker, not of the batcher as a whole: with shards
+  # workers per operation type the process can hold up to
+  # max_queue × shards × 2 commands waiting.
   max_queue: 1000
+  # How many independent workers the batcher runs per operation type. A command
+  # goes to one of them by the hash of its ordering key — "topic/partition" for
+  # Kafka records, empty (round-robin) for API requests. Commands sharing a key
+  # therefore never fly at the same time and keep their submit order, while
+  # different partitions pipeline. More shards means more concurrent requests to
+  # TigerBeetle and more memory (see max_queue); 1 restores the old behaviour of
+  # a single in-flight request per operation type. Defaults to 4.
+  shards: 4
 # Sink pipelining
 sink:
   # How many of one partition's records the sink submits to the batcher before
@@ -24,11 +35,13 @@ sink:
   # is TigerBeetle idempotency: command ids are stable across attempts, and
   # TransferExists/AccountExists map to StatusOK.
   #
-  # Must not exceed batcher.max_queue + batcher.max_batch_size: that is the
-  # most a single partition could ever hold in flight. It is not a protective
-  # ceiling — the batcher queue is shared by all partitions, so with several of
-  # them the enqueue blocks at a fraction of that number. Defaults to 1000,
-  # clamped to the ceiling when the batcher is configured smaller.
+  # Must not exceed batcher.max_queue + batcher.max_batch_size: all of one
+  # partition's records carry the same ordering key and therefore queue on one
+  # batcher worker, so that is the most a single partition could ever hold in
+  # flight. It is not a protective ceiling — partitions whose keys hash to the
+  # same worker share its queue, and then the enqueue blocks below that number.
+  # Defaults to 1000, clamped to the ceiling when the batcher is configured
+  # smaller.
   max_in_flight_per_partition: 1000
 # Kafka consumer/producer settings
 kafka:

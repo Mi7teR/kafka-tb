@@ -40,6 +40,15 @@ func accountCmd(n int, tag string) *model.Command {
 	return c
 }
 
+// sameWorker ставит команде общий ключ порядка: все команды с ним попадают в
+// один воркер батчера. Тесты упаковки, очереди и порядка проверяют поведение
+// именно одного воркера — без общего ключа батчер развёл бы эти команды по
+// разным шардам, и проверять стало бы нечего.
+func sameWorker(cmd *model.Command) *model.Command {
+	cmd.Key = "one-worker"
+	return cmd
+}
+
 func startBatcher(t *testing.T, fc *fakeClient, maxBatch int, linger time.Duration) (*Batcher, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -59,7 +68,7 @@ func TestBatcherNeverSplitsCommand(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			_, err := b.Submit(context.Background(), transferCmd(n, "c"))
+			_, err := b.Submit(context.Background(), sameWorker(transferCmd(n, "c")))
 			// assert, а не require: FailNow из не-тестовой горутины — UB.
 			assert.NoError(t, err)
 		}(n)
@@ -97,7 +106,7 @@ func TestBatcherRespectsMaxBatchSize(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			out, err := b.Submit(context.Background(), transferCmd(2, "c"))
+			out, err := b.Submit(context.Background(), sameWorker(transferCmd(2, "c")))
 			// assert, а не require: FailNow из не-тестовой горутины — UB.
 			assert.NoError(t, err)
 			assert.Len(t, out, 2)
@@ -127,9 +136,9 @@ func TestBatcherRoutesResultsToOwner(t *testing.T) {
 	}}
 	b, _ := startBatcher(t, fc, 100, 10*time.Millisecond)
 
-	mark := transferCmd(2, "marked")
+	mark := sameWorker(transferCmd(2, "marked"))
 	mark.Transfers[1].Amount = types.ToUint128(7)
-	plain := transferCmd(2, "plain")
+	plain := sameWorker(transferCmd(2, "plain"))
 
 	var wg sync.WaitGroup
 	var markOut, plainOut []Outcome
@@ -327,7 +336,7 @@ func TestBatcherSubmitAsyncBatchesInSubmitOrder(t *testing.T) {
 
 	chans := make([]<-chan SubmitResult, n)
 	for i := 0; i < n; i++ {
-		ch, err := b.SubmitAsync(context.Background(), markedTransferCmd(uint64(i+1), 1))
+		ch, err := b.SubmitAsync(context.Background(), sameWorker(markedTransferCmd(uint64(i+1), 1)))
 		require.NoError(t, err)
 		chans[i] = ch
 	}
@@ -375,7 +384,7 @@ func TestBatcherSubmitAsyncBlocksWhenQueueIsFull(t *testing.T) {
 		close(pumpDone)
 	}()
 
-	_, err := b.SubmitAsync(context.Background(), transferCmd(1, "c0"))
+	_, err := b.SubmitAsync(context.Background(), sameWorker(transferCmd(1, "c0")))
 	require.NoError(t, err)
 	select {
 	case <-fc.enterTransfers: // цикл внутри вызова клиента и очередь не читает
@@ -387,7 +396,7 @@ func TestBatcherSubmitAsyncBlocksWhenQueueIsFull(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		done := make(chan error, 1)
 		go func() {
-			_, aerr := b.SubmitAsync(context.Background(), transferCmd(1, "c"))
+			_, aerr := b.SubmitAsync(context.Background(), sameWorker(transferCmd(1, "c")))
 			done <- aerr
 		}()
 		select {
@@ -400,7 +409,7 @@ func TestBatcherSubmitAsyncBlocksWhenQueueIsFull(t *testing.T) {
 
 	blocked := make(chan error, 1)
 	go func() {
-		_, aerr := b.SubmitAsync(context.Background(), transferCmd(1, "full"))
+		_, aerr := b.SubmitAsync(context.Background(), sameWorker(transferCmd(1, "full")))
 		blocked <- aerr
 	}()
 	select {
@@ -441,13 +450,13 @@ func TestBatcherSubmitAsyncAbandonedChannelDoesNotWedgeLoop(t *testing.T) {
 	b, _ := startBatcher(t, fc, 1, time.Hour)
 
 	for i := 0; i < 20; i++ {
-		_, err := b.SubmitAsync(context.Background(), transferCmd(1, "abandoned"))
+		_, err := b.SubmitAsync(context.Background(), sameWorker(transferCmd(1, "abandoned")))
 		require.NoError(t, err)
 	}
 
 	done := make(chan SubmitResult, 1)
 	go func() {
-		out, err := b.Submit(context.Background(), transferCmd(1, "last"))
+		out, err := b.Submit(context.Background(), sameWorker(transferCmd(1, "last")))
 		done <- SubmitResult{Outcomes: out, Err: err}
 	}()
 	select {
@@ -496,12 +505,12 @@ func TestBatcherSubmitAsyncCancelledContextOnFullQueue(t *testing.T) {
 		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger(), nil)
 	defer b.Close()
 
-	_, err := b.SubmitAsync(context.Background(), transferCmd(1, "queued"))
+	_, err := b.SubmitAsync(context.Background(), sameWorker(transferCmd(1, "queued")))
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	ch, err := b.SubmitAsync(ctx, transferCmd(1, "cancelled"))
+	ch, err := b.SubmitAsync(ctx, sameWorker(transferCmd(1, "cancelled")))
 	require.ErrorIs(t, err, context.Canceled)
 	require.Nil(t, ch)
 }

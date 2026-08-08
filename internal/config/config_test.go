@@ -178,3 +178,22 @@ func TestEnvOverride(t *testing.T) {
 func replace(s, old, new string) string {
 	return strings.Replace(s, old, new, 1)
 }
+
+// batcher.shards не задан — батчер всё равно обязан получить рабочее число
+// воркеров, а не ноль.
+func TestLoadDefaultsBatcherShards(t *testing.T) {
+	cfg, err := Load(writeCfg(t, validCfg))
+	require.NoError(t, err)
+	require.Equal(t, DefaultBatcherShards, cfg.Batcher.Shards)
+}
+
+func TestLoadKeepsExplicitBatcherShards(t *testing.T) {
+	cfg, err := Load(writeCfg(t, replace(validCfg, "  max_queue: 1000", "  max_queue: 1000\n  shards: 1")))
+	require.NoError(t, err)
+	require.Equal(t, 1, cfg.Batcher.Shards)
+}
+
+func TestLoadRejectsNegativeBatcherShards(t *testing.T) {
+	_, err := Load(writeCfg(t, replace(validCfg, "  max_queue: 1000", "  max_queue: 1000\n  shards: -1")))
+	require.ErrorContains(t, err, "batcher.shards")
+}

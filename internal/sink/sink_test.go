@@ -1566,3 +1566,46 @@ func TestOnRevokedCommitsBeforeForget(t *testing.T) {
 	require.Equal(t, int64(1), cl.committed[0]["src"][0].Offset)
 	require.Empty(t, s.offsets.Commitable(), "партиция забыта")
 }
+
+// keySubmitter записывает ключ порядка каждой поставленной команды.
+type keySubmitter struct {
+	mu   sync.Mutex
+	keys []string
+}
+
+func (s *keySubmitter) SubmitAsync(_ context.Context, cmd *model.Command) (<-chan tbx.SubmitResult, error) {
+	s.mu.Lock()
+	s.keys = append(s.keys, cmd.Key)
+	s.mu.Unlock()
+	return result(tbx.SubmitResult{
+		Outcomes: []tbx.Outcome{{Index: 0, ID: cmd.IDs[0], Status: tbx.StatusOK}},
+	}), nil
+}
+
+func (s *keySubmitter) submittedKeys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.keys...)
+}
+
+// Ключ порядка команды — "topic/partition", ровно та единица, внутри которой
+// порядок обязателен. Батчер держит команды одного ключа у одного воркера;
+// без ключа записи одной партиции разъехались бы по воркерам и могли бы
+// примениться не в порядке офсетов. Разные партиции обязаны получить разные
+// ключи — иначе они сериализуются об один воркер без всякой на то причины.
+func TestPassTagsCommandsWithPartitionOrderKey(t *testing.T) {
+	sub := &keySubmitter{}
+	s := newSink(t, idDecoder{}, sub, &recordingEmitter{})
+
+	applied, err := s.pass(context.Background(),
+		[]*kgo.Record{srcRec(2, 10), srcRec(2, 11)}, time.Now().Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, 2, applied)
+
+	applied, err = s.pass(context.Background(),
+		[]*kgo.Record{srcRec(3, 10)}, time.Now().Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, 1, applied)
+
+	require.Equal(t, []string{"src/2", "src/2", "src/3"}, sub.submittedKeys())
+}
