@@ -126,7 +126,7 @@ func TestLoadClampsDefaultMaxInFlightToCeiling(t *testing.T) {
 	cfg, err := Load(writeCfg(t, body))
 	require.NoError(t, err)
 	require.Equal(t, 600, cfg.Sink.MaxInFlightPerPartition,
-		"дефолт прижимается к max_queue + max_batch_size")
+		"default is clamped to max_queue + max_batch_size")
 }
 
 // It is specifically the default that gets clamped: an explicitly set value
@@ -152,7 +152,7 @@ func TestLoadRejectsUnreachableMaxInFlightPerPartition(t *testing.T) {
 	body = replace(validCfg, "  max_queue: 1000",
 		"  max_queue: 1000\nsink:\n  max_in_flight_per_partition: 9189")
 	cfg, err := Load(writeCfg(t, body))
-	require.NoError(t, err, "ровно потолок max_queue + max_batch_size ещё достижим")
+	require.NoError(t, err, "exactly max_queue + max_batch_size is still reachable")
 	require.Equal(t, 9189, cfg.Sink.MaxInFlightPerPartition)
 }
 

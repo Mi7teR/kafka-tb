@@ -173,7 +173,7 @@ func TestBatcherMixedOpsNeverInFlightTogether(t *testing.T) {
 	}
 
 	require.False(t, fc.overlapped(),
-		"команды разных операций оказались в полёте одновременно")
+		"commands for different operation types ended up in flight simultaneously")
 	require.Equal(t, []string{"a1", "t2"}, fc.order(),
-		"порядок применения разошёлся с порядком постановки")
+		"application order diverged from submission order")
 }

@@ -772,7 +772,7 @@ func TestHandleDLQFailureInsideRejectLoopBlocks(t *testing.T) {
 	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
 	require.Error(t, err)
 	require.False(t, done)
-	require.Equal(t, 1, em.results, "results уже опубликованы — ветка именно про reject-цикл")
+	require.Equal(t, 1, em.results, "results already published — this branch is for the reject-cycle")
 }
 
 // TestHandleMetricsByOutcome verifies handle actually increments RecordsTotal
@@ -873,7 +873,7 @@ func TestProcessBatchMarksEveryRecordDone(t *testing.T) {
 
 	require.Zero(t, s.offsets.InFlight())
 	require.Equal(t, int64(2), s.offsets.Commitable()["src"][0].Offset)
-	require.Empty(t, clientOf(t, s).setOffsets, "успешная пачка не перематывается")
+	require.Empty(t, clientOf(t, s).setOffsets, "successful batch must not be rewound")
 }
 
 // C1: the failed record itself is retried, it is not skipped in favor of the next one.
@@ -889,11 +889,11 @@ func TestProcessBatchRetriesSameRecord(t *testing.T) {
 	rec := srcRec(0, 7)
 	s.processBatch(context.Background(), []*kgo.Record{rec})
 
-	require.Equal(t, 2, sub.calls, "та же запись должна повториться")
+	require.Equal(t, 2, sub.calls, "same record must be retried")
 	require.Zero(t, s.offsets.InFlight())
 	require.Equal(t, int64(8), s.offsets.Commitable()["src"][0].Offset)
-	require.Empty(t, em.dlq, "инфраструктурный сбой не повод для DLQ")
-	require.Equal(t, 1, em.results, "результат публикуется ровно один раз")
+	require.Empty(t, em.dlq, "infrastructure failure is not a reason for DLQ")
+	require.Equal(t, 1, em.results, "result must be published exactly once")
 }
 
 // C2: a permanent infrastructure error does not hold the rebalance longer than the budget —
@@ -916,19 +916,19 @@ func TestProcessBatchAbandonsAndRewindsOnBudget(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("processBatch не уложилась в бюджет — ретрай не ограничен")
+		t.Fatal("processBatch did not fit in budget — retry is not limited")
 	}
 
 	cl := clientOf(t, s)
-	require.Len(t, cl.setOffsets, 1, "брошенная пачка обязана перематываться")
+	require.Len(t, cl.setOffsets, 1, "failed batch must be rewound")
 	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
 		"src": {
 			0: {Epoch: 3, Offset: 11}, // 10 was processed and marked Done with epoch 3
 			1: {Epoch: -1, Offset: 4}, // never reached at all — offset 3 is not Done, sentinel
 		},
 	}, cl.setOffsets[0])
-	require.Zero(t, s.offsets.InFlight(), "брошенные партиции забыты")
-	require.Empty(t, s.offsets.Commitable(), "забытая партиция ничего не коммитит")
+	require.Zero(t, s.offsets.InFlight(), "failed partitions are forgotten")
+	require.Empty(t, s.offsets.Commitable(), "forgotten partition must not commit anything")
 }
 
 // C4: a batch with no single infrastructure error — every record succeeds, but
@@ -959,16 +959,16 @@ func TestProcessBatchAbandonsSlowSuccessfulBatch(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("processBatch не уложилась в бюджет — медленная успешная пачка не ограничена")
+		t.Fatal("processBatch did not fit in budget — slow successful batch is not limited")
 	}
 
 	require.Less(t, sub.calls, len(records),
-		"пачка обязана быть брошена, не дойдя до конца")
+		"batch must be abandoned before reaching the end")
 	cl := clientOf(t, s)
-	require.Len(t, cl.setOffsets, 1, "брошенная пачка обязана перематываться")
+	require.Len(t, cl.setOffsets, 1, "failed batch must be rewound")
 	require.Equal(t, int64(2), cl.setOffsets[0]["src"][0].Offset,
-		"перематывать нужно с первой недошедшей записи")
-	require.Zero(t, s.offsets.InFlight(), "брошенная партиция забыта")
+		"rewind must start from the first unprocessed record")
+	require.Zero(t, s.offsets.InFlight(), "failed partition is forgotten")
 }
 
 // Context cancellation is not a reason to rewind: the process is shutting down, and unfinished
@@ -1006,8 +1006,8 @@ func TestProcessBatchPreservesSubmitOrderWithinPartition(t *testing.T) {
 
 	s.processBatch(context.Background(), records)
 
-	require.Equal(t, want, sub.submitted(), "постановка в батчер обязана идти по офсетам")
-	require.Equal(t, wantPub, em.publishedFor(0), "публикация исходов обязана идти по офсетам")
+	require.Equal(t, want, sub.submitted(), "submission to batcher must follow offset order")
+	require.Equal(t, wantPub, em.publishedFor(0), "outcome publication must follow offset order")
 	require.Zero(t, s.offsets.InFlight())
 	require.Equal(t, int64(n), s.offsets.Commitable()["src"][0].Offset)
 }
@@ -1036,11 +1036,11 @@ func TestProcessBatchRunsPartitionsConcurrently(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(30 * time.Second):
-		t.Fatal("processBatch не вернулась")
+		t.Fatal("processBatch did not return")
 	}
 
 	require.Equal(t, parts, em.resultsCount(),
-		"барьер не сошёлся: партиции обрабатываются последовательно")
+		"barrier did not converge: partitions are processed sequentially")
 	require.Zero(t, s.offsets.InFlight())
 }
 
@@ -1069,7 +1069,7 @@ func TestProcessBatchPublishesPoisonInOffsetOrder(t *testing.T) {
 	s.processBatch(context.Background(), records)
 
 	require.Equal(t, want, em.publishedFor(0))
-	require.Len(t, sub.submitted(), n/2, "poison не должен попадать в батчер вообще")
+	require.Len(t, sub.submitted(), n/2, "poison must not enter the batcher at all")
 	require.Zero(t, s.offsets.InFlight())
 	require.Equal(t, int64(n), s.offsets.Commitable()["src"][0].Offset)
 }
@@ -1095,16 +1095,16 @@ func TestProcessBatchCancelledMidPollLeavesUnverifiedRecords(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(30 * time.Second):
-		t.Fatal("processBatch не вернулась после отмены контекста")
+		t.Fatal("processBatch did not return after context cancellation")
 	}
 
 	require.Equal(t, []publication{
 		{kind: "results", offset: 0},
 		{kind: "results", offset: 1},
-	}, em.publishedFor(0), "публикуются ровно записи с исходом")
-	require.Equal(t, 2, s.offsets.InFlight(), "запись без исхода не может быть Done")
+	}, em.publishedFor(0), "only records with outcomes are published")
+	require.Equal(t, 2, s.offsets.InFlight(), "record without outcome cannot be marked Done")
 	require.Equal(t, int64(2), s.offsets.Commitable()["src"][0].Offset,
-		"коммитится только префикс подтверждённых записей")
+		"only confirmed record prefix is committed")
 	require.Empty(t, clientOf(t, s).setOffsets)
 }
 
@@ -1128,21 +1128,21 @@ func TestProcessBatchAbandonsWhileWaitingForOutcomes(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(30 * time.Second):
-		t.Fatal("processBatch не уложилась в бюджет — ожидание исходов не ограничено")
+		t.Fatal("processBatch did not fit in budget — waiting for outcomes is not limited")
 	}
 
 	require.Equal(t, len(records), sub.Calls(),
-		"все записи обязаны быть поставлены не дожидаясь исходов")
-	require.Zero(t, em.resultsCount(), "исходов не было — публиковать нечего")
+		"all records must be submitted without waiting for outcomes")
+	require.Zero(t, em.resultsCount(), "there were no outcomes — nothing to publish")
 	cl := clientOf(t, s)
-	require.Len(t, cl.setOffsets, 1, "брошенная пачка обязана перематываться")
+	require.Len(t, cl.setOffsets, 1, "failed batch must be rewound")
 	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
 		"src": {
 			0: {Epoch: -1, Offset: 5},
 			1: {Epoch: -1, Offset: 2},
 		},
-	}, cl.setOffsets[0], "перематываются обе партиции, каждая со своей первой записи")
-	require.Zero(t, s.offsets.InFlight(), "брошенные партиции забыты")
+	}, cl.setOffsets[0], "both partitions are rewound, each from its own first record")
+	require.Zero(t, s.offsets.InFlight(), "failed partitions are forgotten")
 }
 
 // F1: the budget must also bound submission itself. SubmitAsync parks on the
@@ -1167,18 +1167,18 @@ func TestProcessBatchAbandonsWhenEnqueueBlocks(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("processBatch не вернулась — постановка не ограничена бюджетом пачки")
+		t.Fatal("processBatch did not return — submission is not limited by batch budget")
 	}
 
 	require.Less(t, time.Since(start), time.Second,
-		"постановка обязана сдаваться на бюджете, а не висеть")
-	require.Zero(t, em.resultsCount(), "ни одна запись не поставлена — публиковать нечего")
+		"submission must yield to budget constraints, not hang")
+	require.Zero(t, em.resultsCount(), "no records were submitted — nothing to publish")
 	cl := clientOf(t, s)
-	require.Len(t, cl.setOffsets, 1, "брошенная пачка обязана перематываться")
+	require.Len(t, cl.setOffsets, 1, "failed batch must be rewound")
 	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
 		"src": {0: {Epoch: -1, Offset: 5}},
 	}, cl.setOffsets[0])
-	require.Zero(t, s.offsets.InFlight(), "брошенная партиция забыта")
+	require.Zero(t, s.offsets.InFlight(), "failed partition is forgotten")
 }
 
 // F3: a submission failure must stop the partition's run. Otherwise offsets
@@ -1200,18 +1200,18 @@ func TestProcessBatchStopsSubmittingAfterEnqueueFailure(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(30 * time.Second):
-		t.Fatal("processBatch не вернулась")
+		t.Fatal("processBatch did not return")
 	}
 
 	submitted := sub.submitted()
-	require.NotEmpty(t, submitted, "упавшая запись обязана быть хотя бы попытана")
+	require.NotEmpty(t, submitted, "failed record must be attempted at least once")
 	for _, id := range submitted {
 		require.Equal(t, recID(0, 0), id,
-			"после провала постановки ни одна следующая запись партиции не может попасть в батчер")
+			"after submission failure, no subsequent record from the partition can enter the batcher")
 	}
-	require.Zero(t, em.resultsCount(), "применённых записей не было")
+	require.Zero(t, em.resultsCount(), "no records were applied")
 	require.Equal(t, int64(0), clientOf(t, s).setOffsets[0]["src"][0].Offset,
-		"перематывать нужно с упавшей записи")
+		"rewind must start from the failed record")
 }
 
 // F4: a panic in a partition goroutine has no right to crash the process. The caller's deferred
@@ -1231,10 +1231,10 @@ func TestProcessBatchSurvivesPanicInPartitionGoroutine(t *testing.T) {
 	})
 
 	cl := clientOf(t, s)
-	require.Len(t, cl.setOffsets, 1, "партиция с паникой обязана перематываться")
+	require.Len(t, cl.setOffsets, 1, "partition with panic must be rewound")
 	require.Equal(t, int64(4), cl.setOffsets[0]["src"][0].Offset)
-	require.Zero(t, s.offsets.InFlight(), "брошенная партиция забыта")
-	require.Empty(t, s.offsets.Commitable(), "офсет записи с паникой не коммитится")
+	require.Zero(t, s.offsets.InFlight(), "failed partition is forgotten")
+	require.Empty(t, s.offsets.Commitable(), "offset of record with panic must not be committed")
 }
 
 // F2 (review): a panic between issuing Results and issuing the reject DLQ has no
@@ -1265,13 +1265,13 @@ func TestFinishPanicAfterResultsAwaitsAlreadyIssuedPublication(t *testing.T) {
 	// Both publications must be issued — Results before the panic, the poison DLQ
 	// after the recover — and neither is acknowledged yet: pass must hang.
 	require.Eventually(t, func() bool { return len(em.publishedFor(0)) == 2 }, time.Second, time.Millisecond,
-		"Results и поисоновый DLQ обязаны быть выданы, даже если между ними была паника")
+		"Results and poison DLQ must be published even if panic occurred between them")
 	select {
 	case r := <-done:
-		t.Fatalf("pass завершилась до подтверждения обеих публикаций: %+v", r)
+		t.Fatalf("pass completed before both publications were confirmed: %+v", r)
 	case <-time.After(50 * time.Millisecond):
 	}
-	require.Equal(t, 1, s.offsets.InFlight(), "запись без подтверждения обеих публикаций не может быть Done")
+	require.Equal(t, 1, s.offsets.InFlight(), "record without confirmation of both publications cannot be marked Done")
 	require.Empty(t, s.offsets.Commitable())
 
 	// Only the poison DLQ is acknowledged: if recover replaced the set of
@@ -1280,11 +1280,11 @@ func TestFinishPanicAfterResultsAwaitsAlreadyIssuedPublication(t *testing.T) {
 	require.Equal(t, 1, em.releaseKind("dlq"))
 	select {
 	case r := <-done:
-		t.Fatalf("pass завершилась при неподтверждённом Results: %+v", r)
+		t.Fatalf("pass completed with unconfirmed Results: %+v", r)
 	case <-time.After(50 * time.Millisecond):
 	}
 	require.Equal(t, 1, s.offsets.InFlight(),
-		"осиротевшая публикация Results обязана по-прежнему держать запись в полёте")
+		"orphaned Results publication must still keep record in flight")
 
 	require.Equal(t, 1, em.releaseKind("results"))
 
@@ -1293,7 +1293,7 @@ func TestFinishPanicAfterResultsAwaitsAlreadyIssuedPublication(t *testing.T) {
 	require.Equal(t, 1, r.applied)
 	require.Zero(t, s.offsets.InFlight())
 	require.Equal(t, int64(1), s.offsets.Commitable()["src"][0].Offset,
-		"запись обязана стать коммитабельной только после ack обеих публикаций")
+		"record must become commitable only after ack of both publications")
 }
 
 // T16: publication is now asynchronous, and the whole "offset only after ack" contract
@@ -1321,14 +1321,14 @@ func TestRecordIsNotDoneUntilPublicationIsAcknowledged(t *testing.T) {
 	// The publication is issued but not acknowledged: pass must hang, and the record must
 	// stay in flight and not enter the commit.
 	require.Eventually(t, func() bool { return len(em.publishedFor(0)) == 1 }, time.Second, time.Millisecond,
-		"публикация обязана выдаваться, не дожидаясь брокера")
+		"publication must be issued without waiting for broker")
 	select {
 	case r := <-done:
-		t.Fatalf("pass завершилась до подтверждения публикации: %+v", r)
+		t.Fatalf("pass completed before publication was confirmed: %+v", r)
 	case <-time.After(50 * time.Millisecond):
 	}
-	require.Equal(t, 1, s.offsets.InFlight(), "неподтверждённая запись не может быть Done")
-	require.Empty(t, s.offsets.Commitable(), "неподтверждённый офсет не имеет права коммититься")
+	require.Equal(t, 1, s.offsets.InFlight(), "unconfirmed record cannot be marked Done")
+	require.Empty(t, s.offsets.Commitable(), "unconfirmed offset must not be committed")
 
 	require.Equal(t, 1, em.releaseAll())
 
@@ -1337,7 +1337,7 @@ func TestRecordIsNotDoneUntilPublicationIsAcknowledged(t *testing.T) {
 	require.Equal(t, 1, r.applied)
 	require.Zero(t, s.offsets.InFlight())
 	require.Equal(t, int64(1), s.offsets.Commitable()["src"][0].Offset,
-		"подтверждённая запись обязана стать коммитабельной")
+		"confirmed record must become commitable")
 }
 
 // T16: a results-publication failure is an infrastructure class. The record is not
@@ -1359,15 +1359,15 @@ func TestProcessBatchResultsPublicationFailureRewindsPartition(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(30 * time.Second):
-		t.Fatal("processBatch не вернулась")
+		t.Fatal("processBatch did not return")
 	}
 
 	cl := clientOf(t, s)
-	require.Len(t, cl.setOffsets, 1, "партиция с непрошедшей публикацией обязана перематываться")
+	require.Len(t, cl.setOffsets, 1, "partition with failed publication must be rewound")
 	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
 		"src": {0: {Epoch: -1, Offset: 0}},
-	}, cl.setOffsets[0], "перематывать нужно с записи, чья публикация не подтверждена")
-	require.Empty(t, s.offsets.Commitable(), "офсет неопубликованной записи не коммитится")
+	}, cl.setOffsets[0], "rewind must start from the record whose publication was not confirmed")
+	require.Empty(t, s.offsets.Commitable(), "offset of unpublished record must not be committed")
 	require.Zero(t, s.offsets.InFlight())
 }
 
@@ -1395,7 +1395,7 @@ func TestProcessBatchOneFailedPublicationLeavesEarlierOnesConfirmed(t *testing.T
 	select {
 	case <-done:
 	case <-time.After(30 * time.Second):
-		t.Fatal("processBatch не вернулась")
+		t.Fatal("processBatch did not return")
 	}
 
 	cl := clientOf(t, s)
@@ -1403,7 +1403,7 @@ func TestProcessBatchOneFailedPublicationLeavesEarlierOnesConfirmed(t *testing.T
 	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
 		"src": {0: {Epoch: 3, Offset: 2}},
 	}, cl.setOffsets[0],
-		"офсеты 0 и 1 подтверждены и помечены Done, несмотря на провал офсета 2")
+		"offsets 0 and 1 are confirmed and marked Done despite failure of offset 2")
 }
 
 // T16: acknowledgments arrive in an order different from the one publications were issued in —
@@ -1440,7 +1440,7 @@ func TestProcessBatchPublicationOrderFollowsOffsetsWithOutOfOrderAcks(t *testing
 		case <-done:
 			released = parts * perP
 		case <-deadline:
-			t.Fatal("processBatch не вернулась — подтверждения не разбираются")
+			t.Fatal("processBatch did not return — confirmations are not handled")
 		case <-time.After(time.Millisecond):
 			released += em.releaseAll()
 		}
@@ -1448,7 +1448,7 @@ func TestProcessBatchPublicationOrderFollowsOffsetsWithOutOfOrderAcks(t *testing
 	select {
 	case <-done:
 	case <-time.After(30 * time.Second):
-		t.Fatal("processBatch не вернулась")
+		t.Fatal("processBatch did not return")
 	}
 
 	for p := range int32(parts) {
@@ -1457,9 +1457,9 @@ func TestProcessBatchPublicationOrderFollowsOffsetsWithOutOfOrderAcks(t *testing
 			want[o] = publication{kind: "results", partition: p, offset: o}
 		}
 		require.Equal(t, want, em.publishedFor(p),
-			"публикация партиции %d обязана идти по офсетам", p)
+			"partition %d publication must follow offset order", p)
 		require.Equal(t, int64(perP), s.offsets.Commitable()["src"][p].Offset,
-			"партиция %d обязана дойти до конца", p)
+			"partition %d must reach completion", p)
 	}
 	require.Zero(t, s.offsets.InFlight())
 }
@@ -1477,9 +1477,9 @@ func TestCommitSkipsCommitWhenFlushFails(t *testing.T) {
 	s.commit(context.Background(), slog.LevelError)
 
 	cl := clientOf(t, s)
-	require.Empty(t, cl.committed, "провалившийся Flush обязан остановить коммит")
+	require.Empty(t, cl.committed, "failed Flush must stop commit")
 	require.Equal(t, int64(1), s.offsets.Commitable()["src"][0].Offset,
-		"незакоммиченный офсет обязан остаться коммитабельным")
+		"uncommitted offset must remain commitable")
 }
 
 func TestCommitSkipsMarkCommittedOnTransportError(t *testing.T) {
@@ -1494,7 +1494,7 @@ func TestCommitSkipsMarkCommittedOnTransportError(t *testing.T) {
 
 	require.Len(t, cl.committed, 1)
 	require.Equal(t, int64(1), s.offsets.Commitable()["src"][0].Offset,
-		"неудавшийся коммит не должен помечаться выполненным")
+		"failed commit must not be marked as completed")
 }
 
 // A partition-level error is not surfaced in the callback's err — without checking it,
@@ -1520,7 +1520,7 @@ func TestCommitMarksCommittedOnSuccess(t *testing.T) {
 	s.offsets.Done(rec)
 	s.commit(context.Background(), slog.LevelError)
 
-	require.Empty(t, s.offsets.Commitable(), "успешный коммит двигает ватермарк")
+	require.Empty(t, s.offsets.Commitable(), "successful commit moves watermark")
 }
 
 // F3: commit must publish kafkatb_offset_commit_lag from the offsets
@@ -1562,7 +1562,7 @@ func TestOnRevokedCommitsBeforeForget(t *testing.T) {
 	s.OnRevoked(context.Background(), map[string][]int32{"src": {0}})
 
 	cl := clientOf(t, s)
-	require.Len(t, cl.committed, 1, "коммит обязан произойти до Forget")
+	require.Len(t, cl.committed, 1, "commit must occur before Forget")
 	require.Equal(t, int64(1), cl.committed[0]["src"][0].Offset)
-	require.Empty(t, s.offsets.Commitable(), "партиция забыта")
+	require.Empty(t, s.offsets.Commitable(), "partition is forgotten")
 }

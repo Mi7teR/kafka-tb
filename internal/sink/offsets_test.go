@@ -319,11 +319,11 @@ func TestPendingSkipsFinishedAndForgottenPartitions(t *testing.T) {
 	o := NewOffsets()
 	o.Track(rec(0))
 	o.Done(rec(0))
-	require.Empty(t, o.Pending(), "всё завершено — перематывать нечего")
+	require.Empty(t, o.Pending(), "everything is done — nothing to rewind")
 
 	o.Track(rec(1))
 	o.Forget("t", 0)
-	require.Empty(t, o.Pending(), "тумбстон не перематывается")
+	require.Empty(t, o.Pending(), "tombstone must not be rewound")
 }
 
 func TestPendingIsPerPartition(t *testing.T) {
