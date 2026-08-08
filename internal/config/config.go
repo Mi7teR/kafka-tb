@@ -42,11 +42,15 @@ type Batcher struct {
 }
 
 type Sink struct {
-	// MaxInFlightPerPartition bounds how many of one partition's records the
-	// sink may have handed to the batcher without having accounted for their
-	// outcome yet. The bound is what keeps a cancellation or a failure from
-	// leaving an unbounded tail of records already applied to TigerBeetle but
-	// neither published nor committed.
+	// MaxInFlightPerPartition caps how many of one partition's records the sink
+	// hands to the batcher in a single pass before it starts collecting their
+	// outcomes. It is a throughput/replay trade-off, not a safety bound: on an
+	// ungraceful stop up to MaxInFlightPerPartition × (assigned partitions)
+	// records may be applied to TigerBeetle but neither published nor
+	// committed, and will be replayed after restart — duplicate results-topic
+	// messages included. Correctness of the replay rests on stable command ids
+	// and on TransferExists/AccountExists being mapped to StatusOK, not on this
+	// number.
 	MaxInFlightPerPartition int `yaml:"max_in_flight_per_partition"`
 }
 
@@ -123,7 +127,13 @@ func Load(path string) (*Config, error) {
 	}
 	applyEnv(&cfg)
 	if cfg.Sink.MaxInFlightPerPartition == 0 {
-		cfg.Sink.MaxInFlightPerPartition = DefaultMaxInFlightPerPartition
+		// Дефолт прижимается к потолку батчера, а не навязывается: конфиг,
+		// написанный до появления этого поля, мог иметь очередь меньше
+		// дефолта, и падать на загрузке из-за значения, которого в нём нет,
+		// он не должен. Явно заданное значение выше потолка по-прежнему
+		// отвергается — там это ошибка автора, а не наш дефолт.
+		cfg.Sink.MaxInFlightPerPartition = min(
+			DefaultMaxInFlightPerPartition, cfg.Batcher.MaxQueue+cfg.Batcher.MaxBatchSize)
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -171,15 +181,19 @@ func (c *Config) validate() error {
 	if c.Batcher.MaxQueue <= 0 {
 		return fmt.Errorf("batcher.max_queue: must be > 0")
 	}
-	// The ceiling is max_queue + max_batch_size, not max_queue alone: a job
-	// dequeued into the batch being assembled frees its queue slot while its
-	// caller stays parked for the whole TigerBeetle round trip. Past that
-	// point the batcher's own enqueue blocks, so a larger bound here can never
-	// be reached and would only misdescribe the sink's real in-flight window.
+	// max_queue + max_batch_size is what a single partition, alone in the
+	// process, could ever get in flight: a job dequeued into the batch being
+	// assembled frees its queue slot while its caller stays parked for the whole
+	// TigerBeetle round trip. It is not a protective limit — the batcher's queue
+	// is global while this setting is per-partition, so with several assigned
+	// partitions the enqueue blocks at a fraction of it. The check only rejects
+	// a number that could never describe anything real.
 	if ceiling := c.Batcher.MaxQueue + c.Batcher.MaxBatchSize; c.Sink.MaxInFlightPerPartition <= 0 ||
 		c.Sink.MaxInFlightPerPartition > ceiling {
 		return fmt.Errorf(
-			"sink.max_in_flight_per_partition: want 1..%d (batcher.max_queue + batcher.max_batch_size), got %d",
+			"sink.max_in_flight_per_partition: want 1..%d — no single partition can hold more"+
+				" than batcher.max_queue + batcher.max_batch_size in flight, and with several"+
+				" partitions the shared batcher queue blocks the enqueue well below that; got %d",
 			ceiling, c.Sink.MaxInFlightPerPartition)
 	}
 	if c.Limits.MaxEventsPerMessage <= 0 || c.Limits.MaxEventsPerMessage > MaxBatchSize {

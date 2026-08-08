@@ -14,10 +14,21 @@ batcher:
   max_queue: 1000
 # Sink pipelining
 sink:
-  # How many of one partition's records may be in flight (submitted to the
-  # batcher, outcome not yet accounted for). Must not exceed
-  # batcher.max_queue + batcher.max_batch_size — beyond that the batcher's own
-  # enqueue blocks first. Defaults to 1000 when unset.
+  # How many of one partition's records the sink submits to the batcher before
+  # it starts collecting their outcomes. A throughput/replay trade-off, not a
+  # safety bound: on an ungraceful stop up to this many records per assigned
+  # partition may be applied to TigerBeetle but neither published nor
+  # committed — about 12k across 12 partitions at this value, a couple of
+  # seconds of replay at current throughput — and they are reprocessed after
+  # restart, producing duplicate results-topic messages. What keeps that safe
+  # is TigerBeetle idempotency: command ids are stable across attempts, and
+  # TransferExists/AccountExists map to StatusOK.
+  #
+  # Must not exceed batcher.max_queue + batcher.max_batch_size: that is the
+  # most a single partition could ever hold in flight. It is not a protective
+  # ceiling — the batcher queue is shared by all partitions, so with several of
+  # them the enqueue blocks at a fraction of that number. Defaults to 1000,
+  # clamped to the ceiling when the batcher is configured smaller.
   max_in_flight_per_partition: 1000
 # Kafka consumer/producer settings
 kafka:

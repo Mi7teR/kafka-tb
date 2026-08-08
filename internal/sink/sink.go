@@ -216,6 +216,24 @@ func (s *Sink) processBatch(ctx context.Context, records []*kgo.Record) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// Паника отдельной горутины проходит мимо любого defer вызывающего
+			// — в том числе мимо AllowRebalance, который обещан «хоть на
+			// панике», — и убивает процесс целиком. Ловится она поэтому здесь.
+			// prepare и finish ловят свои паники сами; сюда доходит то, что
+			// мимо них: await, offsets.Done и повторная паника в отложенной
+			// публикации самого finish. Партиция считается брошенной: её
+			// записи остаются непомеченными и потому незакоммиченными, а
+			// вызывающий перемотает её назад.
+			defer func() {
+				r := recover()
+				if r == nil {
+					return
+				}
+				s.log.Error("panic processing partition", slog.Any("panic", r),
+					slog.String("topic", group[0].Topic),
+					slog.Int("partition", int(group[0].Partition)))
+				abandoned.Store(true)
+			}()
 			if !s.runPartition(ctx, group, deadline) {
 				abandoned.Store(true)
 			}
@@ -327,12 +345,36 @@ func (s *Sink) pass(ctx context.Context, recs []*kgo.Record, deadline time.Time)
 	if len(recs) > s.maxInFlight {
 		recs = recs[:s.maxInFlight]
 	}
+	// Постановка ограничена бюджетом пачки, а не только отменой: SubmitAsync
+	// паркуется на очереди батчера, а очередь эта общая и заведомо переполняется
+	// — партиций много, у каждой свой maxInFlight. Пока TigerBeetle отвечает,
+	// очередь разбирается; как только он замолчал, батчер ретраит вечно, очередь
+	// не двигается, и постановка без дедлайна держала бы блокировку ребаланса
+	// сколь угодно долго. Исход уже поставленной команды от этого контекста не
+	// зависит — его ждёт await по общему бюджету.
+	enqueueCtx, cancelEnqueue := context.WithDeadline(ctx, deadline)
+	defer cancelEnqueue()
 	prep := make([]prepared, 0, len(recs))
 	for _, rec := range recs {
 		if ctx.Err() != nil || !time.Now().Before(deadline) {
 			break
 		}
-		prep = append(prep, s.prepare(ctx, rec))
+		p := s.prepare(enqueueCtx, rec)
+		if p.err != nil && enqueueCtx.Err() != nil && ctx.Err() == nil {
+			// Постановку оборвал наш собственный дедлайн: это исчерпанный
+			// бюджет пачки, а не сбой записи. Ошибку не поднимаем — ретраить
+			// её незачем, вызывающий бросит партицию и перемотает её.
+			break
+		}
+		prep = append(prep, p)
+		if p.err != nil {
+			// Постановка сорвалась. Следующие записи партиции ставить нельзя:
+			// они применились бы в TigerBeetle раньше упавшей, а упавшая — на
+			// повторе, то есть после них. Порядок применения внутри партиции
+			// обязан быть порядком офсетов, поэтому пробег останавливается
+			// здесь, а уже поставленный префикс собирается как обычно.
+			break
+		}
 	}
 	for i, p := range prep {
 		var res tbx.SubmitResult

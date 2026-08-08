@@ -195,6 +195,59 @@ func (b *blockingSubmitter) Calls() int {
 	return b.calls
 }
 
+// enqueueBlockingSubmitter паркуется на самой постановке и отпускает только по
+// отмене контекста: так выглядит батчер, чья очередь забита, потому что
+// TigerBeetle перестал отвечать и ретраи разбирают её вечно.
+type enqueueBlockingSubmitter struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (b *enqueueBlockingSubmitter) SubmitAsync(
+	ctx context.Context, _ *model.Command,
+) (<-chan tbx.SubmitResult, error) {
+	b.mu.Lock()
+	b.calls++
+	b.mu.Unlock()
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (b *enqueueBlockingSubmitter) Calls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.calls
+}
+
+// refusingSubmitter отказывает в постановке команде с перечисленным id и
+// записывает всё, что до него дошло: только по этому журналу видно, не уехала
+// ли следующая запись партиции в TigerBeetle раньше упавшей.
+type refusingSubmitter struct {
+	mu     sync.Mutex
+	refuse map[string]bool
+	order  []string
+}
+
+func (s *refusingSubmitter) SubmitAsync(_ context.Context, cmd *model.Command) (<-chan tbx.SubmitResult, error) {
+	id := cmd.IDs[0]
+	s.mu.Lock()
+	s.order = append(s.order, id)
+	refuse := s.refuse[id]
+	s.mu.Unlock()
+	if refuse {
+		return nil, errors.New("enqueue refused")
+	}
+	return result(tbx.SubmitResult{
+		Outcomes: []tbx.Outcome{{Index: 0, ID: id, Status: tbx.StatusOK}},
+	}), nil
+}
+
+func (s *refusingSubmitter) submitted() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.order...)
+}
+
 // cancellingSubmitter отвечает первым after записям сразу, а начиная со
 // следующей отменяет контекст и уходит в молчание — так выглядит SIGTERM
 // посреди опроса.
@@ -290,6 +343,20 @@ func (r *recordingEmitter) publishedFor(partition int32) []publication {
 	}
 	return out
 }
+
+// panicOnDLQEmitter паникует на каждой публикации в DLQ — в том числе на той,
+// которой finish отвечает на панику. Так паника выходит за пределы recover'ов
+// prepare и finish и добирается до самой горутины партиции.
+type panicOnDLQEmitter struct{}
+
+func (panicOnDLQEmitter) DLQ(context.Context, *kgo.Record, emitReason, string, string) error {
+	panic("dlq exploded")
+}
+func (panicOnDLQEmitter) Results(context.Context, *kgo.Record, []tbx.Outcome) error { return nil }
+func (panicOnDLQEmitter) Flush(context.Context) error                               { return nil }
+func (panicOnDLQEmitter) Close()                                                    {}
+
+var _ emitterIface = panicOnDLQEmitter{}
 
 // stubClient подменяет *kgo.Client в тех двух вызовах, которыми синк двигает
 // офсеты. Без него processBatch/commit/OnRevoked невозможно прогнать.
@@ -949,6 +1016,98 @@ func TestProcessBatchAbandonsWhileWaitingForOutcomes(t *testing.T) {
 		},
 	}, cl.setOffsets[0], "перематываются обе партиции, каждая со своей первой записи")
 	require.Zero(t, s.offsets.InFlight(), "брошенные партиции забыты")
+}
+
+// F1: бюджет обязан ограничивать и саму постановку. SubmitAsync паркуется на
+// очереди батчера, и очередь эту синк переполняет намеренно: партиций много, у
+// каждой свой maxInFlight. Пока TigerBeetle отвечает, очередь разбирается; как
+// только он замолчал, застрявшая постановка держала бы блокировку ребаланса
+// сколь угодно долго — а её лимит у группы 60s.
+func TestProcessBatchAbandonsWhenEnqueueBlocks(t *testing.T) {
+	sub := &enqueueBlockingSubmitter{}
+	em := &recordingEmitter{}
+	s := newSink(t, idDecoder{}, sub, em)
+	s.retryPeriod = time.Millisecond
+	s.batchBudget = 50 * time.Millisecond
+
+	records := []*kgo.Record{srcRec(0, 5), srcRec(0, 6)}
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		defer close(done)
+		s.processBatch(context.Background(), records)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("processBatch не вернулась — постановка не ограничена бюджетом пачки")
+	}
+
+	require.Less(t, time.Since(start), time.Second,
+		"постановка обязана сдаваться на бюджете, а не висеть")
+	require.Zero(t, em.resultsCount(), "ни одна запись не поставлена — публиковать нечего")
+	cl := clientOf(t, s)
+	require.Len(t, cl.setOffsets, 1, "брошенная пачка обязана перематываться")
+	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
+		"src": {0: {Epoch: -1, Offset: 5}},
+	}, cl.setOffsets[0])
+	require.Zero(t, s.offsets.InFlight(), "брошенная партиция забыта")
+}
+
+// F3: провал постановки обязан останавливать пробег партиции. Иначе офсеты
+// после упавшего уедут в TigerBeetle, а он — нет: ровно та инверсия порядка
+// применения, которую пробег обязан исключать.
+func TestProcessBatchStopsSubmittingAfterEnqueueFailure(t *testing.T) {
+	sub := &refusingSubmitter{refuse: map[string]bool{recID(0, 0): true}}
+	em := &recordingEmitter{}
+	s := newSink(t, idDecoder{}, sub, em)
+	s.retryPeriod = time.Millisecond
+	s.batchBudget = 50 * time.Millisecond
+
+	records := []*kgo.Record{srcRec(0, 0), srcRec(0, 1), srcRec(0, 2)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.processBatch(context.Background(), records)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("processBatch не вернулась")
+	}
+
+	submitted := sub.submitted()
+	require.NotEmpty(t, submitted, "упавшая запись обязана быть хотя бы попытана")
+	for _, id := range submitted {
+		require.Equal(t, recID(0, 0), id,
+			"после провала постановки ни одна следующая запись партиции не может попасть в батчер")
+	}
+	require.Zero(t, em.resultsCount(), "применённых записей не было")
+	require.Equal(t, int64(0), clientOf(t, s).setOffsets[0]["src"][0].Offset,
+		"перематывать нужно с упавшей записи")
+}
+
+// F4: паника в горутине партиции не имеет права уронить процесс. defer
+// AllowRebalance у вызывающего обещает сняться «хоть на панике», но паника в
+// отдельной горутине проходит мимо любого defer вызывающего — ловить её
+// приходится в самой горутине. Здесь паникует DLQ, в том числе та публикация,
+// которой finish отвечает на панику: recover'ы prepare и finish такое не ловят.
+func TestProcessBatchSurvivesPanicInPartitionGoroutine(t *testing.T) {
+	sub := &idSubmitter{ok: map[string]bool{}}
+	s := newSink(t, mixedDecoder{poison: map[string]bool{recID(0, 4): true}},
+		sub, panicOnDLQEmitter{})
+	s.retryPeriod = time.Millisecond
+	s.batchBudget = 50 * time.Millisecond
+
+	require.NotPanics(t, func() {
+		s.processBatch(context.Background(), []*kgo.Record{srcRec(0, 4)})
+	})
+
+	cl := clientOf(t, s)
+	require.Len(t, cl.setOffsets, 1, "партиция с паникой обязана перематываться")
+	require.Equal(t, int64(4), cl.setOffsets[0]["src"][0].Offset)
+	require.Zero(t, s.offsets.InFlight(), "брошенная партиция забыта")
+	require.Empty(t, s.offsets.Commitable(), "офсет записи с паникой не коммитится")
 }
 
 func TestCommitSkipsMarkCommittedOnTransportError(t *testing.T) {

@@ -120,6 +120,29 @@ func TestLoadDefaultsMaxInFlightPerPartition(t *testing.T) {
 	require.Equal(t, DefaultMaxInFlightPerPartition, cfg.Sink.MaxInFlightPerPartition)
 }
 
+// F2: a config written before sink.max_in_flight_per_partition existed may have
+// a batcher smaller than the default. Such a config must keep loading — the
+// default is clamped to the ceiling, not enforced against it. Failing here
+// would break every existing deployment with a small queue on upgrade.
+func TestLoadClampsDefaultMaxInFlightToCeiling(t *testing.T) {
+	body := replace(validCfg, "max_batch_size: 8189", "max_batch_size: 500")
+	body = replace(body, "  max_queue: 1000", "  max_queue: 100")
+	cfg, err := Load(writeCfg(t, body))
+	require.NoError(t, err)
+	require.Equal(t, 600, cfg.Sink.MaxInFlightPerPartition,
+		"дефолт прижимается к max_queue + max_batch_size")
+}
+
+// Прижимается именно дефолт: явно заданное значение выше потолка — ошибка
+// автора конфига, и молча уменьшать его нельзя.
+func TestLoadRejectsExplicitMaxInFlightAboveSmallCeiling(t *testing.T) {
+	body := replace(validCfg, "max_batch_size: 8189", "max_batch_size: 500")
+	body = replace(body, "  max_queue: 1000",
+		"  max_queue: 100\nsink:\n  max_in_flight_per_partition: 1000")
+	_, err := Load(writeCfg(t, body))
+	require.ErrorContains(t, err, "sink.max_in_flight_per_partition")
+}
+
 // The reachable ceiling is max_queue + max_batch_size, not max_queue: a job
 // dequeued into the batch under assembly frees its queue slot while its caller
 // stays parked for the whole TigerBeetle call. A bound above that can never be
