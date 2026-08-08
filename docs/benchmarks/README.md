@@ -24,61 +24,88 @@ To compare against a later commit: `./scripts/bench.sh && benchstat docs/benchma
 
 **Latest re-run:** [`523ffd3.txt`](./523ffd3.txt), same machine and same
 `./scripts/bench.sh` invocation, at commit `523ffd3` (after per-partition
-pipelining and async DLQ/results publication — see the three-way table
+pipelining and async DLQ/results publication — see the four-way table
 below). Every number here is within run-to-run noise of the `99ebf66`
 figures above (e.g. `BenchmarkDecodeJSON/n=1` median 2,024ns vs 1,990ns):
 none of the code these microbenchmarks cover (decode, amount/ID parsing,
 result mapping, batch assembly) changed in either perf commit, so an
 unchanged result here is the expected outcome, not a null result.
 
-## Sink throughput: baseline → pipelining → async publish
+**Latest re-run after batcher sharding:** [`173d712.txt`](./173d712.txt),
+same machine and invocation, at commit `173d712` (after batcher sharding —
+see the four-way table below). Again within run-to-run noise of both prior
+files (e.g. `BenchmarkDecodeJSON/n=1` ~2.02µs here too): none of the
+microbenchmarked code path changed in the sharding commits either.
 
-Three point-in-time measurements of the same code path (Kafka record in,
+## Sink throughput: baseline → pipelining → async publish → batcher sharding
+
+Four point-in-time measurements of the same code path (Kafka record in,
 TigerBeetle transfer applied, result published), each reproducing the prior
 run's method for comparability. Full detail and raw per-run numbers are in
 `.superpowers/sdd/perf-baseline.md`, `.superpowers/sdd/perf-after-pipelining.md`,
-and `.superpowers/sdd/perf-final.md`. **What's measured vs. estimated:** every
-number in this table comes from a real run against the same containerized
-Redpanda/TigerBeetle stack as the load scenarios below — none of it is
-extrapolated or scaled up from a smaller run. All three are single-machine,
-few-run measurements (1 run for the baseline, 2 for pipelining, 3-4 for the
-final column) — order-of-magnitude, not an SLA; see each linked doc for the
-per-run spread.
+`.superpowers/sdd/perf-final.md`, and `.superpowers/sdd/perf-sharded.md`.
+**What's measured vs. estimated:** every number in this table comes from a
+real run against the same containerized Redpanda/TigerBeetle stack as the
+load scenarios below — none of it is extrapolated or scaled up from a
+smaller run. All four are single-machine, few-run measurements (1 run for
+the baseline, 2 for pipelining, 3-4 for async publish, 2 for the headline
+sharding rows — the shards/max-in-flight/linger sweeps in `perf-sharded.md`
+are single runs per value and flagged there as noisy) — order-of-magnitude,
+not an SLA; see each linked doc for the per-run spread.
 
 **Hardware:** Apple M4 Pro, macOS, Docker via OrbStack, go1.26.3 darwin/arm64
-(same machine for all three). **Config held constant across all three runs:**
+(same machine for all four). **Config held constant across all four runs:**
 `batcher.linger=5ms`, `batcher.max_batch_size=8189`, `batcher.max_queue=1000`,
 1 partition unless noted. `sink.max_in_flight_per_partition` did not exist
-before pipelining; it defaulted to 1000 for the "after pipelining" and
-"final" columns.
+before pipelining; it defaulted to 1000 from the "after pipelining" column
+onward. `batcher.shards` did not exist before sharding; the sharding column
+uses the default (4) unless noted — see `perf-sharded.md` for the
+`shards=1/4/8/16` sweep.
 
-| Metric | Baseline (serial sink, pre-`ab2b47a`; no commit sha recorded in `perf-baseline.md`) | After pipelining (`ab2b47a`) | **Final (`523ffd3`, + async publish)** |
-|---|---|---|---|
-| Throughput, 1 partition (n=3,000) | 48.2 rec/sec | 4,494 rec/sec | **16,343 rec/sec** (avg of 3 runs) |
-| Per-record wall clock | 20.75 ms | 0.222 ms | **61.2 µs** |
-| Mean batch size TigerBeetle sees | 1.0000 | 750 | **428.7** |
-| p99 batch size | n/a (all batches = 1) | 1,000 (capped by `max_in_flight_per_partition`) | ~594 |
-| 12 vs 1 partition (n=1,500) | ~1.06x (no effect) | 2.20x (12p faster) | **~1.0x** (parity — no longer a lever, see below) |
-| Dominant cost | TigerBeetle round trip (51%) + linger wait (30%) | `emit.Results` synchronous `ProduceSync` (92%) | **TigerBeetle round trip (~55%), still serialized one batch at a time** |
+| Metric | Baseline (serial sink, pre-`ab2b47a`; no commit sha recorded in `perf-baseline.md`) | After pipelining (`ab2b47a`) | After async publish (`523ffd3`) | **After batcher sharding (`173d712`)** |
+|---|---|---|---|---|
+| Throughput, 1 partition (n=3,000) | 48.2 rec/sec | 4,494 rec/sec | 16,343 rec/sec (avg of 3 runs) | **16,459.5 rec/sec** (avg of 2 runs) |
+| Per-record wall clock | 20.75 ms | 0.222 ms | 61.2 µs | **60.7 µs** |
+| Mean batch size TigerBeetle sees | 1.0000 | 750 | 428.7 | **514.5** (avg of 2: 600.2 / 428.7 — see `perf-sharded.md` on why 428.7 recurs exactly) |
+| p99 batch size | n/a (all batches = 1) | 1,000 (capped by `max_in_flight_per_partition`) | ~594 | ~663-1,000 (2 runs) |
+| Throughput, 12 partitions (n=3,000 or 1,500) | ~1.06x vs 1p (no effect) | 2.20x vs 1p (12p faster) | ~1.03x vs 1p (parity) | **1.36x vs 1p** (12p faster again — avg 22,341.0 rec/sec) |
+| Dominant cost | TigerBeetle round trip (51%) + linger wait (30%) | `emit.Results` synchronous `ProduceSync` (92%) | TigerBeetle round trip (~55%), serialized one batch at a time | **TigerBeetle round trip, now split across up to `shards` (4) concurrent batches — see below** |
 
-Two results worth calling out because they reverse the previous column's
-conclusion rather than just extending it:
+Three results worth calling out because they reverse or qualify the previous
+column's conclusion rather than just extending it:
 
-- **Partition count stopped mattering.** Pipelining made partition count a
-  real throughput lever (2.20x at 12p) because the bottleneck at that point
-  (`emit.Results`) ran once per record on each partition's own goroutine, so
-  more partitions meant more concurrent produce calls. Async publication
-  moved the bottleneck to `tbx.Batcher`'s `CreateTransfers`, which keeps
-  exactly one in-flight batch *shared across all partitions* — so adding
-  partitions no longer adds independent throughput, and four repeat runs at
-  1 vs 12 partitions came back at 0.86x-1.11x, centered on parity.
-- **`sink.max_in_flight_per_partition` is still a real, measurable limiter**,
-  just a smaller one now: raising it from the default 1,000 to 8,000 gave
-  1.29x-1.45x more throughput (two runs), down from the 14.8x swing
-  pipelining found between 1,000 and a pathologically low value of 5. See
-  `perf-final.md` §4 for why the mechanism changed (it now bounds how many
-  records one `pass()` accepts before paying a per-pass publish-confirm
-  tail, not batch size directly — this run's batches never reached the cap).
+- **Partition count matters again, partially.** Pipelining made partition
+  count a real throughput lever (2.20x at 12p) because the bottleneck then
+  (`emit.Results`) ran once per record on each partition's own goroutine.
+  Async publication moved the bottleneck to `tbx.Batcher`'s single in-flight
+  `CreateTransfers` call *shared across all partitions*, flattening the ratio
+  to ~1.0x. Sharding gives partitions concurrent batcher workers to land on
+  again (up to `shards`, 4 by default) — the ratio moved to 1.36x, real but
+  well short of pipelining's 2.20x, because the default caps concurrency at 4
+  regardless of partition count and per-shard batches are smaller than the
+  single-worker case was (mean ~300-333 at 12p vs ~429-600 at 1p — see
+  `perf-sharded.md` §2).
+- **At 1 partition, sharding changes nothing — confirmed directly, not just
+  inferred.** All of one partition's records share one ordering key, so
+  `pickShard` always routes them to the same worker no matter how many
+  shards exist: a direct `shards=1` vs `shards=4` check at 1 partition came
+  back 12,982.3 vs 12,983.5 rec/sec, a 0.01% difference (`perf-sharded.md`
+  §3). This is the expected result of the routing design, not a null
+  finding.
+- **The `shards` sweep itself (1/4/8/16 at 12 partitions) did not produce a
+  clean ranking** in a single run per value — `shards=1` was actually
+  fastest in that run, ahead of the default `shards=4` (`perf-sharded.md`
+  §4). Batch size shrank monotonically with more shards, as expected, but
+  whether that nets out to more throughput at typical partition counts needs
+  a repeated, sustained-load sweep this report does not have. What can be
+  said without more data: shards beyond the number of distinct ordering keys
+  in flight (partitions, here 12) cannot help by construction — `hashShard`
+  has nothing to route to them.
+- **`sink.max_in_flight_per_partition` is still a real, measurable limiter.**
+  Raising it from the default 1,000 to 4,000 gave 1.47x more throughput at 1
+  partition (single run); 8,000 gave 1.38x, not further improvement over
+  4,000 — plausibly a plateau, but only one run each, so not strong evidence
+  either way (`perf-sharded.md` §7).
 
 ## End-to-end load scenarios
 
@@ -148,38 +175,53 @@ scenario, which was **not measured** here (see below).
   `-rate=0`, unlimited); it was smoke-tested separately (see loadgen
   correctness check).
 
-### `linger`: the smallest-value conclusion below is outdated — read this first
+### `linger`: re-run against current (pipelined + async-publish + sharded) code
 
-**Everything in this subsection was written against the original serial sink
-and is invalidated by the pipelining work.** It is kept verbatim below for
-the record, not as current guidance.
+The original analysis in the collapsed box at the end of this subsection was
+written against the serial sink, before pipelining, and is superseded by the
+re-run below — it is kept only for the historical record, not as current
+guidance.
 
-The serial sink (`internal/sink.Sink.processBatch` as it existed at the time)
-consumed and applied one Kafka record at a time: it called `Submit` and
-blocked on the outcome before moving to the next record. Because
-`tbx.Batcher.Submit` was only ever called once at a time from that loop, the
-batcher's linger window genuinely never had more than one job to coalesce
-across *separate Kafka messages* — the "smallest linger wins" conclusion
-followed correctly from that constraint. It does not follow anymore: the
-sink now pipelines up to `sink.max_in_flight_per_partition` records per
-partition (`internal/sink/sink.go`, `pass`), enqueuing them into the batcher
-in quick succession rather than one at a time, so linger *does* now coalesce
-across separate Kafka messages — `.superpowers/sdd/perf-final.md` measured a
-mean TigerBeetle batch size of **428.7** at the unchanged `linger: 5ms`
-default, which would be structurally impossible if linger still coalesced
-nothing.
+`.superpowers/sdd/perf-sharded.md` §5 re-ran the 1ms/5ms/50ms sweep against
+current code (1 partition, `shards=4`, `max_in_flight_per_partition=1000`,
+n=3,000, single run per value):
 
-**What linger value the current data argues for:** directionally, some
-non-minimal value — but this repo has not re-run the 1ms/5ms/50ms sweep
-below against the pipelined-plus-async-publish code, so there is no
-re-derived specific number to give here. `perf-final.md`'s closing section
-says this explicitly rather than guessing: raise it if throughput needs to
-improve further and the linger sweep below hasn't been redone, but treat
-`linger: 5ms` as merely "not yet shown to be wrong" rather than "confirmed
-optimal" until that sweep is repeated on current code.
+| `linger` | Throughput | Mean batch |
+|---|---|---|
+| 1ms | **22,281.0 rec/sec** | 428.7 |
+| 5ms (current default) | 16,701.4 rec/sec | 428.7 |
+| 50ms | 10,102.0 rec/sec | 750.2 |
+
+Clean and monotonic — 1.33x faster at 1ms than 5ms, 2.21x faster than 50ms —
+and mechanistically explained rather than just a numeric win: mean batch
+size is *identical* at 1ms and 5ms, so the extra 4ms of waiting bought zero
+additional coalescing in this run; the sink's own pipelined submission
+(records queuing up to `max_in_flight_per_partition` in quick succession)
+already saturates the batch the linger timer would have waited for, so a
+shorter timer just flushes the same-size batch sooner. Only at 50ms does the
+batch grow (750.2, pinned near the `max_in_flight_per_partition` cap), and
+even then the added coalescing doesn't pay for the wait: throughput is still
+worse than the 1ms row.
+
+**Recommendation: the data supports `linger: 1ms`** as a better default than
+the current `5ms`, for this workload shape. Two caveats before treating this
+as settled: each value was run once (not repeated), and the test produces
+its whole volume in one burst (`ProduceSync` of the full batch at once) —
+the best case for pipelined submission to saturate batches on its own. A
+slower, steadier arrival rate closer to real production traffic could
+plausibly still benefit from a longer linger, and this report has no data on
+that shape. **`configs/example.yaml` still defaults to `linger: 5ms` — this
+recommendation was not applied to the config as part of this measurement
+task.**
+
+The re-run above lands on the same 1ms-is-best conclusion as the original
+serial-sink analysis kept below, but for a different, now-verified
+mechanistic reason (pipelined submission saturating batches on its own,
+rather than the serial sink never having more than one job to coalesce) —
+see above, not the archival box below.
 
 <details>
-<summary>Original (now outdated) analysis, serial sink, pre-<code>ab2b47a</code></summary>
+<summary>Original (now superseded) analysis, serial sink, pre-<code>ab2b47a</code></summary>
 
 The sink (`internal/sink.Sink.processBatch`) consumes and applies one Kafka
 record at a time: it calls `Submit` and blocks on the outcome before moving

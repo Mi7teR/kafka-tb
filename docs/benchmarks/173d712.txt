@@ -1,0 +1,80 @@
+?   	github.com/Mi7teR/kafka-tb/cmd/kafkatb	[no test files]
+?   	github.com/Mi7teR/kafka-tb/cmd/loadgen	[no test files]
+?   	github.com/Mi7teR/kafka-tb/gen/kafkatb/v1	[no test files]
+PASS
+ok  	github.com/Mi7teR/kafka-tb/internal/api	0.592s
+?   	github.com/Mi7teR/kafka-tb/internal/codec	[no test files]
+goos: darwin
+goarch: arm64
+pkg: github.com/Mi7teR/kafka-tb/internal/codec/jsonc
+cpu: Apple M4 Pro
+BenchmarkDecodeJSON/n=1-12         	  591194	      2037 ns/op	 132.08 MB/s	    1848 B/op	      28 allocs/op
+BenchmarkDecodeJSON/n=1-12         	  580110	      2033 ns/op	 132.31 MB/s	    1848 B/op	      28 allocs/op
+BenchmarkDecodeJSON/n=1-12         	  584026	      2041 ns/op	 131.77 MB/s	    1848 B/op	      28 allocs/op
+BenchmarkDecodeJSON/n=1-12         	  588517	      2027 ns/op	 132.71 MB/s	    1848 B/op	      28 allocs/op
+BenchmarkDecodeJSON/n=1-12         	  607129	      2010 ns/op	 133.82 MB/s	    1848 B/op	      28 allocs/op
+BenchmarkDecodeJSON/n=1-12         	  592674	      2014 ns/op	 133.56 MB/s	    1848 B/op	      28 allocs/op
+BenchmarkDecodeJSON/n=10-12        	   75468	     15728 ns/op	 144.71 MB/s	   16624 B/op	     124 allocs/op
+BenchmarkDecodeJSON/n=10-12        	   76027	     15696 ns/op	 145.00 MB/s	   16624 B/op	     124 allocs/op
+BenchmarkDecodeJSON/n=10-12        	   76077	     15673 ns/op	 145.22 MB/s	   16624 B/op	     124 allocs/op
+BenchmarkDecodeJSON/n=10-12        	   76458	     15785 ns/op	 144.19 MB/s	   16624 B/op	     124 allocs/op
+BenchmarkDecodeJSON/n=10-12        	   75920	     15849 ns/op	 143.61 MB/s	   16624 B/op	     124 allocs/op
+BenchmarkDecodeJSON/n=10-12        	   75781	     15714 ns/op	 144.84 MB/s	   16624 B/op	     124 allocs/op
+BenchmarkDecodeJSON/n=100-12       	    8060	    148112 ns/op	 150.87 MB/s	  151776 B/op	    1030 allocs/op
+BenchmarkDecodeJSON/n=100-12       	    8028	    148313 ns/op	 150.67 MB/s	  151776 B/op	    1030 allocs/op
+BenchmarkDecodeJSON/n=100-12       	    8182	    148710 ns/op	 150.27 MB/s	  151776 B/op	    1030 allocs/op
+BenchmarkDecodeJSON/n=100-12       	    7894	    148542 ns/op	 150.44 MB/s	  151776 B/op	    1030 allocs/op
+BenchmarkDecodeJSON/n=100-12       	    7982	    148548 ns/op	 150.43 MB/s	  151776 B/op	    1030 allocs/op
+BenchmarkDecodeJSON/n=100-12       	    8108	    148622 ns/op	 150.35 MB/s	  151776 B/op	    1030 allocs/op
+PASS
+ok  	github.com/Mi7teR/kafka-tb/internal/codec/jsonc	23.825s
+PASS
+ok  	github.com/Mi7teR/kafka-tb/internal/config	0.375s
+PASS
+ok  	github.com/Mi7teR/kafka-tb/internal/emit	0.454s
+goos: darwin
+goarch: arm64
+pkg: github.com/Mi7teR/kafka-tb/internal/model
+cpu: Apple M4 Pro
+BenchmarkParseAmount-12     	12913861	        93.14 ns/op	      48 B/op	       3 allocs/op
+BenchmarkParseAmount-12     	12918453	        92.53 ns/op	      48 B/op	       3 allocs/op
+BenchmarkParseAmount-12     	12859272	        92.77 ns/op	      48 B/op	       3 allocs/op
+BenchmarkParseAmount-12     	12931405	        92.82 ns/op	      48 B/op	       3 allocs/op
+BenchmarkParseAmount-12     	12691400	        93.20 ns/op	      48 B/op	       3 allocs/op
+BenchmarkParseAmount-12     	12907857	        93.35 ns/op	      48 B/op	       3 allocs/op
+BenchmarkFormatAmount-12    	 6344019	       184.7 ns/op	     160 B/op	      11 allocs/op
+BenchmarkFormatAmount-12    	 6491787	       186.7 ns/op	     160 B/op	      11 allocs/op
+BenchmarkFormatAmount-12    	 6320168	       187.0 ns/op	     160 B/op	      11 allocs/op
+BenchmarkFormatAmount-12    	 6429732	       186.5 ns/op	     160 B/op	      11 allocs/op
+BenchmarkFormatAmount-12    	 6400528	       186.1 ns/op	     160 B/op	      11 allocs/op
+BenchmarkFormatAmount-12    	 6415099	       187.0 ns/op	     160 B/op	      11 allocs/op
+BenchmarkParseID-12         	90150156	        13.37 ns/op	       0 B/op	       0 allocs/op
+BenchmarkParseID-12         	91287727	        13.35 ns/op	       0 B/op	       0 allocs/op
+BenchmarkParseID-12         	90277605	        13.34 ns/op	       0 B/op	       0 allocs/op
+BenchmarkParseID-12         	90588256	        13.37 ns/op	       0 B/op	       0 allocs/op
+BenchmarkParseID-12         	89714319	        13.34 ns/op	       0 B/op	       0 allocs/op
+BenchmarkParseID-12         	89332520	        13.35 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/Mi7teR/kafka-tb/internal/model	24.752s
+PASS
+ok  	github.com/Mi7teR/kafka-tb/internal/obs	0.419s
+PASS
+ok  	github.com/Mi7teR/kafka-tb/internal/sink	0.423s
+goos: darwin
+goarch: arm64
+pkg: github.com/Mi7teR/kafka-tb/internal/tbx
+cpu: Apple M4 Pro
+BenchmarkMapResults-12         	   11302	    104563 ns/op	  526256 B/op	      83 allocs/op
+BenchmarkMapResults-12         	   10000	    104306 ns/op	  526256 B/op	      83 allocs/op
+BenchmarkMapResults-12         	   10000	    104927 ns/op	  526256 B/op	      83 allocs/op
+BenchmarkMapResults-12         	   10000	    104661 ns/op	  526256 B/op	      83 allocs/op
+BenchmarkMapResults-12         	   10000	    105488 ns/op	  526256 B/op	      83 allocs/op
+BenchmarkMapResults-12         	   10000	    104485 ns/op	  526256 B/op	      83 allocs/op
+BenchmarkBatcherAssemble-12    	   10000	    102702 ns/op	  320543 B/op	      10 allocs/op
+BenchmarkBatcherAssemble-12    	   11841	     98720 ns/op	  308765 B/op	       9 allocs/op
+BenchmarkBatcherAssemble-12    	   10000	    102412 ns/op	  313822 B/op	      10 allocs/op
+BenchmarkBatcherAssemble-12    	   11443	    100479 ns/op	  311881 B/op	       9 allocs/op
+BenchmarkBatcherAssemble-12    	   10000	    104548 ns/op	  319487 B/op	      10 allocs/op
+BenchmarkBatcherAssemble-12    	   10000	    102520 ns/op	  314873 B/op	      10 allocs/op
+PASS
+ok  	github.com/Mi7teR/kafka-tb/internal/tbx	16.069s
