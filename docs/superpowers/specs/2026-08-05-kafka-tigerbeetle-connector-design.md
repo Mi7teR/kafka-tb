@@ -277,7 +277,7 @@ tigerbeetle:
   addresses: ["3000", "3001", "3002"]
 batcher:
   max_batch_size: 8189
-  linger: 5ms
+  linger: 1ms
   max_queue: 50000
 kafka:
   brokers: ["localhost:9092"]

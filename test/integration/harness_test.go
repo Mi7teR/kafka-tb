@@ -151,7 +151,7 @@ func testConfig(t *testing.T, brokers []string, tbAddr string) *config.Config {
 		TigerBeetle: config.TigerBeetle{ClusterID: 0, Addresses: []string{tbAddr}},
 		Batcher: config.Batcher{
 			MaxBatchSize: config.MaxBatchSize,
-			Linger:       5 * time.Millisecond,
+			Linger:       1 * time.Millisecond,
 			MaxQueue:     1000,
 		},
 		Kafka: config.Kafka{

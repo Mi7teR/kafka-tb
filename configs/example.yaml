@@ -10,7 +10,15 @@ tigerbeetle:
 # Batching behaviour for TigerBeetle writes
 batcher:
   max_batch_size: 8189
-  linger: 5ms
+  # How long a worker waits for more commands before sending what it has.
+  # Measured, not guessed: at 1 partition the sweep is clean and monotonic —
+  # 1ms gives 22,281 rec/sec, 5ms 16,701, 50ms 10,102. Mean batch size is
+  # identical at 1ms and 5ms (428.7), so the coalescing does not come from the
+  # timer waiting at all; it comes from the sink submitting a partition's
+  # records pipelined, without awaiting each outcome, which keeps a batch
+  # filling while the previous one is in flight. A longer linger therefore buys
+  # no extra batching and only adds latency to the last command in the batch.
+  linger: 1ms
   # Queue depth of ONE worker, not of the batcher as a whole. The batcher runs
   # one worker per operation type — two — and a worker also holds up to
   # max_batch_size events in the batch it is assembling or sending, so the
