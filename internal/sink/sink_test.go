@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Mi7teR/kafka-tb/internal/codec"
+	"github.com/Mi7teR/kafka-tb/internal/emit"
 	"github.com/Mi7teR/kafka-tb/internal/model"
 	"github.com/Mi7teR/kafka-tb/internal/obs"
 	"github.com/Mi7teR/kafka-tb/internal/tbx"
@@ -285,6 +286,12 @@ type recordingEmitter struct {
 	published   []publication
 	failDLQ     error
 	failResults error
+	// failResultsAt проваливает публикацию results ровно у перечисленных
+	// офсетов: провал одной записи не имеет права утаскивать за собой пачку,
+	// и проверить это общим переключателем невозможно.
+	failResultsAt map[int64]error
+	// flushErr — то, чем отвечает Flush; коммит обязан на это реагировать.
+	flushErr error
 }
 
 type dlqCall struct {
@@ -298,30 +305,35 @@ type publication struct {
 	offset    int64
 }
 
-func (r *recordingEmitter) DLQ(_ context.Context, rec *kgo.Record, reason emitReason, errName, _ string) error {
+func (r *recordingEmitter) DLQ(
+	_ context.Context, rec *kgo.Record, reason emitReason, errName, _ string,
+) *emit.Publication {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.failDLQ != nil {
-		return r.failDLQ
+		return emit.Resolved(r.failDLQ)
 	}
 	r.dlq = append(r.dlq, dlqCall{reason: string(reason), errName: errName})
 	r.published = append(r.published,
 		publication{kind: "dlq", partition: rec.Partition, offset: rec.Offset})
-	return nil
+	return emit.Resolved(nil)
 }
 
-func (r *recordingEmitter) Results(_ context.Context, rec *kgo.Record, _ []tbx.Outcome) error {
+func (r *recordingEmitter) Results(_ context.Context, rec *kgo.Record, _ []tbx.Outcome) *emit.Publication {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.failResults != nil {
-		return r.failResults
+		return emit.Resolved(r.failResults)
+	}
+	if err, ok := r.failResultsAt[rec.Offset]; ok {
+		return emit.Resolved(err)
 	}
 	r.results++
 	r.published = append(r.published,
 		publication{kind: "results", partition: rec.Partition, offset: rec.Offset})
-	return nil
+	return emit.Resolved(nil)
 }
-func (r *recordingEmitter) Flush(context.Context) error { return nil }
+func (r *recordingEmitter) Flush(context.Context) error { return r.flushErr }
 func (r *recordingEmitter) Close()                      {}
 
 func (r *recordingEmitter) resultsCount() int {
@@ -349,14 +361,80 @@ func (r *recordingEmitter) publishedFor(partition int32) []publication {
 // prepare и finish и добирается до самой горутины партиции.
 type panicOnDLQEmitter struct{}
 
-func (panicOnDLQEmitter) DLQ(context.Context, *kgo.Record, emitReason, string, string) error {
+func (panicOnDLQEmitter) DLQ(context.Context, *kgo.Record, emitReason, string, string) *emit.Publication {
 	panic("dlq exploded")
 }
-func (panicOnDLQEmitter) Results(context.Context, *kgo.Record, []tbx.Outcome) error { return nil }
-func (panicOnDLQEmitter) Flush(context.Context) error                               { return nil }
-func (panicOnDLQEmitter) Close()                                                    {}
+func (panicOnDLQEmitter) Results(context.Context, *kgo.Record, []tbx.Outcome) *emit.Publication {
+	return emit.Resolved(nil)
+}
+func (panicOnDLQEmitter) Flush(context.Context) error { return nil }
+func (panicOnDLQEmitter) Close()                      {}
 
 var _ emitterIface = panicOnDLQEmitter{}
+
+// deferredEmitter публикует, не отвечая: обещания копятся, а завершает их
+// release — в любом порядке. Так выглядит настоящая асинхронная публикация, у
+// которой брокер отвечает позже и не обязательно в порядке выдачи. Без такого
+// стаба «Done только после подтверждения» проверить нечем: у уже готового
+// обещания подтверждение и выдача неразличимы.
+type deferredEmitter struct {
+	mu        sync.Mutex
+	published []publication
+	resolve   []func(error)
+	// rejectAt — офсеты, чью публикацию брокер отвергнет.
+	rejectAt map[int64]error
+}
+
+func (d *deferredEmitter) pend(kind string, rec *kgo.Record) *emit.Publication {
+	p, resolve := emit.NewPending()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.published = append(d.published,
+		publication{kind: kind, partition: rec.Partition, offset: rec.Offset})
+	err := d.rejectAt[rec.Offset]
+	d.resolve = append(d.resolve, func(error) { resolve(err) })
+	return p
+}
+
+func (d *deferredEmitter) DLQ(
+	_ context.Context, rec *kgo.Record, _ emitReason, _, _ string,
+) *emit.Publication {
+	return d.pend("dlq", rec)
+}
+
+func (d *deferredEmitter) Results(_ context.Context, rec *kgo.Record, _ []tbx.Outcome) *emit.Publication {
+	return d.pend("results", rec)
+}
+func (d *deferredEmitter) Flush(context.Context) error { return nil }
+func (d *deferredEmitter) Close()                      {}
+
+// releaseAll завершает все накопленные обещания в обратном порядке выдачи:
+// порядок ответов брокера не обязан совпадать с порядком публикации, и синк
+// обязан оставаться корректным именно при таком расхождении.
+func (d *deferredEmitter) releaseAll() int {
+	d.mu.Lock()
+	pending := d.resolve
+	d.resolve = nil
+	d.mu.Unlock()
+	for i := len(pending) - 1; i >= 0; i-- {
+		pending[i](nil)
+	}
+	return len(pending)
+}
+
+func (d *deferredEmitter) publishedFor(partition int32) []publication {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out []publication
+	for _, p := range d.published {
+		if p.partition == partition {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+var _ emitterIface = (*deferredEmitter)(nil)
 
 // stubClient подменяет *kgo.Client в тех двух вызовах, которыми синк двигает
 // офсеты. Без него processBatch/commit/OnRevoked невозможно прогнать.
@@ -1108,6 +1186,192 @@ func TestProcessBatchSurvivesPanicInPartitionGoroutine(t *testing.T) {
 	require.Equal(t, int64(4), cl.setOffsets[0]["src"][0].Offset)
 	require.Zero(t, s.offsets.InFlight(), "брошенная партиция забыта")
 	require.Empty(t, s.offsets.Commitable(), "офсет записи с паникой не коммитится")
+}
+
+// T16: публикация теперь асинхронна, и весь контракт «офсет только после ack»
+// держится на том, что Done наступает строго после подтверждения. Пока брокер
+// молчит, запись обязана оставаться незавершённой — иначе «подтверждено»
+// подменяется на «отдано в буфер», а потерянный DLQ платежа не заметит никто.
+func TestRecordIsNotDoneUntilPublicationIsAcknowledged(t *testing.T) {
+	em := &deferredEmitter{}
+	sub := &stubSubmitter{outcomes: []tbx.Outcome{{Index: 0, ID: "id-0", Status: tbx.StatusOK}}}
+	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
+
+	rec := srcRec(0, 0)
+	s.offsets.Track(rec)
+
+	type passResult struct {
+		applied int
+		err     error
+	}
+	done := make(chan passResult, 1)
+	go func() {
+		applied, err := s.pass(context.Background(), []*kgo.Record{rec}, time.Now().Add(time.Minute))
+		done <- passResult{applied, err}
+	}()
+
+	// Публикация выдана, но не подтверждена: pass обязана висеть, а запись —
+	// оставаться в полёте и не попадать в коммит.
+	require.Eventually(t, func() bool { return len(em.publishedFor(0)) == 1 }, time.Second, time.Millisecond,
+		"публикация обязана выдаваться, не дожидаясь брокера")
+	select {
+	case r := <-done:
+		t.Fatalf("pass завершилась до подтверждения публикации: %+v", r)
+	case <-time.After(50 * time.Millisecond):
+	}
+	require.Equal(t, 1, s.offsets.InFlight(), "неподтверждённая запись не может быть Done")
+	require.Empty(t, s.offsets.Commitable(), "неподтверждённый офсет не имеет права коммититься")
+
+	require.Equal(t, 1, em.releaseAll())
+
+	r := <-done
+	require.NoError(t, r.err)
+	require.Equal(t, 1, r.applied)
+	require.Zero(t, s.offsets.InFlight())
+	require.Equal(t, int64(1), s.offsets.Commitable()["src"][0].Offset,
+		"подтверждённая запись обязана стать коммитабельной")
+}
+
+// T16: провал публикации в results — инфраструктурный класс. Запись не
+// помечается Done, а её партиция уходит в откат существующим путём: молча
+// потерять её нельзя.
+func TestProcessBatchResultsPublicationFailureRewindsPartition(t *testing.T) {
+	em := &recordingEmitter{failResultsAt: map[int64]error{0: errors.New("results topic down")}}
+	sub := &idSubmitter{ok: map[string]bool{recID(0, 0): true, recID(0, 1): true}}
+	s := newSink(t, idDecoder{}, sub, em)
+	s.retryPeriod = time.Millisecond
+	s.batchBudget = 50 * time.Millisecond
+
+	records := []*kgo.Record{srcRec(0, 0), srcRec(0, 1)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.processBatch(context.Background(), records)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("processBatch не вернулась")
+	}
+
+	cl := clientOf(t, s)
+	require.Len(t, cl.setOffsets, 1, "партиция с непрошедшей публикацией обязана перематываться")
+	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
+		"src": {0: {Epoch: -1, Offset: 0}},
+	}, cl.setOffsets[0], "перематывать нужно с записи, чья публикация не подтверждена")
+	require.Empty(t, s.offsets.Commitable(), "офсет неопубликованной записи не коммитится")
+	require.Zero(t, s.offsets.InFlight())
+}
+
+// T16: провал публикации одной записи не имеет права утаскивать за собой
+// подтверждения соседей. Записи до упавшей подтверждены и помечены Done;
+// откат начинается ровно с упавшей.
+func TestProcessBatchOneFailedPublicationLeavesEarlierOnesConfirmed(t *testing.T) {
+	em := &recordingEmitter{failResultsAt: map[int64]error{2: errors.New("results topic down")}}
+	ok := map[string]bool{}
+	records := make([]*kgo.Record, 4)
+	for i := range records {
+		records[i] = srcRec(0, int64(i))
+		ok[recID(0, int64(i))] = true
+	}
+	sub := &idSubmitter{ok: ok}
+	s := newSink(t, idDecoder{}, sub, em)
+	s.retryPeriod = time.Millisecond
+	s.batchBudget = 50 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.processBatch(context.Background(), records)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("processBatch не вернулась")
+	}
+
+	cl := clientOf(t, s)
+	require.Len(t, cl.setOffsets, 1)
+	require.Equal(t, map[string]map[int32]kgo.EpochOffset{
+		"src": {0: {Epoch: 3, Offset: 2}},
+	}, cl.setOffsets[0],
+		"офсеты 0 и 1 подтверждены и помечены Done, несмотря на провал офсета 2")
+}
+
+// T16: подтверждения приходят не в том порядке, в каком публикации выданы, —
+// и это ничего не меняет. Порядок публикации внутри партиции обязан оставаться
+// порядком офсетов, а Done — наступать по тому же порядку.
+func TestProcessBatchPublicationOrderFollowsOffsetsWithOutOfOrderAcks(t *testing.T) {
+	const (
+		parts = 3
+		perP  = 40
+	)
+	em := &deferredEmitter{}
+	sub := &idSubmitter{ok: make(map[string]bool, parts*perP)}
+	var records []*kgo.Record
+	for p := range int32(parts) {
+		for o := range int64(perP) {
+			records = append(records, srcRec(p, o))
+			sub.ok[recID(p, o)] = true
+		}
+	}
+	s := newSink(t, idDecoder{}, sub, em)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.processBatch(context.Background(), records)
+	}()
+
+	// Подтверждения выдаются пачками и в обратном порядке — так брокер и
+	// отвечает: порядок ответов не совпадает с порядком выдачи.
+	released := 0
+	deadline := time.After(30 * time.Second)
+	for released < parts*perP {
+		select {
+		case <-done:
+			released = parts * perP
+		case <-deadline:
+			t.Fatal("processBatch не вернулась — подтверждения не разбираются")
+		case <-time.After(time.Millisecond):
+			released += em.releaseAll()
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("processBatch не вернулась")
+	}
+
+	for p := range int32(parts) {
+		want := make([]publication, perP)
+		for o := range int64(perP) {
+			want[o] = publication{kind: "results", partition: p, offset: o}
+		}
+		require.Equal(t, want, em.publishedFor(p),
+			"публикация партиции %d обязана идти по офсетам", p)
+		require.Equal(t, int64(perP), s.offsets.Commitable()["src"][p].Offset,
+			"партиция %d обязана дойти до конца", p)
+	}
+	require.Zero(t, s.offsets.InFlight())
+}
+
+// T16: Flush перед коммитом обязан учитывать ошибки, а не только опустошение
+// буфера. Провал Flush означает, что какая-то публикация не подтверждена —
+// коммитить после него нельзя ничего.
+func TestCommitSkipsCommitWhenFlushFails(t *testing.T) {
+	em := &recordingEmitter{flushErr: errors.New("producer flush failed")}
+	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, &stubSubmitter{}, em)
+
+	rec := srcRec(0, 0)
+	s.offsets.Track(rec)
+	s.offsets.Done(rec)
+	s.commit(context.Background(), slog.LevelError)
+
+	cl := clientOf(t, s)
+	require.Empty(t, cl.committed, "провалившийся Flush обязан остановить коммит")
+	require.Equal(t, int64(1), s.offsets.Commitable()["src"][0].Offset,
+		"незакоммиченный офсет обязан остаться коммитабельным")
 }
 
 func TestCommitSkipsMarkCommittedOnTransportError(t *testing.T) {

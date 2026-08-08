@@ -36,12 +36,6 @@ const (
 	defaultBatchBudget = 30 * time.Second
 )
 
-// errHandleContract stands in for finish returning done=false with no error.
-// Sending a record on without either an outcome or a failure would pin its
-// partition's watermark forever, so it is treated as an infrastructure fault
-// and retried like one.
-var errHandleContract = errors.New("record finished with neither an outcome nor an error")
-
 // Submitter — то, что умеет применять команду. В проде это *tbx.Batcher.
 // Постановка не ждёт исход: ровно один SubmitResult приходит в возвращённый
 // канал, и именно это позволяет держать в батчере больше одной команды сразу.
@@ -329,18 +323,25 @@ func (s *Sink) abandonOnShutdown(rec *kgo.Record) bool {
 	return false
 }
 
-// pass ставит в батчер префикс recs, ни на один исход не дожидаясь, и только
-// потом собирает исходы в том же порядке, публикуя и помечая каждый по мере
-// прихода. Порядок постановки — это порядок применения в TigerBeetle, порядок
-// сбора — порядок публикации в results и DLQ; оба совпадают с порядком офсетов
-// партиции. Poison сюда тоже попадает: в батчер он не идёт, но его DLQ
-// откладывается до фазы сбора, иначе публикация партиции перестала бы быть
-// последовательной.
+// pass ставит в батчер префикс recs, ни на один исход не дожидаясь, потом
+// собирает исходы в том же порядке, выдавая брокеру публикации, и только
+// третьей фазой дожидается подтверждения этих публикаций и помечает записи
+// Done. Порядок постановки — это порядок применения в TigerBeetle, порядок
+// выдачи публикаций — порядок записей в results и DLQ; оба совпадают с
+// порядком офсетов партиции. Poison сюда тоже попадает: в батчер он не идёт,
+// но его DLQ откладывается до фазы сбора, иначе публикация партиции перестала
+// бы быть последовательной.
 //
-// Возвращает число ведущих записей, доведённых до окончательного исхода, и
-// инфраструктурную ошибку, которая это остановила: ошибка принадлежит
-// recs[applied]. Короткий возврат без ошибки означает, что кончился бюджет
-// пачки или процесс уходит — остальные записи остаются непомеченными.
+// Три фазы, а не две, именно ради подтверждения: дожидаться брокера сразу
+// после выдачи значило бы платить round-trip на запись — ровно то, что
+// пайплайнинг уже убрал у TigerBeetle. Выданные публикации летят параллельно,
+// поэтому общая фаза ожидания стоит максимума, а не суммы.
+//
+// Возвращает число ведущих записей, доведённых до окончательного исхода и
+// подтверждённых брокером, и инфраструктурную ошибку, которая это остановила:
+// ошибка принадлежит recs[applied]. Короткий возврат без ошибки означает, что
+// кончился бюджет пачки или процесс уходит — остальные записи остаются
+// непомеченными.
 func (s *Sink) pass(ctx context.Context, recs []*kgo.Record, deadline time.Time) (int, error) {
 	if len(recs) > s.maxInFlight {
 		recs = recs[:s.maxInFlight]
@@ -376,32 +377,99 @@ func (s *Sink) pass(ctx context.Context, recs []*kgo.Record, deadline time.Time)
 			break
 		}
 	}
+	// issued — публикации записей в порядке офсетов; issued[i] принадлежит
+	// recs[i]. Собираются, а не дожидаются на месте: см. комментарий выше.
+	issued := make([]issuedPubs, 0, len(prep))
+	var failErr error
 	for i, p := range prep {
 		var res tbx.SubmitResult
 		if p.ch != nil {
 			var ok bool
 			if res, ok = s.await(ctx, p.ch, deadline); !ok {
-				return i, nil
+				// Бюджет пачки или отмена: остальные записи не публикуются
+				// вовсе, а уже выданные всё равно обязаны быть подтверждены
+				// ниже — иначе их офсеты нельзя двигать.
+				break
 			}
 		}
-		done, err := s.finish(ctx, recs[i], p, res)
-		if err == nil && !done {
-			// Контракт finish: (false, nil) значить не должно ничего — каждая
-			// ветка отдаёт либо (true, nil), либо (_, err). Сегодня
-			// недостижимо, но молча продвинуться дальше здесь значило бы
-			// навсегда пришпилить ватермарк этой партиции: офсет остался бы в
-			// pending, а Commitable никогда не увидит его завершённым.
-			s.log.Error("handle contract violation: done=false with no error, retrying",
-				slog.String("topic", recs[i].Topic), slog.Int("partition", int(recs[i].Partition)),
-				slog.Int64("offset", recs[i].Offset))
-			err = errHandleContract
-		}
+		pub, err := s.finish(ctx, recs[i], p, res)
 		if err != nil {
+			// Ошибка принадлежит recs[i], но объявить её можно только после
+			// того, как подтвердятся публикации записей до неё: pass обязана
+			// вернуть индекс первой незавершённой записи, а ей может
+			// оказаться и более ранняя, чья публикация не доехала.
+			failErr = err
+			break
+		}
+		issued = append(issued, pub)
+	}
+
+	applied, err := s.confirm(ctx, recs, issued, deadline)
+	if err != nil || applied < len(issued) {
+		return applied, err
+	}
+	return applied, failErr
+}
+
+// confirm дожидается подтверждения выданных публикаций в порядке офсетов и
+// помечает Done ровно тот ведущий префикс записей, чьи публикации брокер
+// подтвердил. Запись, чья публикация не подтверждена, Done не становится ни
+// при каких обстоятельствах: её офсет не закоммитится, партицию перемотают, и
+// запись обработается заново — потерять её в DLQ нельзя.
+//
+// Ожидание ограничено бюджетом пачки: franz-go ретраит публикацию до победного,
+// и без дедлайна молчащий брокер держал бы блокировку ребаланса сколь угодно
+// долго.
+func (s *Sink) confirm(
+	ctx context.Context, recs []*kgo.Record, issued []issuedPubs, deadline time.Time,
+) (int, error) {
+	if len(issued) == 0 {
+		return 0, nil
+	}
+	waitCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	for i, pub := range issued {
+		for _, p := range pub.pubs {
+			err := p.Wait(waitCtx)
+			if err == nil {
+				continue
+			}
+			if waitCtx.Err() != nil && errors.Is(err, waitCtx.Err()) {
+				// Ответа не дождались: бюджет пачки кончился или процесс
+				// уходит. Сбоем записи это не является — ретраить нечего,
+				// партицию перемотают целиком. Сверка с самой ошибкой
+				// обязательна: настоящий отказ брокера, пришедший ровно на
+				// истёкшем дедлайне, обязан быть виден как отказ, а не
+				// потеряться в общем «не дождались».
+				return i, nil
+			}
+			s.metrics.IncRecords("blocked")
 			return i, err
 		}
+		// Считается здесь, а не при выдаче публикации: до подтверждения
+		// обработка записи не окончательна — она ещё может уехать на повтор,
+		// и тогда ok/rejected посчитались бы дважды.
+		s.count(pub)
 		s.offsets.Done(recs[i])
 	}
-	return len(prep), nil
+	return len(issued), nil
+}
+
+// count фиксирует окончательный исход подтверждённой записи.
+func (s *Sink) count(pub issuedPubs) {
+	if pub.poison != "" {
+		s.metrics.IncRecords("poison")
+		s.metrics.IncDLQ(string(emit.ReasonPoison), pub.poison)
+		return
+	}
+	for _, o := range pub.outcomes {
+		if o.Status == tbx.StatusRejected {
+			s.metrics.IncDLQ(string(emit.ReasonReject), o.Error)
+		}
+	}
+	for _, o := range pub.outcomes {
+		s.metrics.IncRecords(string(o.Status))
+	}
 }
 
 // await ждёт исход одной команды. Возвращает false, если ждать перестали —
@@ -513,12 +581,26 @@ func (s *Sink) prepare(ctx context.Context, rec *kgo.Record) (p prepared) {
 	return prepared{ch: ch}
 }
 
-// finish публикует исход записи и возвращает (true, nil), если её офсет можно
-// коммитить. Ошибка означает инфраструктурную проблему: офсет остаётся на
-// месте, запись будет обработана снова.
+// issuedPubs — публикации одной записи, выданные брокеру, но ещё не
+// подтверждённые, вместе с тем, что нужно посчитать, когда они подтвердятся.
+// Пустой pubs невозможен: у каждой дошедшей до публикации записи есть либо
+// results, либо DLQ.
+type issuedPubs struct {
+	pubs []*emit.Publication
+	// poison называет ошибку для DLQ записи, которая никогда не применится.
+	// Пусто, если запись дошла до TigerBeetle.
+	poison string
+	// outcomes — исходы применённой команды; nil у poison.
+	outcomes []tbx.Outcome
+}
+
+// finish выдаёт брокеру публикации записи, не дожидаясь подтверждения, и
+// возвращает их. Ошибка означает инфраструктурную проблему до публикации:
+// офсет остаётся на месте, запись будет обработана снова. Отсутствие ошибки
+// ещё не значит, что офсет можно двигать, — это решает confirm.
 func (s *Sink) finish(
 	ctx context.Context, rec *kgo.Record, p prepared, res tbx.SubmitResult,
-) (done bool, err error) {
+) (pub issuedPubs, err error) {
 	defer func() {
 		r := recover()
 		if r == nil {
@@ -527,65 +609,47 @@ func (s *Sink) finish(
 		// Паника — дефект в обработке этого сообщения, а не всего потока.
 		s.log.Error("panic handling record", slog.Any("panic", r),
 			slog.String("topic", rec.Topic), slog.Int64("offset", rec.Offset))
-		done, err = s.emitPoison(ctx, rec, "panic", fmt.Sprint(r))
+		pub, err = s.emitPoison(ctx, rec, "panic", fmt.Sprint(r)), nil
 	}()
 
 	if p.poison != "" {
-		return s.emitPoison(ctx, rec, p.poison, p.detail)
+		return s.emitPoison(ctx, rec, p.poison, p.detail), nil
 	}
 	if p.err != nil {
 		s.metrics.IncRecords("blocked")
-		return false, p.err
+		return issuedPubs{}, p.err
 	}
 	if res.Err != nil {
 		// Настоящий батчер отказывает слишком большой команде прямо на
 		// постановке, но Submitter вправе сообщить это и исходом; трактуем
 		// одинаково, откуда бы ни пришло.
 		if errors.Is(res.Err, tbx.ErrCommandTooLarge) {
-			return s.emitPoison(ctx, rec, "command_too_large", res.Err.Error())
+			return s.emitPoison(ctx, rec, "command_too_large", res.Err.Error()), nil
 		}
 		s.metrics.IncRecords("blocked")
-		return false, res.Err
+		return issuedPubs{}, res.Err
 	}
 
-	// RecordsTotal is counted here, once the record's handling is actually
-	// final, not right after the outcome arrives: Results and the reject-DLQ
-	// loop below can still fail and send this same record back through
-	// runPartition for a retry. Counting ok/rejected before they succeed would
-	// double-count on that retry and never show the intervening failure as
-	// blocked.
-	if e := s.em.Results(ctx, rec, res.Outcomes); e != nil {
-		s.metrics.IncRecords("blocked")
-		return false, e
-	}
+	pubs := make([]*emit.Publication, 0, 1+len(res.Outcomes))
+	pubs = append(pubs, s.em.Results(ctx, rec, res.Outcomes))
 	for _, o := range res.Outcomes {
 		if o.Status != tbx.StatusRejected {
 			continue
 		}
 		detail := fmt.Sprintf("event %d (id %s): %s", o.Index, o.ID, o.Error)
-		if e := s.em.DLQ(ctx, rec, emit.ReasonReject, o.Error, detail); e != nil {
-			s.metrics.IncRecords("blocked")
-			return false, e
-		}
-		s.metrics.IncDLQ(string(emit.ReasonReject), o.Error)
+		pubs = append(pubs, s.em.DLQ(ctx, rec, emit.ReasonReject, o.Error, detail))
 	}
-	for _, o := range res.Outcomes {
-		s.metrics.IncRecords(string(o.Status))
-	}
-	return true, nil
+	return issuedPubs{pubs: pubs, outcomes: res.Outcomes}, nil
 }
 
-// emitPoison публикует запись, которая никогда не будет применена, и говорит,
-// можно ли двигать её офсет: (true, nil) — только после подтверждённой записи
-// в DLQ, иначе (false, err).
-func (s *Sink) emitPoison(ctx context.Context, rec *kgo.Record, errName, detail string) (bool, error) {
-	if e := s.em.DLQ(ctx, rec, emit.ReasonPoison, errName, detail); e != nil {
-		s.metrics.IncRecords("blocked")
-		return false, e
+// emitPoison выдаёт брокеру запись, которая никогда не будет применена.
+// Двигать её офсет можно только после того, как confirm дождётся подтверждения
+// этой публикации.
+func (s *Sink) emitPoison(ctx context.Context, rec *kgo.Record, errName, detail string) issuedPubs {
+	return issuedPubs{
+		pubs:   []*emit.Publication{s.em.DLQ(ctx, rec, emit.ReasonPoison, errName, detail)},
+		poison: errName,
 	}
-	s.metrics.IncRecords("poison")
-	s.metrics.IncDLQ(string(emit.ReasonPoison), errName)
-	return true, nil
 }
 
 // commit отдаёт брокеру непрерывный префикс обработанных офсетов.
