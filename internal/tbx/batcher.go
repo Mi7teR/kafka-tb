@@ -25,12 +25,14 @@ const linkedBit uint16 = 1
 
 type job struct {
 	cmd  *model.Command
-	done chan submitResult
+	done chan SubmitResult
 }
 
-type submitResult struct {
-	outcomes []Outcome
-	err      error
+// SubmitResult — исход одной команды: либо исходы всех её событий, либо ошибка.
+// Ровно один такой результат приходит на каждую поставленную в очередь команду.
+type SubmitResult struct {
+	Outcomes []Outcome
+	Err      error
 }
 
 // Batcher — единственная дверь в TigerBeetle.
@@ -97,16 +99,24 @@ func (b *Batcher) Start(ctx context.Context) {
 	go func() { b.wg.Wait(); b.signalFinished() }()
 }
 
-// Submit ставит команду в очередь и ждёт исход.
-// Блокировка при полной очереди — это backpressure для консьюмера.
-func (b *Batcher) Submit(ctx context.Context, cmd *model.Command) ([]Outcome, error) {
+// SubmitAsync ставит команду в очередь и сразу возвращает канал, в который
+// придёт ровно один исход. Ошибка возвращается только на самой постановке:
+// пустая или слишком большая команда, остановленный батчер, отменённый контекст.
+// Всё, что случилось после постановки, приходит в канал, а не в эту ошибку.
+//
+// Блокировка при полной очереди сохранена — это backpressure для консьюмера:
+// без него синк поставит в очередь весь опрос и съест память.
+//
+// Канал буферизован на единицу, и писатель у него ровно один, поэтому
+// вызывающий, бросивший канал не прочитав, никого не блокирует.
+func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan SubmitResult, error) {
 	if cmd.Len() == 0 {
 		return nil, errors.New("empty command")
 	}
 	if cmd.Len() > b.cfg.MaxBatchSize {
 		return nil, ErrCommandTooLarge
 	}
-	j := &job{cmd: cmd, done: make(chan submitResult, 1)}
+	j := &job{cmd: cmd, done: make(chan SubmitResult, 1)}
 	queue := b.transfers
 	if cmd.Op == model.OpCreateAccounts {
 		queue = b.accounts
@@ -130,9 +140,53 @@ func (b *Batcher) Submit(ctx context.Context, cmd *model.Command) ([]Outcome, er
 	case queue <- j:
 	}
 
+	// Ожидание исхода живёт здесь, а не у вызывающего: держатель канала знает
+	// только его и не может сам выяснить, что отвечать уже некому. Отдать ему
+	// голый j.done значило бы молчание вместо ErrClosed для команды, которую
+	// не увидел ни один цикл, — для синка это потерянное сообщение.
+	out := make(chan SubmitResult, 1)
+	go func() {
+		select {
+		case res := <-j.done:
+			out <- res
+		case <-b.finished:
+			// Здесь ждём именно finished, а не stop. stop означает лишь «начали
+			// останавливаться»: батч этой команды может быть уже в TigerBeetle и
+			// вот-вот вернуть исход. Ответить в этот момент ErrClosed — соврать
+			// про применённую работу; вызывающий не обязан повторять запрос с
+			// тем же id и восстановить правду ему неоткуда.
+			// finished же закрывается после выхода обоих циклов, то есть когда
+			// ответить этой команде уже некому.
+			//
+			// Гонка «исход доставлен ровно в момент выхода циклов» реальна:
+			// оба канала готовы, и select выбрал бы случайно. Приоритет исхода
+			// восстанавливаем явной непустой проверкой.
+			select {
+			case res := <-j.done:
+				out <- res
+			default:
+				// Команда попала в очередь так поздно, что ни один цикл её не
+				// увидел. Отвечаем ошибкой, а не молчим; дальше расчёт на
+				// идемпотентность по id — повтор даёт TransferExists/
+				// AccountExists, а MapTransferResults/MapAccountResults
+				// трактуют их как StatusOK.
+				out <- SubmitResult{Err: ErrClosed}
+			}
+		}
+	}()
+	return out, nil
+}
+
+// Submit ставит команду в очередь и ждёт исход.
+// Блокировка при полной очереди — это backpressure для консьюмера.
+func (b *Batcher) Submit(ctx context.Context, cmd *model.Command) ([]Outcome, error) {
+	done, err := b.SubmitAsync(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
 	select {
-	case res := <-j.done:
-		return res.outcomes, res.err
+	case res := <-done:
+		return res.Outcomes, res.Err
 	case <-ctx.Done():
 		// Команда уже в очереди и может дойти до TigerBeetle после этого
 		// возврата: отменить её отсюда нельзя. Вызывающий (Kafka-синк) увидит
@@ -142,27 +196,6 @@ func (b *Batcher) Submit(ctx context.Context, cmd *model.Command) ([]Outcome, er
 		// трактуют их как StatusOK. Это работает только потому, что id
 		// приходят от вызывающего и стабильны между попытками.
 		return nil, ctx.Err()
-	case <-b.finished:
-		// Здесь ждём именно finished, а не stop. stop означает лишь «начали
-		// останавливаться»: батч этой команды может быть уже в TigerBeetle и
-		// вот-вот вернуть исход. Ответить в этот момент ErrClosed — соврать
-		// про применённую работу; для синхронного API это неисправимо, его
-		// клиент не обязан повторять запрос с тем же id.
-		// finished же закрывается после выхода обоих циклов, то есть когда
-		// ответить этой команде уже некому.
-		//
-		// Гонка «исход доставлен ровно в момент выхода циклов» реальна:
-		// оба канала готовы, и select выбрал бы случайно. Приоритет исхода
-		// восстанавливаем явной непустой проверкой.
-		select {
-		case res := <-j.done:
-			return res.outcomes, res.err
-		default:
-		}
-		// Команда попала в очередь так поздно, что ни один цикл её не увидел.
-		// Отвечаем ошибкой, а не виснем; дальше — тот же расчёт на
-		// идемпотентность по id, что и в ветке ctx.Done() выше.
-		return nil, ErrClosed
 	}
 }
 
@@ -253,7 +286,7 @@ func (b *Batcher) drain(queue chan *job, err error) {
 	for {
 		select {
 		case j := <-queue:
-			j.done <- submitResult{err: err}
+			j.done <- SubmitResult{Err: err}
 		default:
 			return
 		}
@@ -262,7 +295,7 @@ func (b *Batcher) drain(queue chan *job, err error) {
 
 func (b *Batcher) failAll(jobs []*job, err error) {
 	for _, j := range jobs {
-		j.done <- submitResult{err: err}
+		j.done <- SubmitResult{Err: err}
 	}
 }
 
@@ -286,7 +319,7 @@ func (b *Batcher) sendTransfers(jobs []*job) error {
 	typed, _ := results.([]types.CreateTransferResult)
 	for i, j := range jobs {
 		outcomes, mapErr := MapTransferResults(j.cmd, typed, offsets[i], len(events))
-		j.done <- submitResult{outcomes: outcomes, err: mapErr}
+		j.done <- SubmitResult{Outcomes: outcomes, Err: mapErr}
 	}
 	return nil
 }
@@ -310,7 +343,7 @@ func (b *Batcher) sendAccounts(jobs []*job) error {
 	typed, _ := results.([]types.CreateAccountResult)
 	for i, j := range jobs {
 		outcomes, mapErr := MapAccountResults(j.cmd, typed, offsets[i], len(events))
-		j.done <- submitResult{outcomes: outcomes, err: mapErr}
+		j.done <- SubmitResult{Outcomes: outcomes, Err: mapErr}
 	}
 	return nil
 }
