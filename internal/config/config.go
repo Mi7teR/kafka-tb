@@ -37,11 +37,12 @@ type TigerBeetle struct {
 type Batcher struct {
 	MaxBatchSize int           `yaml:"max_batch_size"`
 	Linger       time.Duration `yaml:"linger"`
-	// MaxQueue is the depth of ONE worker's queue, not of the batcher as a
-	// whole. The batcher runs one worker per operation type — two — and a
-	// worker holds MaxQueue commands queued plus up to MaxBatchSize events in
-	// the batch it is assembling or sending. The process can therefore hold up
-	// to (MaxQueue + MaxBatchSize) × 2 in the batcher: 18,378 at the defaults.
+	// MaxQueue is the depth of the batcher's single queue, which is also the
+	// batcher as a whole: one worker serves both operation types, so commands
+	// of every operation share this one queue. The worker holds MaxQueue
+	// commands queued plus up to MaxBatchSize events in the batch it is
+	// assembling or sending. The process can therefore hold up to
+	// MaxQueue + MaxBatchSize in the batcher: 9,189 at the defaults.
 	MaxQueue int `yaml:"max_queue"`
 }
 

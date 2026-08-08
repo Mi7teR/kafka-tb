@@ -191,7 +191,7 @@ func TestBatcherSubmitAfterCloseFails(t *testing.T) {
 	require.ErrorIs(t, err, ErrClosed)
 }
 
-// C1: отмена контекста Start останавливает циклы. Отправители, застрявшие
+// C1: отмена контекста Start останавливает цикл. Отправители, застрявшие
 // на переполненной очереди, обязаны получить выход, иначе Close() виснет
 // и вместе с ним весь shutdown процесса.
 func TestBatcherCloseReturnsWithBlockedSubmitters(t *testing.T) {

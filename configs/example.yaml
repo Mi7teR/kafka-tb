@@ -19,11 +19,11 @@ batcher:
   # filling while the previous one is in flight. A longer linger therefore buys
   # no extra batching and only adds latency to the last command in the batch.
   linger: 1ms
-  # Queue depth of ONE worker, not of the batcher as a whole. The batcher runs
-  # one worker per operation type — two — and a worker also holds up to
-  # max_batch_size events in the batch it is assembling or sending, so the
-  # process can hold up to (max_queue + max_batch_size) × 2 — 18,378 at these
-  # values.
+  # Queue depth of the batcher's single queue, which is the batcher as a whole:
+  # one worker serves both operation types, so commands of every operation
+  # share this queue. The worker also holds up to max_batch_size events in the
+  # batch it is assembling or sending, so the process can hold up to
+  # max_queue + max_batch_size — 9,189 at these values.
   max_queue: 1000
 # Sink pipelining
 sink:
