@@ -11,17 +11,20 @@ tigerbeetle:
 batcher:
   max_batch_size: 8189
   linger: 5ms
-  # Queue depth of ONE worker, not of the batcher as a whole: with shards
-  # workers per operation type the process can hold up to
-  # max_queue × shards × 2 commands waiting.
+  # Queue depth of ONE worker, not of the batcher as a whole. A worker also
+  # holds up to max_batch_size commands in the batch it is assembling or
+  # sending, so the process can hold up to
+  # (max_queue + max_batch_size) × shards commands — 36,756 at these values.
   max_queue: 1000
-  # How many independent workers the batcher runs per operation type. A command
-  # goes to one of them by the hash of its ordering key — "topic/partition" for
-  # Kafka records, empty (round-robin) for API requests. Commands sharing a key
-  # therefore never fly at the same time and keep their submit order, while
-  # different partitions pipeline. More shards means more concurrent requests to
-  # TigerBeetle and more memory (see max_queue); 1 restores the old behaviour of
-  # a single in-flight request per operation type. Defaults to 4.
+  # How many independent workers the batcher runs. A command goes to one of them
+  # by the hash of its ordering key — "topic/partition" for Kafka records, empty
+  # (round-robin) for API requests. The operation type plays no part in that
+  # routing: one worker owns a key across both create_accounts and
+  # create_transfers, so commands sharing a key never fly at the same time and
+  # keep their submit order, while different partitions pipeline. More shards
+  # means more concurrent requests to TigerBeetle and more memory (see
+  # max_queue); 1 restores the old behaviour of a single in-flight request.
+  # Defaults to 4.
   shards: 4
 # Sink pipelining
 sink:

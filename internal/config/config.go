@@ -42,15 +42,18 @@ type Batcher struct {
 	MaxBatchSize int           `yaml:"max_batch_size"`
 	Linger       time.Duration `yaml:"linger"`
 	// MaxQueue is the depth of one worker's queue, not of the batcher as a
-	// whole: with shards workers per operation type the process can hold up to
-	// max_queue × shards × 2 commands queued.
+	// whole. A worker holds max_queue commands queued plus up to
+	// max_batch_size more in the batch it is assembling or sending, so the
+	// process can hold up to (max_queue + max_batch_size) × shards commands —
+	// 36,756 at the defaults, not 1,000.
 	MaxQueue int `yaml:"max_queue"`
-	// Shards is how many independent workers the batcher runs per operation
-	// type. A command is routed to one of them by the hash of its ordering
-	// key, so commands sharing a key are never in flight at the same time and
-	// keep their submit order, while different keys pipeline. One shard
-	// restores the old behaviour: a single in-flight request per operation
-	// type, everything serialised behind it.
+	// Shards is how many independent workers the batcher runs. A command is
+	// routed to one of them by the hash of its ordering key alone, regardless
+	// of operation type, so commands sharing a key are never in flight at the
+	// same time and keep their submit order — including a create_accounts
+	// followed by a create_transfers on the same key. Different keys pipeline.
+	// One shard restores the old behaviour: a single in-flight request,
+	// everything serialised behind it.
 	Shards int `yaml:"shards"`
 }
 

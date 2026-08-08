@@ -38,11 +38,12 @@ type SubmitResult struct {
 }
 
 // Batcher — единственная дверь в TigerBeetle.
-// Держит shards независимых воркеров на каждый тип операции; у воркера в любой
-// момент не больше одного батча в полёте. Команда попадает к воркеру по хешу
-// своего ключа порядка, поэтому две команды с одним ключом никогда не летят
-// одновременно — а значит, порядок применения внутри ключа совпадает с
-// порядком Submit. Между разными ключами порядок не гарантируется: ровно этим
+// Держит shards независимых воркеров; у воркера в любой момент не больше одного
+// батча в полёте. Команда попадает к воркеру по хешу своего ключа порядка — по
+// ключу и только по нему, безотносительно типа операции, — поэтому две команды
+// с одним ключом никогда не летят одновременно, даже когда одна создаёт счета,
+// а другая переводит с них. А значит, порядок применения внутри ключа совпадает
+// с порядком Submit. Между разными ключами порядок не гарантируется: ровно этим
 // разменом и покупается параллелизм, недоступный одному воркеру.
 type Batcher struct {
 	client  Client
@@ -51,11 +52,13 @@ type Batcher struct {
 	log     *slog.Logger
 	metrics *obs.Metrics
 
-	// transfers/accounts — по очереди на воркер. Очередь на шард, а не общая:
-	// общая очередь снова свела бы разные ключи в одну точку сериализации.
-	shards    int
-	transfers []chan *job
-	accounts  []chan *job
+	// queues — по одной очереди на воркер, обе операции в ней вперемешку.
+	// Очередь на шард, а не общая: общая снова свела бы разные ключи в одну
+	// точку сериализации. Одна очередь на шард, а не по одной на тип операции:
+	// две очереди — это два воркера, а два воркера на ключ и есть та самая
+	// одновременность, которой быть не должно.
+	shards int
+	queues []chan *job
 
 	// rr раздаёт воркеров командам без ключа. Круг, а не хеш пустой строки:
 	// иначе весь API-трафик встал бы в один воркер и сериализовался об него.
@@ -102,23 +105,21 @@ func NewBatcher(c Client, cfg config.Batcher, retry config.Retry, log *slog.Logg
 		shards = config.DefaultBatcherShards
 	}
 	b := &Batcher{
-		client:    c,
-		cfg:       cfg,
-		retry:     retry,
-		log:       log,
-		metrics:   metrics,
-		shards:    shards,
-		transfers: make([]chan *job, shards),
-		accounts:  make([]chan *job, shards),
-		seed:      maphash.MakeSeed(),
-		stop:      make(chan struct{}),
-		finished:  make(chan struct{}),
+		client:   c,
+		cfg:      cfg,
+		retry:    retry,
+		log:      log,
+		metrics:  metrics,
+		shards:   shards,
+		queues:   make([]chan *job, shards),
+		seed:     maphash.MakeSeed(),
+		stop:     make(chan struct{}),
+		finished: make(chan struct{}),
 	}
 	for i := 0; i < shards; i++ {
 		// max_queue — на воркер: очередь одного ключа не должна упираться в
 		// заполненность чужой.
-		b.transfers[i] = make(chan *job, cfg.MaxQueue)
-		b.accounts[i] = make(chan *job, cfg.MaxQueue)
+		b.queues[i] = make(chan *job, cfg.MaxQueue)
 	}
 	b.pickShard = b.hashShard
 	return b
@@ -139,11 +140,10 @@ func (b *Batcher) hashShard(key string) int {
 func (b *Batcher) Start(ctx context.Context) {
 	// Отмена контекста — это тот же shutdown, что и Close().
 	b.unwatch = context.AfterFunc(ctx, b.signalStop)
-	b.wg.Add(2 * b.shards)
+	b.wg.Add(b.shards)
 	for i := 0; i < b.shards; i++ {
-		transfers, accounts := b.transfers[i], b.accounts[i]
-		go func() { defer b.wg.Done(); b.loop(transfers, b.sendTransfers) }()
-		go func() { defer b.wg.Done(); b.loop(accounts, b.sendAccounts) }()
+		queue := b.queues[i]
+		go func() { defer b.wg.Done(); b.loop(queue) }()
 	}
 	// Наблюдатель живёт здесь, а не в Close: путь остановки по отмене контекста
 	// не проходит через Close, но отправителей отпускать обязан так же.
@@ -171,11 +171,12 @@ func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan S
 		return nil, ErrCommandTooLarge
 	}
 	j := &job{cmd: cmd, done: make(chan SubmitResult, 1)}
-	queues := b.transfers
-	if cmd.Op == model.OpCreateAccounts {
-		queues = b.accounts
-	}
-	queue := queues[b.pickShard(cmd.Key)]
+	// Шард выбирается по одному лишь ключу: тип операции в маршрутизацию не
+	// входит намеренно. Развести create_accounts и create_transfers одного
+	// ключа по разным воркерам значило бы отправить их одновременно — и
+	// трансфер со счёта, который ещё не создан, вернул бы
+	// debit_account_not_found, то есть бизнес-отказ и DLQ для законной записи.
+	queue := b.queues[b.pickShard(cmd.Key)]
 
 	// Быстрый отказ, когда батчер уже остановлен: иначе select ниже выбирал бы
 	// между stop и свободным местом в очереди случайно.
@@ -210,7 +211,7 @@ func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan S
 			// вот-вот вернуть исход. Ответить в этот момент ErrClosed — соврать
 			// про применённую работу; вызывающий не обязан повторять запрос с
 			// тем же id и восстановить правду ему неоткуда.
-			// finished же закрывается после выхода обоих циклов, то есть когда
+			// finished же закрывается после выхода всех воркеров, то есть когда
 			// ответить этой команде уже некому.
 			//
 			// Гонка «исход доставлен ровно в момент выхода циклов» реальна:
@@ -283,11 +284,17 @@ func (b *Batcher) signalFinished() {
 	b.finishedOnce.Do(func() { close(b.finished) })
 }
 
-// loop собирает батч по правилу «max_batch_size или linger, что раньше».
-func (b *Batcher) loop(queue chan *job, send func([]*job) error) {
+// loop копит подряд идущие команды одной операции и отправляет накопленное,
+// когда операция сменилась, набрался max_batch_size или истёк linger — что
+// наступит раньше. Смена операции — такой же повод отправить, как и остальные
+// два: один запрос к TigerBeetle несёт события ровно одного типа, смешать
+// счета с трансферами нельзя. Отправка идёт строго последовательно, поэтому
+// порядок применения совпадает с порядком постановки и на стыке операций тоже.
+func (b *Batcher) loop(queue chan *job) {
 	var (
 		batch []*job
 		size  int
+		op    model.Op
 		timer *time.Timer
 		tick  <-chan time.Time
 	)
@@ -302,7 +309,7 @@ func (b *Batcher) loop(queue chan *job, send func([]*job) error) {
 			return
 		}
 		stopTimer()
-		if err := send(batch); err != nil {
+		if err := b.send(op, batch); err != nil {
 			b.failAll(batch, err)
 		}
 		batch, size = nil, 0
@@ -317,10 +324,16 @@ func (b *Batcher) loop(queue chan *job, send func([]*job) error) {
 			b.drain(queue, ErrClosed)
 			return
 		case j := <-queue:
+			// Пробег одной операции кончился — отправляем его целиком, следующий
+			// начинается с этой команды.
+			if len(batch) > 0 && j.cmd.Op != op {
+				flush()
+			}
 			// Команда не влезает в остаток — отправляем накопленное и начинаем новый батч.
 			if size+j.cmd.Len() > b.cfg.MaxBatchSize {
 				flush()
 			}
+			op = j.cmd.Op
 			batch = append(batch, j)
 			size += j.cmd.Len()
 			if size >= b.cfg.MaxBatchSize {
@@ -335,6 +348,14 @@ func (b *Batcher) loop(queue chan *job, send func([]*job) error) {
 			flush()
 		}
 	}
+}
+
+// send выбирает запрос по операции накопленного пробега.
+func (b *Batcher) send(op model.Op, jobs []*job) error {
+	if op == model.OpCreateAccounts {
+		return b.sendAccounts(jobs)
+	}
+	return b.sendTransfers(jobs)
 }
 
 func (b *Batcher) drain(queue chan *job, err error) {
