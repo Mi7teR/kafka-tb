@@ -4,18 +4,23 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Mi7teR/kafka-tb/internal/config"
 )
 
 // subcommandConfigYAML renders a minimal, valid kafkatb config file for the
@@ -88,25 +93,43 @@ func waitReady(t *testing.T, metricsAddr string, timeout time.Duration) {
 	t.Fatalf("subprocess never became ready at %s within %s", url, timeout)
 }
 
+// subcommandHooks are the two points a scenario needs to reach inside
+// runSubcommandAndSIGTERM: before the subprocess is started (the topics
+// already exist, so this is where a test can put something in them and add
+// CLI arguments), and once it reports ready but before it is signalled (this
+// is where a test asserts on what the running process did).
+type subcommandHooks struct {
+	before func(cfg *config.Config) []string
+	ready  func(cfg *config.Config)
+}
+
 // runSubcommand starts the built kafkatb binary with subcommand and a config
 // pointing at the shared containers, waits for it to report ready, sends
 // SIGTERM, and requires it to exit 0 within timeout. It is the SIGTERM
 // contract every subcommand that actually runs a pipeline must meet. The
 // process's own output is returned so a caller can assert on what it logged.
-func runSubcommandAndSIGTERM(t *testing.T, subcommand string) string {
+func runSubcommandAndSIGTERM(t *testing.T, subcommand string, hooks subcommandHooks) string {
 	t.Helper()
 	name := kafkaName(t.Name())
-	createTopics(t, testConfig(t, sharedBrokers, sharedTBAddr))
+	cfg := testConfig(t, sharedBrokers, sharedTBAddr)
+	createTopics(t, cfg)
 	metricsAddr := freeAddr(t)
 	cfgPath := filepath.Join(t.TempDir(), "cfg.yaml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(subcommandConfigYAML(name, metricsAddr)), 0o600))
 
-	cmd := exec.Command(sharedBinary, subcommand, "--config", cfgPath)
+	args := []string{subcommand, "--config", cfgPath}
+	if hooks.before != nil {
+		args = append(args, hooks.before(cfg)...)
+	}
+	cmd := exec.Command(sharedBinary, args...)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	require.NoError(t, cmd.Start())
 
 	waitReady(t, metricsAddr, 30*time.Second)
+	if hooks.ready != nil {
+		hooks.ready(cfg)
+	}
 
 	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
 
@@ -123,23 +146,59 @@ func runSubcommandAndSIGTERM(t *testing.T, subcommand string) string {
 }
 
 func TestSubcommandSinkStartsAndStopsOnSIGTERM(t *testing.T) {
-	runSubcommandAndSIGTERM(t, "sink")
+	runSubcommandAndSIGTERM(t, "sink", subcommandHooks{})
 }
 
 func TestSubcommandRunStartsAndStopsOnSIGTERM(t *testing.T) {
-	runSubcommandAndSIGTERM(t, "run")
+	runSubcommandAndSIGTERM(t, "run", subcommandHooks{})
 }
 
-// Task 25 covers what the CDC job publishes. What is checked here is that it
-// starts, recovers a cursor from an empty topic, and gets an answer out of
-// GetChangeEvents — an experimental API, against a real replica — rather than
-// logging query failures for as long as it is up.
-func TestSubcommandCDCStartsAndStopsOnSIGTERM(t *testing.T) {
-	out := runSubcommandAndSIGTERM(t, "cdc")
+// The real CLI, as its own process, against a real replica: a transfer the
+// sink applied has to come back out of the CDC topic.
+//
+// The assertion is on the record, not on the absence of error lines in the
+// log. "No query failure was logged" is satisfied just as well by a job that
+// publishes nothing at all, which is the failure this test exists to catch.
+func TestSubcommandCDCPublishesWhatTheSinkApplied(t *testing.T) {
+	var applied uint64
+	var id string
+
+	out := runSubcommandAndSIGTERM(t, "cdc", subcommandHooks{
+		before: func(cfg *config.Config) []string {
+			tb := newTBClient(t, cfg)
+			debit, credit := seedAccounts(t, tb)
+
+			id = uuid.NewString()
+			produce(t, sharedBrokers, cfg.Kafka.Topics[0].Name,
+				[]string{transferJSON(id, debit, credit, "4.50")})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			stop := runSink(t, ctx, cfg, tb)
+			requireBalance(t, tb, credit, "4.50", applyTimeout)
+			stop()
+
+			applied = transferTimestamps(t, tb, []string{id})[0]
+			// The cursor starts immediately below the one transfer this test
+			// applied, so the subprocess publishes that event and nothing
+			// else: the change stream is cluster-wide and this replica is
+			// shared with every other test in the package.
+			return []string{"--timestamp-last", strconv.FormatUint(applied-1, 10)}
+		},
+		ready: func(cfg *config.Config) {
+			events := readCDC(t, sharedBrokers, cfg.CDC.Topic, 1, cdcTimeout)
+			require.Equal(t, applied, events[0].timestamp,
+				"the CDC topic holds no record for the transfer the sink applied")
+			require.Equal(t, id, events[0].msg.Transfer.ID)
+			require.Equal(t, "4.50", events[0].msg.Transfer.Amount)
+			require.Equal(t, "single_phase", events[0].msg.Type)
+			require.Equal(t, applied, events[0].checkpoint,
+				"a closed window's last record claims its own timestamp")
+		},
+	})
 	require.Contains(t, out, "cdc: starting")
 	require.NotContains(t, out, "change events query failed")
-	require.NotContains(t, out, "publication failed",
-		"whatever the sink tests already applied has to publish cleanly")
+	require.NotContains(t, out, "publication failed")
 }
 
 // Without an output topic there is nowhere to publish and no cursor to

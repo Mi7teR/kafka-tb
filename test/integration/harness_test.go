@@ -240,10 +240,17 @@ func kafkaName(s string) string {
 // ordering, and ordering is only defined within a partition.
 func createTopics(t *testing.T, cfg *config.Config) {
 	t.Helper()
+	createTopicsWithCDCPartitions(t, cfg, 1)
+}
+
+// createTopicsWithCDCPartitions is createTopics with the CDC topic spread over
+// cdcPartitions partitions. The CDC tests need more than one: the job's
+// records are keyed, so a window lands on several partitions at once and its
+// recovery scan has to read every one of their tails. With a single partition
+// that scan is trivially correct and proves nothing.
+func createTopicsWithCDCPartitions(t *testing.T, cfg *config.Config, cdcPartitions int32) {
+	t.Helper()
 	names := []string{cfg.Kafka.DLQTopic, cfg.Kafka.ResultsTopic}
-	if cfg.CDC.Topic != "" {
-		names = append(names, cfg.CDC.Topic)
-	}
 	for _, tp := range cfg.Kafka.Topics {
 		names = append(names, tp.Name)
 	}
@@ -253,9 +260,18 @@ func createTopics(t *testing.T, cfg *config.Config) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	resp, err := kadm.NewClient(cl).CreateTopics(ctx, 1, 1, nil, names...)
+	adm := kadm.NewClient(cl)
+	resp, err := adm.CreateTopics(ctx, 1, 1, nil, names...)
 	require.NoError(t, err)
 	for _, r := range resp {
+		require.NoError(t, r.Err, "create topic %s", r.Topic)
+	}
+	if cfg.CDC.Topic == "" {
+		return
+	}
+	cdcResp, err := adm.CreateTopics(ctx, cdcPartitions, 1, nil, cfg.CDC.Topic)
+	require.NoError(t, err)
+	for _, r := range cdcResp {
 		require.NoError(t, r.Err, "create topic %s", r.Topic)
 	}
 }
@@ -545,6 +561,11 @@ type transferSpec struct {
 	Credit string
 	Amount string
 	Flags  []string
+	// PendingID and Timeout are what a two-phase flow needs: the timeout on
+	// the pending leg, the id of that leg on the post or void that resolves
+	// it. Both are omitted from the message when empty.
+	PendingID string
+	Timeout   string
 }
 
 // transfersJSON renders one create_transfers message. It is written by hand
@@ -560,6 +581,12 @@ func transfersJSON(specs ...transferSpec) string {
 		fmt.Fprintf(&sb,
 			`{"id":%q,"debit_account_id":%q,"credit_account_id":%q,"amount":%q,"ledger":%q,"code":%q`,
 			s.ID, s.Debit, s.Credit, s.Amount, ledgerName, codeName)
+		if s.PendingID != "" {
+			fmt.Fprintf(&sb, `,"pending_id":%q`, s.PendingID)
+		}
+		if s.Timeout != "" {
+			fmt.Fprintf(&sb, `,"timeout":%q`, s.Timeout)
+		}
 		if len(s.Flags) > 0 {
 			sb.WriteString(`,"flags":[`)
 			for j, f := range s.Flags {
