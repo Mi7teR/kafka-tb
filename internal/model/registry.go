@@ -99,6 +99,56 @@ func (r *Registry) TransferFlags(names []string) (types.TransferFlags, error) {
 	return f, nil
 }
 
+// transferFlagNames and accountFlagNames are the bit -> name tables the CDC
+// job needs, in bit order. They mirror TransferFlags/AccountFlags above, and
+// the round-trip tests hold the two directions together: a name added on one
+// side and forgotten on the other fails there.
+//
+// imported appears here although it is rejected on the way in: this connector
+// never sets that flag, but an event that carries it must still say so.
+var (
+	transferFlagNames = []string{
+		"linked", "pending", "post_pending_transfer", "void_pending_transfer",
+		"balancing_debit", "balancing_credit", "closing_debit", "closing_credit",
+		"imported",
+	}
+	accountFlagNames = []string{
+		"linked", "debits_must_not_exceed_credits", "credits_must_not_exceed_debits",
+		"history", "imported", "closed",
+	}
+)
+
+// TransferFlagNames is the reverse of TransferFlags: it names the bits set in
+// a transfer's flags, in bit order.
+func (r *Registry) TransferFlagNames(flags uint16) []string {
+	return flagNames(flags, transferFlagNames)
+}
+
+// AccountFlagNames is the reverse of AccountFlags: it names the bits set in an
+// account's flags, in bit order.
+func (r *Registry) AccountFlagNames(flags uint16) []string {
+	return flagNames(flags, accountFlagNames)
+}
+
+// flagNames returns nil rather than an empty slice for no flags, so that a
+// marshaled message carries [] only where the encoder chooses to.
+// A bit with no name is reported as bit_N: a flag this build does not know
+// must not vanish from the message.
+func flagNames(flags uint16, table []string) []string {
+	var out []string
+	for bit := 0; bit < 16; bit++ {
+		if flags&(1<<bit) == 0 {
+			continue
+		}
+		if bit < len(table) {
+			out = append(out, table[bit])
+			continue
+		}
+		out = append(out, fmt.Sprintf("bit_%d", bit))
+	}
+	return out
+}
+
 func (r *Registry) AccountFlags(names []string) (types.AccountFlags, error) {
 	var f types.AccountFlags
 	for _, n := range names {

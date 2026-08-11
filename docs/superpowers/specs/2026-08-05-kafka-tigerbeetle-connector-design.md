@@ -290,5 +290,4 @@ shutdown_timeout: 30s
 
 - Пайплайнинг батчей с привязкой партиций.
 - Кодеки Protobuf и Avro (интерфейс есть, реализация позже).
-- CDC в обратную сторону (TigerBeetle → Kafka).
 - Kafka Connect как рантайм.

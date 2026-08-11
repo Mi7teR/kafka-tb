@@ -1,5 +1,6 @@
-// Command kafkatb runs the Kafka -> TigerBeetle connector: it consumes
-// Kafka and applies commands to TigerBeetle.
+// Command kafkatb runs the Kafka <-> TigerBeetle connector: the sink
+// consumes Kafka and applies commands to TigerBeetle, and the CDC job
+// publishes TigerBeetle's change events back to Kafka.
 package main
 
 import (
@@ -17,6 +18,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Mi7teR/kafka-tb/internal/cdc"
 	"github.com/Mi7teR/kafka-tb/internal/codec"
 	"github.com/Mi7teR/kafka-tb/internal/codec/jsonc"
 	"github.com/Mi7teR/kafka-tb/internal/config"
@@ -88,38 +90,66 @@ func newRootCmd(log *slog.Logger) *cobra.Command {
 		return nil
 	}
 
+	// timestampLast overrides the cursor the CDC job would otherwise recover
+	// from the output topic. It is registered on both commands that can run
+	// the job, and only counts when explicitly set: 0 is a meaningful value
+	// (replay everything), so "unset" cannot be spelled as a zero default.
+	withTimestampLast := func(cmd *cobra.Command) *cobra.Command {
+		cmd.Flags().Uint64("timestamp-last", 0,
+			"resume the CDC job after this TigerBeetle timestamp instead of the one "+
+				"recovered from the output topic (0 replays everything)")
+		return cmd
+	}
+	cdcStart := func(cmd *cobra.Command) *uint64 {
+		if !cmd.Flags().Changed("timestamp-last") {
+			return nil
+		}
+		ts, err := cmd.Flags().GetUint64("timestamp-last")
+		if err != nil {
+			return nil // unreachable: the flag is declared as uint64 above
+		}
+		return &ts
+	}
+
 	sinkCmd := &cobra.Command{
 		Use:   "sink",
 		Short: "run only the Kafka -> TigerBeetle consumer",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runUntilSignal(cmd, func(ctx context.Context, cfg *config.Config) error {
-				return runSink(ctx, cfg, log)
+				return run(ctx, cfg, log, jobs{sink: true})
 			})
 		},
 	}
 
-	runCmd := &cobra.Command{
+	runCmd := withTimestampLast(&cobra.Command{
 		Use:   "run",
 		Short: "run everything this process supports",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			// Currently identical to sink: the CDC job (Task 24) doesn't exist
-			// yet. Once it does, run must start both concurrently.
 			return runUntilSignal(cmd, func(ctx context.Context, cfg *config.Config) error {
-				return runSink(ctx, cfg, log)
+				// The CDC job runs alongside the sink whenever cdc.topic names
+				// one. Left empty it is simply off, so a config written before
+				// the job existed keeps working.
+				return run(ctx, cfg, log, jobs{
+					sink:      true,
+					cdc:       cfg.CDC.Topic != "",
+					cdcCursor: cdcStart(cmd),
+				})
 			})
 		},
-	}
+	})
 
-	cdcCmd := &cobra.Command{
+	cdcCmd := withTimestampLast(&cobra.Command{
 		Use:   "cdc",
 		Short: "run only the TigerBeetle -> Kafka CDC job",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if _, err := loadConfig(cmd); err != nil {
-				return fmt.Errorf("config: %w", err)
-			}
-			return errors.New("cdc: not implemented yet (see task 24)")
+			return runUntilSignal(cmd, func(ctx context.Context, cfg *config.Config) error {
+				if cfg.CDC.Topic == "" {
+					return errors.New("cdc.topic: must not be empty to run the CDC job")
+				}
+				return run(ctx, cfg, log, jobs{cdc: true, cdcCursor: cdcStart(cmd)})
+			})
 		},
-	}
+	})
 
 	root.AddCommand(sinkCmd, runCmd, cdcCmd)
 	return root
@@ -149,20 +179,29 @@ func (h *sinkHolder) onRevoked(ctx context.Context, revoked map[string][]int32) 
 	}
 }
 
-// runSink wires the Kafka -> TigerBeetle pipeline together and tears it down
-// in order once ctx is cancelled (SIGINT/SIGTERM), or as soon as it returns
-// early on a construction error. Shutdown: stop consuming (cl.Close, which
-// runs the revoke callback's final commit), flush and close the DLQ/results
-// producer, close the batcher (waits out any in-flight TigerBeetle call by
-// design — see tbx.Batcher.Close), then close the TigerBeetle client. Each
-// component is closed via defer, registered right after it is successfully
-// built, which both guarantees a construction error never leaks whatever
-// was already started and reproduces that exact order (defers run last-in,
-// first-out). Each server bounds its own graceful drain by
-// cfg.ShutdownTimeout or a fixed internal timeout; runSink does not impose an
-// additional one so that a synchronous caller is never told a transfer
-// failed when it may have applied.
-func runSink(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
+// jobs says which of the process's two pipelines to start, and where the CDC
+// one should resume from. A nil cdcCursor means "recover it from the output
+// topic"; a non-nil one is the operator's --timestamp-last.
+type jobs struct {
+	sink      bool
+	cdc       bool
+	cdcCursor *uint64
+}
+
+// run starts the requested pipelines over one shared TigerBeetle client and
+// returns once ctx is cancelled (SIGINT/SIGTERM) or a pipeline gives up.
+//
+// Shutdown order for the sink is what it always was: stop consuming
+// (consumer.Close, which runs the revoke callback's final commit), flush and
+// close the DLQ/results producer, close the batcher (which waits out any
+// in-flight TigerBeetle call by design — see tbx.Batcher.Close), and only
+// then close the TigerBeetle client. That is what startSink's stop function
+// does, and the client is closed by this function's defer afterwards. Each
+// server bounds its own graceful drain by cfg.ShutdownTimeout or a fixed
+// internal timeout; run does not impose an additional one, so that a
+// synchronous caller is never told a transfer failed when it may have
+// applied.
+func run(ctx context.Context, cfg *config.Config, log *slog.Logger, which jobs) error {
 	tbClient, err := tbx.NewClient(cfg.TigerBeetle)
 	if err != nil {
 		return fmt.Errorf("tigerbeetle client: %w", err)
@@ -170,14 +209,56 @@ func runSink(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	defer tbClient.Close()
 
 	metrics := obs.NewMetrics(prometheus.DefaultRegisterer)
+	g, gctx := errgroup.WithContext(ctx)
 
+	// TigerBeetle answering is the one readiness condition both pipelines
+	// share; each adds its own.
+	checks := []func() error{func() error {
+		if err := tbClient.Nop(); err != nil {
+			return fmt.Errorf("tigerbeetle: %w", err)
+		}
+		return nil
+	}}
+
+	if which.sink {
+		stop, ready, err := startSink(gctx, g, cfg, log, tbClient, metrics)
+		if err != nil {
+			return err
+		}
+		defer stop()
+		checks = append(checks, ready)
+	}
+	if which.cdc {
+		stop, err := startCDC(gctx, g, cfg, log, tbClient, which.cdcCursor)
+		if err != nil {
+			return err
+		}
+		defer stop()
+	}
+
+	metricsSrv := obs.NewServer(cfg.MetricsAddr, func() error {
+		for _, check := range checks {
+			if err := check(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, log)
+	g.Go(func() error { return metricsSrv.Serve(gctx) })
+	return g.Wait()
+}
+
+// startSink wires the Kafka -> TigerBeetle pipeline on top of tbClient and
+// adds it to g. The returned stop closes what was built, in the order the
+// shutdown contract requires; a construction error leaves nothing running.
+func startSink(
+	ctx context.Context, g *errgroup.Group, cfg *config.Config,
+	log *slog.Logger, tbClient tbx.Client, metrics *obs.Metrics,
+) (stop func(), ready func() error, err error) {
 	batcher := tbx.NewBatcher(tbClient, cfg.Batcher, cfg.Retry, log, metrics)
 	batcher.Start(ctx)
-	defer batcher.Close()
 
 	reg := model.NewRegistry(cfg)
-
-	var holder sinkHolder
 	decoders, err := codec.NewRegistry(cfg.Kafka.Topics, func(name string) (codec.Decoder, error) {
 		if name != "json" {
 			return nil, fmt.Errorf("unsupported codec %q", name)
@@ -185,38 +266,76 @@ func runSink(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return jsonc.New(reg, cfg.Limits), nil
 	})
 	if err != nil {
-		return fmt.Errorf("codec registry: %w", err)
+		batcher.Close()
+		return nil, nil, fmt.Errorf("codec registry: %w", err)
 	}
 
 	pcl, err := kgo.NewClient(kgo.SeedBrokers(cfg.Kafka.Brokers...))
 	if err != nil {
-		return fmt.Errorf("kafka producer: %w", err)
+		batcher.Close()
+		return nil, nil, fmt.Errorf("kafka producer: %w", err)
 	}
 	producer := emit.New(pcl, cfg.Kafka)
-	defer producer.Close()
 
+	var holder sinkHolder
 	consumer, err := sink.NewKafkaClient(cfg, holder.onRevoked)
 	if err != nil {
-		return fmt.Errorf("kafka consumer: %w", err)
+		producer.Close()
+		batcher.Close()
+		return nil, nil, fmt.Errorf("kafka consumer: %w", err)
 	}
-	defer consumer.Close()
 
 	s := sink.New(cfg, consumer, decoders, batcher, producer, log, metrics)
 	holder.set(s)
+	g.Go(func() error { s.Run(ctx); return nil })
 
-	ready := func() error {
-		if err := tbClient.Nop(); err != nil {
-			return fmt.Errorf("tigerbeetle: %w", err)
-		}
+	stop = func() {
+		consumer.Close()
+		producer.Close()
+		batcher.Close()
+	}
+	ready = func() error {
 		if id, gen := consumer.GroupMetadata(); id == "" || gen == -1 {
 			return errors.New("consumer: not joined to group")
 		}
 		return nil
 	}
-	metricsSrv := obs.NewServer(cfg.MetricsAddr, ready, log)
+	return stop, ready, nil
+}
 
-	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() error { return metricsSrv.Serve(gctx) })
-	g.Go(func() error { s.Run(gctx); return nil })
-	return g.Wait()
+// startCDC wires the TigerBeetle -> Kafka job on top of the same client and
+// adds it to g. The cursor is resolved before the job starts: either the
+// operator's --timestamp-last, or the highest checkpoint the output topic
+// itself holds. This job keeps no state anywhere else.
+func startCDC(
+	ctx context.Context, g *errgroup.Group, cfg *config.Config,
+	log *slog.Logger, tbClient tbx.Client, cursor *uint64,
+) (stop func(), err error) {
+	// GetChangeEvents is experimental and deliberately absent from
+	// tbx.Client, so it is reached through cdc.Source. Every client
+	// tbx.NewClient can return implements it; the check is here so a future
+	// substitute fails loudly instead of panicking.
+	src, ok := tbClient.(cdc.Source)
+	if !ok {
+		return nil, errors.New("cdc: this TigerBeetle client does not expose change events")
+	}
+
+	checkpoint := uint64(0)
+	switch {
+	case cursor != nil:
+		checkpoint = *cursor
+		log.Info("cdc: cursor overridden by --timestamp-last", slog.Uint64("checkpoint", checkpoint))
+	default:
+		if checkpoint, err = cdc.Resume(ctx, cfg.Kafka.Brokers, cfg.CDC.Topic, log); err != nil {
+			return nil, err
+		}
+	}
+
+	pcl, err := kgo.NewClient(kgo.SeedBrokers(cfg.Kafka.Brokers...))
+	if err != nil {
+		return nil, fmt.Errorf("cdc: kafka producer: %w", err)
+	}
+	job := cdc.New(cfg.CDC, cfg.Retry, src, pcl, model.NewRegistry(cfg), log)
+	g.Go(func() error { return job.Run(ctx, checkpoint) })
+	return pcl.Close, nil
 }

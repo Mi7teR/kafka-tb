@@ -198,6 +198,12 @@ func testConfig(t *testing.T, brokers []string, tbAddr string) *config.Config {
 			Linger:       1 * time.Millisecond,
 			MaxQueue:     1000,
 		},
+		CDC: config.CDC{
+			Topic:        name + ".cdc",
+			BatchSize:    100,
+			PollInterval: 100 * time.Millisecond,
+			PartitionKey: config.PartitionKeyDebitAccountID,
+		},
 		Kafka: config.Kafka{
 			Brokers:      brokers,
 			Group:        name + ".group",
@@ -229,12 +235,15 @@ func kafkaName(s string) string {
 	}, s)
 }
 
-// createTopics creates the input, DLQ and results topics with one partition
-// each. One partition is deliberate: every test asserts on ordering, and
-// ordering is only defined within a partition.
+// createTopics creates the input, DLQ, results and CDC topics with one
+// partition each. One partition is deliberate: every test asserts on
+// ordering, and ordering is only defined within a partition.
 func createTopics(t *testing.T, cfg *config.Config) {
 	t.Helper()
 	names := []string{cfg.Kafka.DLQTopic, cfg.Kafka.ResultsTopic}
+	if cfg.CDC.Topic != "" {
+		names = append(names, cfg.CDC.Topic)
+	}
 	for _, tp := range cfg.Kafka.Topics {
 		names = append(names, tp.Name)
 	}

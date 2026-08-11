@@ -13,14 +13,15 @@ endif
 build:
 	go build $(GO_LDFLAGS) -o bin/kafkatb ./cmd/kafkatb
 
-# Regenerates easyjson marshalers (go:generate directives in internal/codec/jsonc
-# and internal/emit). Requires the easyjson binary: go install
+# Regenerates easyjson marshalers (go:generate directives in internal/codec/jsonc,
+# internal/emit and internal/cdc). Requires the easyjson binary: go install
 # github.com/mailru/easyjson/...@latest. GOFLAGS carries GO_LDFLAGS down into the
 # "go build"/"go run" easyjson runs internally to introspect the target package,
 # which on Darwin otherwise hits the same TigerBeetle linker issue as above.
 generate:
 	GOFLAGS="$(GO_LDFLAGS)" go generate ./...
-	goimports -w internal/codec/jsonc/decoder_easyjson.go internal/emit/emitter_easyjson.go
+	goimports -w internal/codec/jsonc/decoder_easyjson.go internal/emit/emitter_easyjson.go \
+		internal/cdc/message_easyjson.go
 
 test:
 	go test ./... -race -count=1 $(GO_LDFLAGS)

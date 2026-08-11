@@ -62,6 +62,35 @@ type Topic struct {
 	Codec string `yaml:"codec"`
 }
 
+// Partition key names accepted by cdc.partition_key. The key decides which
+// ordering a consumer of the CDC topic gets — per debit account, per credit
+// account, per ledger or per transfer — so it is the consumer's choice, not
+// ours.
+const (
+	PartitionKeyDebitAccountID  = "debit_account_id"
+	PartitionKeyCreditAccountID = "credit_account_id"
+	PartitionKeyLedger          = "ledger"
+	PartitionKeyTransferID      = "transfer_id"
+)
+
+// Defaults for the CDC job, applied when the config file omits them.
+const (
+	DefaultCDCBatchSize    = 1000
+	DefaultCDCPollInterval = time.Second
+)
+
+// CDC configures the TigerBeetle -> Kafka change-event job. An empty Topic
+// disables the job: kafkatb run then starts the sink alone, and kafkatb cdc
+// refuses to start. The remaining fields always carry a valid value — Load
+// registers defaults for them — so they are validated whether the job is
+// enabled or not.
+type CDC struct {
+	Topic        string        `yaml:"topic"`
+	BatchSize    int           `yaml:"batch_size"`
+	PollInterval time.Duration `yaml:"poll_interval"`
+	PartitionKey string        `yaml:"partition_key"`
+}
+
 type Kafka struct {
 	Brokers      []string `yaml:"brokers"`
 	Group        string   `yaml:"group"`
@@ -86,6 +115,7 @@ type Config struct {
 	TigerBeetle     TigerBeetle       `yaml:"tigerbeetle"`
 	Batcher         Batcher           `yaml:"batcher"`
 	Sink            Sink              `yaml:"sink"`
+	CDC             CDC               `yaml:"cdc"`
 	Kafka           Kafka             `yaml:"kafka"`
 	Limits          Limits            `yaml:"limits"`
 	Ledgers         map[string]Ledger `yaml:"ledgers"`
@@ -157,6 +187,12 @@ func Load(path string, opts ...Option) (*Config, error) {
 	// from the file (see the clamp below). Registering it means an env
 	// override for it still works even when the file never mentions it.
 	v.SetDefault("sink.max_in_flight_per_partition", 0)
+	// The CDC job's knobs are optional in the file — only cdc.topic decides
+	// whether the job runs at all — so they are defaulted here rather than
+	// left at Go's zero value, which validate would (rightly) reject.
+	v.SetDefault("cdc.batch_size", DefaultCDCBatchSize)
+	v.SetDefault("cdc.poll_interval", DefaultCDCPollInterval)
+	v.SetDefault("cdc.partition_key", PartitionKeyDebitAccountID)
 
 	var cfg Config
 	err = v.Unmarshal(&cfg, func(c *mapstructure.DecoderConfig) { c.TagName = "yaml" })
@@ -286,6 +322,22 @@ func (c *Config) validate() error {
 				" than batcher.max_queue + batcher.max_batch_size in flight, and with several"+
 				" partitions the shared batcher queue blocks the enqueue well below that; got %d",
 			ceiling, c.Sink.MaxInFlightPerPartition)
+	}
+	// cdc.topic may be empty (the job is then disabled), but the knobs are
+	// checked either way: a bad value must be reported when it is written, not
+	// on the day someone adds the topic.
+	if c.CDC.BatchSize <= 0 || c.CDC.BatchSize > MaxBatchSize {
+		return fmt.Errorf("cdc.batch_size: want 1..%d, got %d", MaxBatchSize, c.CDC.BatchSize)
+	}
+	if c.CDC.PollInterval <= 0 {
+		return fmt.Errorf("cdc.poll_interval: must be > 0")
+	}
+	switch c.CDC.PartitionKey {
+	case PartitionKeyDebitAccountID, PartitionKeyCreditAccountID, PartitionKeyLedger, PartitionKeyTransferID:
+	default:
+		return fmt.Errorf("cdc.partition_key: want one of %s|%s|%s|%s, got %q",
+			PartitionKeyDebitAccountID, PartitionKeyCreditAccountID,
+			PartitionKeyLedger, PartitionKeyTransferID, c.CDC.PartitionKey)
 	}
 	if c.Limits.MaxEventsPerMessage <= 0 || c.Limits.MaxEventsPerMessage > MaxBatchSize {
 		return fmt.Errorf("limits.max_events_per_message: want 1..%d", MaxBatchSize)

@@ -38,6 +38,11 @@ kafka:
     - {name: %s.in, codec: json}
   dlq_topic: %s.dlq
   results_topic: %s.results
+cdc:
+  topic: %s.cdc
+  batch_size: 100
+  poll_interval: 100ms
+  partition_key: debit_account_id
 limits:
   max_message_bytes: 1048576
   max_events_per_message: 100
@@ -49,7 +54,7 @@ codes:
 retry: {initial: 50ms, max: 2s, jitter: true}
 shutdown_timeout: 10s
 metrics_addr: %q
-`, sharedTBAddr, sharedBrokers[0], name, name, name, name, metricsAddr)
+`, sharedTBAddr, sharedBrokers[0], name, name, name, name, name, metricsAddr)
 }
 
 // freeAddr returns a loopback address with a currently-unused port, for
@@ -86,8 +91,9 @@ func waitReady(t *testing.T, metricsAddr string, timeout time.Duration) {
 // runSubcommand starts the built kafkatb binary with subcommand and a config
 // pointing at the shared containers, waits for it to report ready, sends
 // SIGTERM, and requires it to exit 0 within timeout. It is the SIGTERM
-// contract every subcommand that actually runs a pipeline must meet.
-func runSubcommandAndSIGTERM(t *testing.T, subcommand string) {
+// contract every subcommand that actually runs a pipeline must meet. The
+// process's own output is returned so a caller can assert on what it logged.
+func runSubcommandAndSIGTERM(t *testing.T, subcommand string) string {
 	t.Helper()
 	name := kafkaName(t.Name())
 	createTopics(t, testConfig(t, sharedBrokers, sharedTBAddr))
@@ -96,8 +102,8 @@ func runSubcommandAndSIGTERM(t *testing.T, subcommand string) {
 	require.NoError(t, os.WriteFile(cfgPath, []byte(subcommandConfigYAML(name, metricsAddr)), 0o600))
 
 	cmd := exec.Command(sharedBinary, subcommand, "--config", cfgPath)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
 	require.NoError(t, cmd.Start())
 
 	waitReady(t, metricsAddr, 30*time.Second)
@@ -108,11 +114,12 @@ func runSubcommandAndSIGTERM(t *testing.T, subcommand string) {
 	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
-		require.NoError(t, err, "kafkatb %s: %s", subcommand, stderr.String())
+		require.NoError(t, err, "kafkatb %s: %s", subcommand, out.String())
 	case <-time.After(30 * time.Second):
 		_ = cmd.Process.Kill()
 		t.Fatalf("kafkatb %s did not exit within 30s of SIGTERM", subcommand)
 	}
+	return out.String()
 }
 
 func TestSubcommandSinkStartsAndStopsOnSIGTERM(t *testing.T) {
@@ -123,17 +130,29 @@ func TestSubcommandRunStartsAndStopsOnSIGTERM(t *testing.T) {
 	runSubcommandAndSIGTERM(t, "run")
 }
 
-// cdc isn't implemented yet (Task 24): it must fail fast with a clear error
-// instead of pretending to run, so there is nothing to SIGTERM here — the
-// contract under test is "fails immediately and says why."
-func TestSubcommandCDCFailsNotImplemented(t *testing.T) {
+// Task 25 covers what the CDC job publishes. What is checked here is that it
+// starts, recovers a cursor from an empty topic, and gets an answer out of
+// GetChangeEvents — an experimental API, against a real replica — rather than
+// logging query failures for as long as it is up.
+func TestSubcommandCDCStartsAndStopsOnSIGTERM(t *testing.T) {
+	out := runSubcommandAndSIGTERM(t, "cdc")
+	require.Contains(t, out, "cdc: starting")
+	require.NotContains(t, out, "change events query failed")
+	require.NotContains(t, out, "publication failed",
+		"whatever the sink tests already applied has to publish cleanly")
+}
+
+// Without an output topic there is nowhere to publish and no cursor to
+// recover: the CDC job must say so and exit rather than idle silently.
+func TestSubcommandCDCRefusesWithoutATopic(t *testing.T) {
 	name := kafkaName(t.Name())
 	metricsAddr := freeAddr(t)
 	cfgPath := filepath.Join(t.TempDir(), "cfg.yaml")
-	require.NoError(t, os.WriteFile(cfgPath, []byte(subcommandConfigYAML(name, metricsAddr)), 0o600))
+	body := strings.Replace(subcommandConfigYAML(name, metricsAddr), name+".cdc", "", 1)
+	require.NoError(t, os.WriteFile(cfgPath, []byte(body), 0o600))
 
 	cmd := exec.Command(sharedBinary, "cdc", "--config", cfgPath)
 	out, err := cmd.CombinedOutput()
 	require.Error(t, err)
-	require.Contains(t, strings.ToLower(string(out)), "not implemented")
+	require.Contains(t, string(out), "cdc.topic")
 }

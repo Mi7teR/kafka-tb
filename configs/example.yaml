@@ -41,6 +41,20 @@ sink:
   # them the enqueue blocks at a fraction of that number. Defaults to 1000,
   # clamped to the ceiling when the batcher is configured smaller.
   max_in_flight_per_partition: 1000
+# TigerBeetle -> Kafka change-data-capture job
+cdc:
+  # Output topic. Empty (or absent) disables the job: `kafkatb run` then
+  # starts the sink alone and `kafkatb cdc` refuses to start.
+  topic: ledger.events
+  # How many change events one window asks TigerBeetle for. The whole window
+  # is published and acknowledged before the cursor moves past it.
+  batch_size: 1000
+  # How long to wait before asking again when TigerBeetle has nothing new.
+  poll_interval: 1s
+  # Which field becomes the Kafka record key, and therefore which ordering a
+  # consumer of this topic gets: debit_account_id (default),
+  # credit_account_id, ledger or transfer_id.
+  partition_key: debit_account_id
 # Kafka consumer/producer settings
 kafka:
   brokers: ["localhost:9092"]

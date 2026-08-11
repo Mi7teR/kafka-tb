@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
@@ -241,4 +242,49 @@ func TestUnsetFlagDoesNotOverrideEnv(t *testing.T) {
 // replace performs a single-occurrence string replacement.
 func replace(s, old, new string) string {
 	return strings.Replace(s, old, new, 1)
+}
+
+func TestLoadDefaultsCDC(t *testing.T) {
+	cfg, err := Load(writeCfg(t, validCfg))
+	require.NoError(t, err)
+	require.Empty(t, cfg.CDC.Topic, "an absent cdc section leaves the job disabled")
+	require.Equal(t, DefaultCDCBatchSize, cfg.CDC.BatchSize)
+	require.Equal(t, DefaultCDCPollInterval, cfg.CDC.PollInterval)
+	require.Equal(t, PartitionKeyDebitAccountID, cfg.CDC.PartitionKey)
+}
+
+func TestLoadCDCSection(t *testing.T) {
+	cfg, err := Load(writeCfg(t, validCfg+`
+cdc:
+  topic: ledger.events
+  batch_size: 500
+  poll_interval: 250ms
+  partition_key: ledger
+`))
+	require.NoError(t, err)
+	require.Equal(t, "ledger.events", cfg.CDC.Topic)
+	require.Equal(t, 500, cfg.CDC.BatchSize)
+	require.Equal(t, 250*time.Millisecond, cfg.CDC.PollInterval)
+	require.Equal(t, PartitionKeyLedger, cfg.CDC.PartitionKey)
+}
+
+func TestLoadRejectsUnknownPartitionKey(t *testing.T) {
+	_, err := Load(writeCfg(t, validCfg+`
+cdc: {topic: ledger.events, partition_key: account}
+`))
+	require.ErrorContains(t, err, "cdc.partition_key")
+}
+
+func TestLoadRejectsOversizedCDCBatch(t *testing.T) {
+	_, err := Load(writeCfg(t, validCfg+`
+cdc: {topic: ledger.events, batch_size: 8190}
+`))
+	require.ErrorContains(t, err, "cdc.batch_size")
+}
+
+func TestLoadRejectsNonPositiveCDCPollInterval(t *testing.T) {
+	_, err := Load(writeCfg(t, validCfg+`
+cdc: {topic: ledger.events, poll_interval: 0s}
+`))
+	require.ErrorContains(t, err, "cdc.poll_interval")
 }
