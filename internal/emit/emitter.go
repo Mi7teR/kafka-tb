@@ -2,7 +2,6 @@ package emit
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"sync"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/Mi7teR/kafka-tb/internal/config"
 	"github.com/Mi7teR/kafka-tb/internal/tbx"
+	"github.com/mailru/easyjson"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -97,18 +97,23 @@ func (p *Publication) take() error {
 	return p.err
 }
 
+//go:generate easyjson -disallow_unknown_fields $GOFILE
+
+//easyjson:json
 type ResultsMessage struct {
 	Source  Source        `json:"source"`
 	Results []ResultEntry `json:"results"`
 	EmitTS  string        `json:"emitted_at"`
 }
 
+//easyjson:json
 type Source struct {
 	Topic     string `json:"topic"`
 	Partition int32  `json:"partition"`
 	Offset    int64  `json:"offset"`
 }
 
+//easyjson:json
 type ResultEntry struct {
 	Index  int    `json:"index"`
 	ID     string `json:"id"`
@@ -174,7 +179,7 @@ func (e *emitter) Results(ctx context.Context, rec *kgo.Record, outcomes []tbx.O
 	for i, o := range outcomes {
 		msg.Results[i] = ResultEntry{Index: o.Index, ID: o.ID, Status: string(o.Status), Error: o.Error}
 	}
-	body, err := json.Marshal(msg)
+	body, err := easyjson.Marshal(msg)
 	if err != nil {
 		return e.failed(fmt.Errorf("marshal results: %w", err))
 	}

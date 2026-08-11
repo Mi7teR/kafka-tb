@@ -137,6 +137,18 @@ func TestDecodePoison(t *testing.T) {
 	}
 }
 
+// Unknown fields must be dead-lettered as poison, not silently dropped: a producer
+// typo like "amont" for "amount" must not turn into a zero-value amount on a money
+// path. This is enforced by the easyjson generator's -disallow_unknown_fields flag
+// (see the go:generate directive in decoder.go).
+func TestDecodeRejectsUnknownField(t *testing.T) {
+	body := strings.Replace(okTransfers, `"amount"`, `"amont"`, 1)
+	_, err := newDecoder(t).Decode([]byte(body))
+	require.Error(t, err)
+	require.True(t, codec.IsPoison(err), "want poison, got %v", err)
+	require.ErrorContains(t, err, "unknown field")
+}
+
 func TestDecodeRejectsOversizedPayload(t *testing.T) {
 	cfg := config.Limits{MaxMessageBytes: 16, MaxEventsPerMessage: 8189, MaxJSONDepth: 32}
 	d := New(model.NewRegistry(&config.Config{

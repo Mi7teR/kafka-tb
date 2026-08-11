@@ -1,14 +1,13 @@
 package jsonc
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/Mi7teR/kafka-tb/internal/codec"
 	"github.com/Mi7teR/kafka-tb/internal/config"
 	"github.com/Mi7teR/kafka-tb/internal/model"
+	"github.com/mailru/easyjson/jlexer"
 	types "github.com/tigerbeetle/tigerbeetle-go"
 )
 
@@ -21,12 +20,20 @@ func New(reg *model.Registry, lim config.Limits) *Decoder {
 	return &Decoder{reg: reg, lim: lim}
 }
 
+// Generated marshalers replace encoding/json on this hot path. -disallow_unknown_fields
+// preserves the safety property encoding/json's DisallowUnknownFields gave us: a typo'd
+// field name must be dead-lettered as poison, not silently dropped and applied as a zero
+// value on a money path.
+//go:generate easyjson -disallow_unknown_fields $GOFILE
+
+//easyjson:json
 type message struct {
 	Operation string         `json:"operation"`
 	Transfers []jsonTransfer `json:"transfers"`
 	Accounts  []jsonAccount  `json:"accounts"`
 }
 
+//easyjson:json
 type jsonTransfer struct {
 	ID              string   `json:"id"`
 	DebitAccountID  string   `json:"debit_account_id"`
@@ -42,6 +49,7 @@ type jsonTransfer struct {
 	Timeout         string   `json:"timeout"`
 }
 
+//easyjson:json
 type jsonAccount struct {
 	ID          string   `json:"id"`
 	Ledger      string   `json:"ledger"`
@@ -67,14 +75,14 @@ func (d *Decoder) Decode(payload []byte) (cmd *model.Command, err error) {
 		return nil, err
 	}
 
+	// UnmarshalEasyJSON checks trailing data itself: it calls Lexer.Consumed once
+	// it detects this is the top-level value (Lexer.IsStart at entry), which is
+	// always true here since the lexer is freshly constructed.
 	var m message
-	dec := json.NewDecoder(bytes.NewReader(payload))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&m); err != nil {
+	lexer := jlexer.Lexer{Data: payload}
+	m.UnmarshalEasyJSON(&lexer)
+	if err := lexer.Error(); err != nil {
 		return nil, codec.Poison("json: %v", err)
-	}
-	if dec.More() {
-		return nil, codec.Poison("json: trailing data after first value")
 	}
 
 	switch model.Op(m.Operation) {
