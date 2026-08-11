@@ -29,6 +29,19 @@ import (
 	"github.com/Mi7teR/kafka-tb/internal/tbx"
 )
 
+// cdcSingleWriterWarning appears in the help of every subcommand that can
+// start the CDC job. The sink is fenced by its Kafka consumer group; the CDC
+// job has no such fence and none is planned, so the constraint has to be
+// impossible to miss.
+const cdcSingleWriterWarning = `EXACTLY ONE CDC INSTANCE MAY RUN AGAINST A GIVEN OUTPUT TOPIC.
+Nothing enforces this: the CDC job has no consumer group, no lock and no
+leader election. Two instances -- an overlapping rolling deploy, a stale pod
+-- each publish the whole change stream forever. That is permanent
+duplication, not the bounded kind the at-least-once contract allows, and two
+writers interleaving on the same key destroy the per-key ordering
+cdc.partition_key exists to provide. Deploy the CDC job as a single replica
+and cut the old instance over before starting the new one.`
+
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	if err := newRootCmd(log).Execute(); err != nil {
@@ -84,6 +97,14 @@ func newRootCmd(log *slog.Logger) *cobra.Command {
 		}()
 
 		if err := body(ctx, cfg); err != nil {
+			// A signal arriving while a pipeline is still starting up — the
+			// CDC job's cursor scan, say — surfaces as a cancelled context
+			// wrapped in whatever failed. That is the shutdown doing its job,
+			// not a failure, and must not be reported as one.
+			if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+				log.Info("stopped cleanly")
+				return nil
+			}
 			return fmt.Errorf("shutdown with error: %w", err)
 		}
 		log.Info("stopped cleanly")
@@ -124,14 +145,25 @@ func newRootCmd(log *slog.Logger) *cobra.Command {
 	runCmd := withTimestampLast(&cobra.Command{
 		Use:   "run",
 		Short: "run everything this process supports",
+		Long: "Run the Kafka -> TigerBeetle sink and, when cdc.topic names one, the\n" +
+			"TigerBeetle -> Kafka CDC job, in one process over one TigerBeetle client.\n\n" +
+			cdcSingleWriterWarning,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runUntilSignal(cmd, func(ctx context.Context, cfg *config.Config) error {
 				// The CDC job runs alongside the sink whenever cdc.topic names
 				// one. Left empty it is simply off, so a config written before
 				// the job existed keeps working.
+				cdcOn := cfg.CDC.Topic != ""
+				// --timestamp-last only means something to the CDC job. Taking
+				// it and quietly doing nothing with it would let an operator
+				// believe a replay had been requested.
+				if !cdcOn && cmd.Flags().Changed("timestamp-last") {
+					return errors.New(
+						"--timestamp-last: the CDC job is off (cdc.topic is empty), so there is no cursor to set")
+				}
 				return run(ctx, cfg, log, jobs{
 					sink:      true,
-					cdc:       cfg.CDC.Topic != "",
+					cdc:       cdcOn,
 					cdcCursor: cdcStart(cmd),
 				})
 			})
@@ -141,6 +173,8 @@ func newRootCmd(log *slog.Logger) *cobra.Command {
 	cdcCmd := withTimestampLast(&cobra.Command{
 		Use:   "cdc",
 		Short: "run only the TigerBeetle -> Kafka CDC job",
+		Long: "Stream TigerBeetle's change events to the Kafka topic named by cdc.topic.\n\n" +
+			cdcSingleWriterWarning,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runUntilSignal(cmd, func(ctx context.Context, cfg *config.Config) error {
 				if cfg.CDC.Topic == "" {
@@ -327,6 +361,14 @@ func startCDC(
 		log.Info("cdc: cursor overridden by --timestamp-last", slog.Uint64("checkpoint", checkpoint))
 	default:
 		if checkpoint, err = cdc.Resume(ctx, cfg.Kafka.Brokers, cfg.CDC.Topic, log); err != nil {
+			// A signal landing during the startup scan cancels ctx, and
+			// whatever the scan was in the middle of fails with it. Saying so
+			// explicitly is what lets the caller tell that shutdown from a
+			// broker that could not be reached — the scan's own timeout still
+			// reports as the failure it is.
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("cdc: cursor recovery interrupted: %w: %w", ctx.Err(), err)
+			}
 			return nil, err
 		}
 	}

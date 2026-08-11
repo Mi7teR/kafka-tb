@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -58,6 +60,9 @@ type fakePublisher struct {
 	calls [][]*kgo.Record
 	// failCalls indexes calls (from 1) that must fail instead of being acked.
 	failCalls map[int]bool
+	// failAll stands in for a permanently unpublishable window: a record over
+	// max.message.bytes, a topic that cannot be created.
+	failAll bool
 }
 
 func newFakePublisher(fail ...int) *fakePublisher {
@@ -72,7 +77,7 @@ func (p *fakePublisher) ProduceSync(_ context.Context, rs ...*kgo.Record) kgo.Pr
 	p.mu.Lock()
 	p.calls = append(p.calls, rs)
 	n := len(p.calls)
-	fail := p.failCalls[n]
+	fail := p.failAll || p.failCalls[n]
 	p.mu.Unlock()
 
 	results := make(kgo.ProduceResults, 0, len(rs))
@@ -244,6 +249,63 @@ func TestJobRetriesSourceFailures(t *testing.T) {
 		t.Fatalf("job exited on a source failure: %v", err)
 	default:
 	}
+}
+
+// The closing record claims the window's last timestamp as a point the stream
+// is complete up to, and the cursor jumps there. That is only true if the
+// window is an ascending prefix, so the job checks it rather than trusting an
+// experimental API — and stops, because no retry can reorder an answer and
+// publishing one would leave a permanent gap.
+func TestJobStopsOnAnOutOfOrderWindow(t *testing.T) {
+	events := testEvents(3)
+	events[1], events[2] = events[2], events[1] // 100, 102, 101
+	src := &fakeSource{events: events}
+	pub := newFakePublisher()
+	j := New(testJobConfig(), testRetry(), src, pub, testRegistry(), testLog())
+
+	err := j.Run(context.Background(), 0)
+	require.Error(t, err, "an out-of-order window must not be published")
+	require.Contains(t, err.Error(), "ascending timestamp order")
+	require.Empty(t, pub.groups(), "nothing of the window may reach the topic")
+}
+
+func TestJobRejectsRepeatedTimestamps(t *testing.T) {
+	events := testEvents(2)
+	events[1].Timestamp = events[0].Timestamp
+	src := &fakeSource{events: events}
+	j := New(testJobConfig(), testRetry(), src, newFakePublisher(), testRegistry(), testLog())
+
+	require.ErrorContains(t, j.Run(context.Background(), 0), "ascending timestamp order")
+}
+
+// A window that can never be published — a record over max.message.bytes, a
+// topic that cannot be created — is retried forever by design. The operator
+// has to be able to tell that from an idle stream, so the line escalates to
+// ERROR and carries the window and the failure count.
+func TestJobEscalatesAWindowThatKeepsFailing(t *testing.T) {
+	logs := &syncBuffer{}
+	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	src := &fakeSource{events: testEvents(3)}
+	pub := newFakePublisher()
+	pub.failAll = true
+	j := New(testJobConfig(), testRetry(), src, pub, testRegistry(), log)
+	runJob(t, j, 0)
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(logs.String(), "level=ERROR")
+	}, 5*time.Second, 5*time.Millisecond, "a window failing forever must escalate past WARN")
+
+	out := logs.String()
+	require.Contains(t, out, "the stream is stuck")
+	require.Contains(t, out, "window_min=1")
+	require.Contains(t, out, "window_max=102", "the failing window's range names the offending records")
+	require.Contains(t, out, "consecutive_failures=5")
+
+	// Everything before the escalation threshold stays at WARN: a broker
+	// blinking is not an incident.
+	require.Equal(t, escalateAfter-1,
+		strings.Count(out, "level=WARN msg=\"cdc: publication failed"))
 }
 
 func publishedRecords(p *fakePublisher) []*kgo.Record {

@@ -101,12 +101,28 @@ type Account struct {
 	Timestamp      string   `json:"timestamp"`
 }
 
+// gap identifies a registry (or vocabulary) gap already reported, so that one
+// missing entry is warned about once instead of once per event.
+type gap struct {
+	kind  string
+	value uint64
+}
+
 // Encoder turns change events into Kafka records.
+//
+// It is used from the job's single goroutine, which is why warned is a plain
+// map with no lock around it.
 type Encoder struct {
 	topic        string
 	partitionKey string
 	reg          *model.Registry
 	log          *slog.Logger
+	// warned remembers which unknown ledger ids, codes and event types have
+	// already been reported. A gap in the registry is a static condition: it
+	// affects every event on that ledger or with that code, so warning per
+	// occurrence floods the log at the full event rate and tells the operator
+	// nothing the first line did not.
+	warned map[gap]bool
 }
 
 func NewEncoder(cfg config.CDC, reg *model.Registry, log *slog.Logger) *Encoder {
@@ -114,7 +130,18 @@ func NewEncoder(cfg config.CDC, reg *model.Registry, log *slog.Logger) *Encoder 
 	if key == "" {
 		key = config.PartitionKeyDebitAccountID
 	}
-	return &Encoder{topic: cfg.Topic, partitionKey: key, reg: reg, log: log}
+	return &Encoder{topic: cfg.Topic, partitionKey: key, reg: reg, log: log, warned: map[gap]bool{}}
+}
+
+// first reports whether this kind/value pair is being seen for the first
+// time, and records it either way.
+func (e *Encoder) first(kind string, value uint64) bool {
+	g := gap{kind: kind, value: value}
+	if e.warned[g] {
+		return false
+	}
+	e.warned[g] = true
+	return true
 }
 
 // Record renders one event as a Kafka record carrying checkpoint as the
@@ -135,7 +162,7 @@ func (e *Encoder) Record(ev types.ChangeEvent, checkpoint uint64) (*kgo.Record, 
 			UserData32:  ev.TransferUserData32,
 			Timeout:     timeout(ev.TransferTimeout),
 			Code:        e.code(ev.TransferCode, "transfer", ev.Timestamp),
-			Flags:       e.reg.TransferFlagNames(ev.TransferFlags),
+			Flags:       flagList(e.reg.TransferFlagNames(ev.TransferFlags)),
 			Timestamp:   strconv.FormatUint(ev.TransferTimestamp, 10),
 		},
 		DebitAccount: Account{
@@ -148,7 +175,7 @@ func (e *Encoder) Record(ev types.ChangeEvent, checkpoint uint64) (*kgo.Record, 
 			UserData64:     ev.DebitAccountUserData64,
 			UserData32:     ev.DebitAccountUserData32,
 			Code:           e.code(ev.DebitAccountCode, "debit_account", ev.Timestamp),
-			Flags:          e.reg.AccountFlagNames(ev.DebitAccountFlags),
+			Flags:          flagList(e.reg.AccountFlagNames(ev.DebitAccountFlags)),
 			Timestamp:      strconv.FormatUint(ev.DebitAccountTimestamp, 10),
 		},
 		CreditAccount: Account{
@@ -161,7 +188,7 @@ func (e *Encoder) Record(ev types.ChangeEvent, checkpoint uint64) (*kgo.Record, 
 			UserData64:     ev.CreditAccountUserData64,
 			UserData32:     ev.CreditAccountUserData32,
 			Code:           e.code(ev.CreditAccountCode, "credit_account", ev.Timestamp),
-			Flags:          e.reg.AccountFlagNames(ev.CreditAccountFlags),
+			Flags:          flagList(e.reg.AccountFlagNames(ev.CreditAccountFlags)),
 			Timestamp:      strconv.FormatUint(ev.CreditAccountTimestamp, 10),
 		},
 	}
@@ -205,11 +232,17 @@ func (e *Encoder) key(msg Message) string {
 // its amounts stay in minor units: losing a financial event because a config
 // entry is missing would be far worse than an ugly message, and inventing a
 // scale would misstate the amount.
+//
+// The warning is emitted once per unknown ledger id, not once per event: see
+// Encoder.warned.
 func (e *Encoder) ledger(ev types.ChangeEvent) (string, int32) {
 	name, err := e.reg.LedgerName(ev.Ledger)
 	if err != nil {
-		e.log.Warn("cdc: unknown ledger, publishing the numeric value and unscaled amounts",
-			slog.Uint64("ledger", uint64(ev.Ledger)), slog.Uint64("timestamp", ev.Timestamp))
+		if e.first("ledger", uint64(ev.Ledger)) {
+			e.log.Warn("cdc: unknown ledger, publishing the numeric value and unscaled amounts "+
+				"(logged once per ledger id)",
+				slog.Uint64("ledger", uint64(ev.Ledger)), slog.Uint64("timestamp", ev.Timestamp))
+		}
 		return strconv.FormatUint(uint64(ev.Ledger), 10), 0
 	}
 	scale, err := e.reg.ScaleByLedgerID(ev.Ledger)
@@ -223,12 +256,17 @@ func (e *Encoder) ledger(ev types.ChangeEvent) (string, int32) {
 // code names a code, or reports it numerically with a warning. field says
 // which of the three codes it is, so the operator knows what to add to the
 // registry.
+//
+// The warning is emitted once per unknown code value, not once per event or
+// per field: see Encoder.warned.
 func (e *Encoder) code(v uint16, field string, ts uint64) string {
 	name, err := e.reg.CodeName(v)
 	if err != nil {
-		e.log.Warn("cdc: unknown code, publishing the numeric value",
-			slog.String("field", field), slog.Uint64("code", uint64(v)),
-			slog.Uint64("timestamp", ts))
+		if e.first("code", uint64(v)) {
+			e.log.Warn("cdc: unknown code, publishing the numeric value (logged once per code)",
+				slog.String("field", field), slog.Uint64("code", uint64(v)),
+				slog.Uint64("timestamp", ts))
+		}
 		return strconv.FormatUint(uint64(v), 10)
 	}
 	return name
@@ -241,9 +279,24 @@ func (e *Encoder) eventType(ev types.ChangeEvent) string {
 	if name, ok := eventTypeNames[ev.Type]; ok {
 		return name
 	}
-	e.log.Warn("cdc: unknown change event type, publishing the numeric value",
-		slog.Uint64("type", uint64(ev.Type)), slog.Uint64("timestamp", ev.Timestamp))
+	if e.first("event_type", uint64(ev.Type)) {
+		e.log.Warn("cdc: unknown change event type, publishing the numeric value "+
+			"(logged once per type)",
+			slog.Uint64("type", uint64(ev.Type)), slog.Uint64("timestamp", ev.Timestamp))
+	}
 	return strconv.FormatUint(uint64(ev.Type), 10)
+}
+
+// flagList makes a flag list safe to marshal. model's flagNames returns nil
+// for no flags, and nil marshals as null — but a flagless transfer or account
+// is the common case, and the format documents flags as an array. A consumer
+// validating against a schema would break on the majority of messages, so an
+// empty list is written as [].
+func flagList(names []string) []string {
+	if names == nil {
+		return []string{}
+	}
+	return names
 }
 
 // optionalID renders an id, or "" for the zero id so the field is omitted:

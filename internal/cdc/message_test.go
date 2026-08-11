@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -207,6 +208,57 @@ func TestUnknownLedgerAndCodePublishNumericValuesAndWarn(t *testing.T) {
 	require.Contains(t, out, "unknown ledger")
 	require.Contains(t, out, "unknown code")
 	require.Contains(t, out, "1745328372192037030", "the warning must name the event it is about")
+}
+
+// A transfer or account with no flags is the common case, and it must still
+// serialise as [] — a consumer validating the field as an array would break
+// on the majority of messages if it were null.
+func TestZeroFlagsSerialiseAsAnEmptyArray(t *testing.T) {
+	enc, _ := testEncoder(t, "")
+	ev := sampleEvent(types.ChangeEventSinglePhase)
+	ev.TransferFlags = 0
+	ev.DebitAccountFlags = 0
+	ev.CreditAccountFlags = 0
+
+	rec, err := enc.Record(ev, 0)
+	require.NoError(t, err)
+	require.NotContains(t, string(rec.Value), `"flags":null`)
+
+	body := decode(t, rec.Value)
+	for _, field := range []string{"transfer", "debit_account", "credit_account"} {
+		require.Equal(t, []any{}, body[field].(map[string]any)["flags"], field)
+	}
+}
+
+// A registry gap is a static condition: every event on that ledger hits it.
+// Warning per occurrence would flood the log at the full event rate, so each
+// distinct unknown value is reported once.
+func TestUnknownValuesAreWarnedAboutOnlyOnce(t *testing.T) {
+	enc, logs := testEncoder(t, "")
+	ev := sampleEvent(types.ChangeEventSinglePhase)
+	ev.Ledger = 99
+	ev.TransferCode = 98
+	ev.DebitAccountCode = 98
+	ev.CreditAccountCode = 98
+	ev.Type = types.ChangeEventType(200)
+
+	for i := 0; i < 50; i++ {
+		ev.Timestamp = uint64(1745328372192037030 + i)
+		_, err := enc.Record(ev, 0)
+		require.NoError(t, err)
+	}
+
+	out := logs.String()
+	require.Equal(t, 1, strings.Count(out, "unknown ledger"))
+	require.Equal(t, 1, strings.Count(out, "unknown code"), "one warning per code value, not per field or event")
+	require.Equal(t, 1, strings.Count(out, "unknown change event type"))
+
+	// A second, different unknown code is still reported: the rate limit is
+	// per value, not a global one-shot.
+	ev.TransferCode = 97
+	_, err := enc.Record(ev, 0)
+	require.NoError(t, err)
+	require.Equal(t, 2, strings.Count(logs.String(), "unknown code"))
 }
 
 func TestPartitionKeyMatchesConfig(t *testing.T) {

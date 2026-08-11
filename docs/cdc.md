@@ -11,6 +11,35 @@ The source is the Go client's `GetChangeEvents`, which TigerBeetle marks
 (`cdc.Source`), so a change to its signature lands in one declaration and one
 adapter rather than across the package.
 
+The job requires that answer to be a **strictly ascending, timestamp-ordered
+prefix** of what follows the cursor. Everything below rests on it, so it is
+checked on every window rather than trusted: a window that is not ascending
+stops the job with an `ERROR` instead of being published.
+
+## ⚠️ Exactly one CDC instance per output topic
+
+**Run exactly one CDC instance against a given output topic. Nothing enforces
+this.**
+
+The sink is fenced by its Kafka consumer group: start a second one and the
+group hands each partition to exactly one of them. The CDC job has no such
+fence — no consumer group, no lock, no leader election — and none is planned.
+
+Two instances (an overlapping rolling deploy, a stale pod nobody noticed) each
+read the whole change stream and each publish all of it, forever. That is:
+
+- **permanent duplication**, not the bounded, crash-scoped kind the
+  at-least-once contract allows — a consumer sees every event twice for as
+  long as both run; and
+- **broken per-key ordering**: two writers interleaving on the same key make
+  the per-account (or per-ledger, or per-transfer) order that
+  `cdc.partition_key` exists to provide meaningless.
+
+So: deploy the CDC job as a **single replica**, and cut the old instance over
+— stopped, not merely draining — before starting the new one. `kafkatb run`
+starts the CDC job too whenever `cdc.topic` is set, so the same rule covers
+every `kafkatb run` replica.
+
 ## Configuration
 
 ```yaml
@@ -70,13 +99,21 @@ wire-compatible with the official AMQP consumer.
 `two_phase_voided`, `two_phase_expired`. Both account snapshots are the state
 TigerBeetle held as of the event, including each account's own timestamp.
 Optional fields (`pending_id`, `user_data_*`, `timeout`) are omitted when
-zero.
+zero. `flags` is **always an array** — a transfer or account with no flags
+carries `"flags": []`, never `null`, which is the common case and the one a
+consumer's schema is most likely to see.
 
 **A registry gap never costs an event.** An unknown ledger or code is
 published with its numeric value in place of the name and a `WARN` naming the
 event; amounts of an unknown ledger stay in minor units, since inventing a
 scale would misstate the amount. Dropping a financial event because a config
 entry is missing would be far worse than an ugly message.
+
+The warning is emitted **once per distinct unknown value** — once per ledger
+id, once per code, once per event type — not once per event. A gap is a static
+condition affecting every event on that ledger, and warning per occurrence
+would flood the log at the full event rate while telling the operator nothing
+the first line did not.
 
 ### Headers
 
@@ -91,8 +128,33 @@ moves past it**. Losing an event is unacceptable; duplicating one after a
 crash is acceptable, and is the contract.
 
 **Consumers must deduplicate on `timestamp`.** TigerBeetle's event timestamp
-is unique and monotonic, so it is a complete deduplication key on its own —
-no compound key, no state beyond the highest timestamp already handled.
+is unique, so it is a complete deduplication key on its own — no compound key
+is needed.
+
+But it has to be applied **idempotently, per event**: either
+
+- keep a set of the timestamps already applied and skip an event whose
+  timestamp is in it, or
+- apply the event as an **upsert keyed on `timestamp`**, so re-applying it is
+  a no-op.
+
+**Do not keep a running maximum.** "Skip anything at or below the highest
+timestamp I have handled" looks like it follows from uniqueness, and it loses
+events. Two independent reasons, either one on its own is enough:
+
+- **The topic is keyed and multi-partition, so there is no global timestamp
+  order across it.** Records are routed by `partition_key`, and a consumer
+  interleaves partitions in whatever order they arrive. Read `105` from
+  partition 0, set max to 105, then read `103` from partition 1 — and `103`
+  is discarded as already handled, though it never was.
+- **Replay delivers events behind ones already handled.** After a crash
+  mid-window the job republishes that whole window (see below). If `104`
+  landed before the crash and `103` did not, the replay delivers `103` after
+  `104` has been handled, and the maximum swallows it.
+
+A **per-partition** high-water mark fixes only the first reason. The second
+one still loses `103`, on its own partition, in timestamp order. Only
+idempotent application keyed on `timestamp` is correct.
 
 ## Progress: no external state
 
@@ -100,7 +162,8 @@ Like the official job, this one stores its cursor nowhere. On startup it reads
 the **last record of every partition** of the output topic and resumes from the
 highest `checkpoint` it finds, plus one. An empty or missing topic starts from
 zero. `--timestamp-last N` overrides that (including `--timestamp-last 0` to
-replay everything).
+replay everything). `kafkatb run` rejects `--timestamp-last` when `cdc.topic`
+is empty rather than accepting a cursor for a job it is not going to start.
 
 `checkpoint` is the field that makes this safe, and it reads: *every event with
 a timestamp up to and including this one is present in this topic.* It is not
@@ -131,3 +194,32 @@ claims its own timestamp, so nothing is replayed.
 A tail record that cannot be read (foreign, corrupt, or written by a future
 version) is skipped with a `WARN` rather than failing the start: skipping one
 lowers the cursor and costs duplicates, while trusting it could cost an event.
+
+## Failures: retried forever, escalated when stuck
+
+A failed query or a failed publication is retried from the same cursor with a
+backoff, forever. Giving up would stop the stream until somebody noticed,
+which is the worse failure.
+
+But some failures never clear: a record larger than the topic's
+`max.message.bytes`, an output topic that cannot be auto-created, a broker
+ACL. The window is then retried forever and the stream is stuck — and a stuck
+stream looks exactly like an idle one from the outside.
+
+So after **5 consecutive failures of the same window** the retry line is
+logged at `ERROR` instead of `WARN`:
+
+```
+cdc: the stream is stuck: the same window has failed to publish repeatedly
+    checkpoint=1745328372192037030 window_min=1745328372192037031
+    window_max=1745328372192038112 events=1000 consecutive_failures=5
+    error="..." in=30s
+```
+
+`window_min`/`window_max` bracket the events that cannot get out, so the
+offending record can be found; `consecutive_failures` keeps counting, so the
+line distinguishes "stuck since a moment ago" from "stuck all night".
+
+Two things are *not* retried, because no retry could fix them: a window that
+is not in ascending timestamp order (see above), and a config the job cannot
+start with. Both stop the job with an `ERROR`.
