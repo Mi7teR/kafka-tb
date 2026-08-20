@@ -637,6 +637,94 @@ func TestBatcherEverySubmissionAnsweredAcrossShutdown(t *testing.T) {
 	}
 }
 
+// watchLate is the branch a submitter takes when its command lands on the
+// queue after shutdown has already begun: SubmitAsync's enqueue select races
+// <-b.stop against b.queue <- j, and Go picks between two ready cases at
+// random, so the job can land on the queue even though stop is already
+// closed. Nothing else forces that branch: the other watchLate-adjacent
+// tests either run before stop is closed (answered by a drain) or accept
+// either answer, so neither can force it. Missing this branch means a late
+// command could go permanently silent — a lost Kafka message.
+//
+// Phase 1 reproduces the race directly: with stop already closed and its
+// drain already run (settle(), while the queue was still empty), repeatedly
+// attempt the same two-way select SubmitAsync's enqueue uses until the queue
+// send wins it, bounded so a change to that select's odds cannot hang the
+// test. The job that lands is then permanently unreachable by any drain, so
+// watchLate's only way to answer it is the finished case, and the assertion
+// is that it does so with ErrClosed exactly once rather than staying silent.
+//
+// Phase 2 exercises the priority check inside that case: once finished is
+// closed, an outcome already sitting in j.done must still beat ErrClosed.
+// The outer select's random pick can't be steered from outside without
+// touching production code, so this is run many times rather than forced:
+// with two always-ready cases each trial, missing the finished branch (the
+// only one the priority check guards) in all of them is astronomically
+// unlikely.
+func TestBatcherWatchLateAnswersLateEnqueueWithErrClosed(t *testing.T) {
+	const enqueueAttempts = 10000
+
+	b := NewBatcher(&fakeClient{}, config.Batcher{MaxBatchSize: 10, Linger: time.Hour, MaxQueue: 1},
+		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger(), nil)
+	t.Cleanup(func() { b.Close() })
+
+	// Shutdown has already begun, and its drain has already run (queue was
+	// empty): a job that lands on the queue after this point cannot ever be
+	// answered by a drain.
+	b.signalStop()
+	b.settle()
+
+	// Phase 1: force the enqueue select's odds to land on the queue case
+	// despite stop already being closed.
+	var late *job
+	for i := 0; i < enqueueAttempts && late == nil; i++ {
+		j := &job{cmd: transferCmd(1, "late"), done: make(chan SubmitResult, 1)}
+		select {
+		case <-b.stop:
+			continue // stop won this attempt; try again
+		case b.queue <- j:
+			late = j
+		}
+	}
+	require.NotNil(t, late, "queue case never won the random pick in %d attempts", enqueueAttempts)
+
+	// The post-enqueue check in SubmitAsync is deterministic (it has a
+	// default): stop is already closed, so it must take the watchLate path.
+	out := b.watchLate(late)
+
+	select {
+	case res := <-out:
+		require.ErrorIs(t, res.Err, ErrClosed)
+		require.Nil(t, res.Outcomes)
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchLate went silent for a command no drain could ever see")
+	}
+	select {
+	case <-out:
+		t.Fatal("watchLate answered twice")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Phase 2: finished is already closed from Phase 1's settle(). Each
+	// trial's job carries a real result buffered in j.done before racing it;
+	// the real result must win every time, not just when the outer select
+	// happens to pick the j.done case directly.
+	const priorityTrials = 300
+	want := SubmitResult{Outcomes: []Outcome{{Index: 0, ID: "priority", Status: StatusOK}}}
+	for i := 0; i < priorityTrials; i++ {
+		j := &job{cmd: transferCmd(1, "priority"), done: make(chan SubmitResult, 1)}
+		j.done <- want
+		out := b.watchLate(j)
+		select {
+		case res := <-out:
+			require.NoError(t, res.Err, "trial %d: an already-delivered outcome lost to ErrClosed", i)
+			require.Equal(t, want.Outcomes, res.Outcomes, "trial %d", i)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("trial %d: watchLate went silent", i)
+		}
+	}
+}
+
 func TestBatcherAccountsGoToSeparateBatches(t *testing.T) {
 	fc := &fakeClient{}
 	b, _ := startBatcher(t, fc, 100, 5*time.Millisecond)

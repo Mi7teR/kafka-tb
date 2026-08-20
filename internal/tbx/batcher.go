@@ -84,6 +84,14 @@ type Batcher struct {
 	// cap(max_batch_size) buffer is 1 MiB for transfers whatever the batches
 	// actually hold, and that allocation, once per call, was 34% of everything the
 	// sink allocated (.superpowers/sdd/perf-pprof.md 2c).
+	//
+	// The tradeoff is that whatever high-water mark a buffer grows to is held for the
+	// rest of the process's life — append never shrinks capacity back down. At
+	// config.MaxBatchSize (8189), that is up to ~1 MiB for transfers and up to
+	// ~1 MiB for accounts (both types are 128 bytes wide), so up to ~2 MiB retained
+	// between the two in the worst case. This is intended and harmless: both
+	// types.Transfer and types.Account are pointer-free, so the retained capacity
+	// pins nothing else down for the GC.
 	transfers []types.Transfer
 	accounts  []types.Account
 
