@@ -72,6 +72,21 @@ type Batcher struct {
 	finishedOnce sync.Once
 	finished     chan struct{}
 
+	// transfers and accounts are the worker's assembly buffers, reused from send to
+	// send. Only the loop's send path touches them, and the TigerBeetle client is
+	// synchronous: it pins the slice for the duration of the call, copies the events
+	// into its own message, and returns the reply in a separate buffer — nothing of
+	// ours outlives the call. Reuse cannot leak one batch into the next either:
+	// every send starts from [:0] and only the freshly appended prefix is ever read,
+	// by this file and by the client alike, which is handed len(events).
+	//
+	// They are grown by append rather than preallocated: a fixed
+	// cap(max_batch_size) buffer is 1 MiB for transfers whatever the batches
+	// actually hold, and that allocation, once per call, was 34% of everything the
+	// sink allocated (.superpowers/sdd/perf-pprof.md 2c).
+	transfers []types.Transfer
+	accounts  []types.Account
+
 	// unwatch cancels the subscription to Start's context cancellation.
 	// It is written in Start and read in Close; the lifecycle contract
 	// (exactly one Start, Close strictly after it) is described in their doc comments.
@@ -365,7 +380,7 @@ func (b *Batcher) send(op model.Op, jobs []*job) error {
 }
 
 func (b *Batcher) sendTransfers(jobs []*job) error {
-	events := make([]types.Transfer, 0, b.cfg.MaxBatchSize)
+	events := b.transfers[:0]
 	offsets := make([]int, len(jobs))
 	for i, j := range jobs {
 		offsets[i] = len(events)
@@ -373,6 +388,7 @@ func (b *Batcher) sendTransfers(jobs []*job) error {
 		// The chain must not stay open at the seam between commands.
 		events[len(events)-1].Flags &^= linkedBit
 	}
+	b.transfers = events // keep whatever capacity the appends grew
 
 	b.metrics.ObserveBatchSize(len(events))
 	start := time.Now()
@@ -390,13 +406,14 @@ func (b *Batcher) sendTransfers(jobs []*job) error {
 }
 
 func (b *Batcher) sendAccounts(jobs []*job) error {
-	events := make([]types.Account, 0, b.cfg.MaxBatchSize)
+	events := b.accounts[:0]
 	offsets := make([]int, len(jobs))
 	for i, j := range jobs {
 		offsets[i] = len(events)
 		events = append(events, j.cmd.Accounts...)
 		events[len(events)-1].Flags &^= linkedBit
 	}
+	b.accounts = events // keep whatever capacity the appends grew
 
 	b.metrics.ObserveBatchSize(len(events))
 	start := time.Now()
