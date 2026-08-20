@@ -61,11 +61,14 @@ type Batcher struct {
 	stopOnce sync.Once
 	stop     chan struct{}
 
-	// finished means "the loop has exited", not "a stop was requested". The
-	// difference is essential: while the loop is alive, it can still respond to a command
-	// already placed on the queue, and the submitter must wait for that response.
-	// A submitter waiting for an outcome exits only on finished — only then is
+	// finished means "the loop has exited and the queue has been drained", not "a
+	// stop was requested". The difference is essential: while the loop is alive, it
+	// can still respond to a command already placed on the queue, and the submitter
+	// must wait for that response. A submitter that has to wait for the batcher
+	// rather than for its own outcome exits only on finished — only then is
 	// "no one will respond anymore" a guarantee rather than a guess.
+	// Only watchLate needs it; the ordinary submitter holds j.done, which settle
+	// answers.
 	finishedOnce sync.Once
 	finished     chan struct{}
 
@@ -98,7 +101,7 @@ func (b *Batcher) Start(ctx context.Context) {
 	go func() { defer b.wg.Done(); b.loop() }()
 	// The watcher lives here, not in Close: the stop path via context cancellation
 	// does not go through Close, but it must release submitters just the same.
-	go func() { b.wg.Wait(); b.signalFinished() }()
+	go func() { b.wg.Wait(); b.settle() }()
 }
 
 // SubmitAsync places the command on the queue and immediately returns a channel that
@@ -138,10 +141,35 @@ func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan S
 	case b.queue <- j:
 	}
 
-	// Waiting for the outcome lives here, not with the caller: the channel's holder knows
-	// only about it and cannot itself find out that there is no one left to answer. Handing it
-	// the bare j.done would mean silence instead of ErrClosed for a command that
-	// no loop ever saw — for the sink that is a lost message.
+	// The command is on the queue and shutdown had not begun when it got there, so
+	// somebody is guaranteed to answer it: j.done goes to the caller as it is.
+	//
+	// The guarantee is an ordering argument, not a hope. Every shutdown path closes
+	// stop first and drains the queue only afterwards (loop's stop branch, settle).
+	// Operations on one channel are totally ordered, so a stop this receive does not
+	// observe as closed is a stop that closes after it — and therefore after the
+	// send above, which precedes it in program order. A drain that starts after our
+	// send finds the job already in the buffer and empties the buffer, so it cannot
+	// miss it.
+	//
+	// This ordering is what keeps the hot path off a process-wide channel. The
+	// previous shape — a goroutine per command selecting on j.done and the shared
+	// finished — made every waiter lock and unlock that one channel, which was 93%
+	// of all mutex delay in the sink (.superpowers/sdd/perf-pprof.md §2b).
+	select {
+	case <-b.stop:
+		// Shutdown raced this submission: the drain may already be behind us, and
+		// then nothing would ever write to j.done. Only this case needs finished.
+		return b.watchLate(j), nil
+	default:
+		return j.done, nil
+	}
+}
+
+// watchLate waits for a command that landed on the queue with shutdown already under
+// way — the one case where no drain is guaranteed to see it. It is off the hot path
+// by construction: it is reached only once stop is closed.
+func (b *Batcher) watchLate(j *job) <-chan SubmitResult {
 	out := make(chan SubmitResult, 1)
 	go func() {
 		select {
@@ -153,8 +181,8 @@ func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan S
 			// about to return an outcome. Responding with ErrClosed at this moment would be a lie
 			// about work that was actually applied; the caller is not obligated to repeat the request with
 			// the same id, and it has no way to recover the truth.
-			// finished, on the other hand, is closed after the loop has exited, i.e. when
-			// there is truly no one left to answer this command.
+			// finished, on the other hand, is closed after the loop has exited and the
+			// queue has been drained, i.e. when there is truly no one left to answer.
 			//
 			// The race "the outcome is delivered exactly when the loop exits" is real:
 			// both channels are ready, and select would choose randomly. We restore
@@ -163,7 +191,7 @@ func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan S
 			case res := <-j.done:
 				out <- res
 			default:
-				// The command reached the queue so late that the loop never
+				// The command reached the queue so late that no drain
 				// saw it. We respond with an error rather than staying silent; from here on it relies
 				// on idempotency by id — a retry yields TransferExists/
 				// AccountExists, and MapTransferResults/MapAccountResults
@@ -172,7 +200,7 @@ func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan S
 			}
 		}
 	}()
-	return out, nil
+	return out
 }
 
 // Submit places the command on the queue and waits for the outcome.
@@ -212,7 +240,25 @@ func (b *Batcher) Close() {
 	}
 	b.wg.Wait()
 	// A safeguard for the case where Start was never called: there is no watcher,
-	// and a submitter without finished would wait for an outcome forever.
+	// no loop to drain the queue, and a submitter holding j.done would wait for an
+	// outcome forever.
+	b.settle()
+}
+
+// settle closes the door behind the loop: it answers whatever is still on the queue
+// and only then declares that nobody will answer anymore. Both halves matter.
+//
+// The drain is what lets SubmitAsync hand j.done to the caller: it is the last
+// receiver on the queue, and it runs after stop is closed, so it sees every command
+// that got in while stop was still open — including when Start was never called and
+// there is no loop to drain at all. Draining before closing finished is deliberate:
+// an outcome must beat ErrClosed wherever both are possible.
+//
+// It runs from Close and from the watcher, possibly at the same time. That is safe:
+// a queued job is received by exactly one of them, and only its receiver answers it,
+// so the "exactly one result per command" rule holds either way.
+func (b *Batcher) settle() {
+	b.drain(b.queue, ErrClosed)
 	b.signalFinished()
 }
 

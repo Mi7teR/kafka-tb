@@ -574,6 +574,69 @@ func TestBatcherSubmitAsyncCloseDeliversOutcomeForInFlightBatch(t *testing.T) {
 	}
 }
 
+// SubmitAsync hands the caller j.done itself, so "every command receives exactly one
+// result" rests on the claim that a command which slips past stop is still seen by a
+// drain. This is that race, run wide: hundreds of submissions crossing a shutdown.
+// Silence is a lost Kafka message and two answers would mean two writers on one
+// channel; ErrClosed and a real outcome are both correct answers here, and which one
+// a given submitter gets is genuinely undecided.
+func TestBatcherEverySubmissionAnsweredAcrossShutdown(t *testing.T) {
+	const submitters = 200
+	fc := &fakeClient{}
+	ctx, cancel := context.WithCancel(context.Background())
+	b := NewBatcher(fc, config.Batcher{MaxBatchSize: 10, Linger: time.Millisecond, MaxQueue: 16},
+		config.Retry{Initial: time.Millisecond, Max: time.Millisecond}, testLogger(), nil)
+	b.Start(ctx)
+
+	const (
+		refused    = -1
+		unanswered = 0
+		once       = 1
+		twice      = 2
+	)
+	answers := make(chan int, submitters)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < submitters; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ch, err := b.SubmitAsync(context.Background(), transferCmd(1, "race"))
+			if err != nil {
+				// Refusal at submission is an answer too: nothing was enqueued.
+				answers <- refused
+				return
+			}
+			select {
+			case <-ch:
+			case <-time.After(10 * time.Second):
+				answers <- unanswered
+				return
+			}
+			select {
+			case <-ch:
+				answers <- twice
+			case <-time.After(100 * time.Millisecond):
+				answers <- once
+			}
+		}()
+	}
+	close(start)
+	// Long enough for some submissions to be applied, short enough that the rest are
+	// still in flight when stop closes: the seam is the point of the test.
+	time.Sleep(2 * time.Millisecond)
+	cancel()
+	b.Close()
+
+	wg.Wait()
+	close(answers)
+	for a := range answers {
+		require.NotEqual(t, unanswered, a, "a command on the queue never got a result")
+		require.NotEqual(t, twice, a, "a command got two results")
+	}
+}
+
 func TestBatcherAccountsGoToSeparateBatches(t *testing.T) {
 	fc := &fakeClient{}
 	b, _ := startBatcher(t, fc, 100, 5*time.Millisecond)
