@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -49,6 +50,64 @@ func TestServeHealthzOK(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+// TestPprofOffByDefault is the guard on the one thing about pprof that must
+// not drift: a Server built the ordinary way exposes no debugging surface.
+// /debug/pprof/ is checked because net/http/pprof's init() registers its
+// handlers on http.DefaultServeMux the moment the package is linked in, so a
+// server that reached for the default mux — or a future refactor that did —
+// would serve these without anyone asking.
+func TestPprofOffByDefault(t *testing.T) {
+	addr := freeAddr(t)
+	srv := NewServer(addr, func() error { return nil }, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+	waitUp(t, addr)
+
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/cmdline", "/debug/pprof/heap"} {
+		resp, err := http.Get("http://" + addr + path)
+		require.NoError(t, err)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		require.NoError(t, resp.Body.Close())
+		require.Equal(t, http.StatusNotFound, resp.StatusCode, "%s must not be served by default", path)
+	}
+	// WithPprof(false) is what a caller passing a config flag through hands
+	// over when the flag is unset, so it must mean exactly the same thing.
+	require.False(t, NewServer(addr, func() error { return nil }, nil, WithPprof(false)).pprof)
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+// TestPprofEnabled checks the flag actually does something, so that
+// TestPprofOffByDefault cannot pass by pprof being broken outright.
+func TestPprofEnabled(t *testing.T) {
+	addr := freeAddr(t)
+	srv := NewServer(addr, func() error { return nil }, nil, WithPprof(true))
+	// The profilers WithPprof turns on are process-global; put them back
+	// where they were so the rest of the package's tests run unprofiled.
+	t.Cleanup(func() {
+		runtime.SetBlockProfileRate(0)
+		runtime.SetMutexProfileFraction(0)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+	waitUp(t, addr)
+
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/heap", "/debug/pprof/block"} {
+		resp, err := http.Get("http://" + addr + path)
+		require.NoError(t, err)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		require.NoError(t, resp.Body.Close())
+		require.Equal(t, http.StatusOK, resp.StatusCode, "%s", path)
+	}
+	require.NotZero(t, runtime.SetMutexProfileFraction(-1), "the mutex profiler was left off")
 
 	cancel()
 	require.NoError(t, <-done)

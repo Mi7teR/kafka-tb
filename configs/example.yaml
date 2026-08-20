@@ -80,3 +80,12 @@ retry: {initial: 100ms, max: 30s, jitter: true}
 shutdown_timeout: 30s
 # Listen address for /metrics, /healthz and /readyz.
 metrics_addr: ":9464"
+# Adds net/http/pprof's endpoints under /debug/pprof/ on metrics_addr, and
+# turns on Go's block and mutex profilers so those endpoints have something to
+# report. Off by default and worth leaving off: the endpoints expose this
+# process's command line, its goroutine stacks and its heap to anything that
+# can reach metrics_addr, they have no authentication of their own, and
+# /debug/pprof/profile will burn 30 seconds of CPU on request. The two
+# profilers are not free either. Turn it on for an investigation, on an
+# address that is not public, and turn it back off.
+pprof: false

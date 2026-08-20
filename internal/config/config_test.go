@@ -253,6 +253,21 @@ func TestLoadDefaultsCDC(t *testing.T) {
 	require.Equal(t, PartitionKeyDebitAccountID, cfg.CDC.PartitionKey)
 }
 
+// TestPprofDefaultsOff pins the default of a flag whose wrong value is a
+// remote debugging surface rather than a misconfiguration: a config that
+// never mentions pprof must not get it.
+func TestPprofDefaultsOff(t *testing.T) {
+	cfg, err := Load(writeCfg(t, validCfg))
+	require.NoError(t, err)
+	require.False(t, cfg.Pprof)
+}
+
+func TestPprofCanBeEnabled(t *testing.T) {
+	cfg, err := Load(writeCfg(t, validCfg+"pprof: true\n"))
+	require.NoError(t, err)
+	require.True(t, cfg.Pprof)
+}
+
 func TestLoadCDCSection(t *testing.T) {
 	cfg, err := Load(writeCfg(t, validCfg+`
 cdc:

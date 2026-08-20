@@ -124,6 +124,12 @@ type Config struct {
 	ShutdownTimeout time.Duration     `yaml:"shutdown_timeout"`
 	// MetricsAddr serves /metrics, /healthz and /readyz.
 	MetricsAddr string `yaml:"metrics_addr"`
+	// Pprof adds net/http/pprof's endpoints to the metrics server and turns
+	// on the block and mutex profilers. Off by default and meant to stay
+	// that way outside an investigation: /debug/pprof/ exposes the process's
+	// command line, its goroutine stacks and its heap to anyone who can
+	// reach MetricsAddr, and the two profilers it enables are not free.
+	Pprof bool `yaml:"pprof"`
 }
 
 func (c *Config) LedgerByName(name string) (Ledger, bool) {

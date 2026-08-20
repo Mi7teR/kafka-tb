@@ -277,7 +277,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger, which jobs) 
 			}
 		}
 		return nil
-	}, log)
+	}, log, obs.WithPprof(cfg.Pprof))
 	g.Go(func() error { return metricsSrv.Serve(gctx) })
 	return g.Wait()
 }
