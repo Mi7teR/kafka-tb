@@ -48,7 +48,20 @@ cdc:
   topic: ledger.events
   # How many change events one window asks TigerBeetle for. The whole window
   # is published and acknowledged before the cursor moves past it.
-  batch_size: 1000
+  #
+  # 2730 is both the default and the hard ceiling: a change event is 384 bytes,
+  # so floor((1 MiB - 128 B header) / 384) events is all TigerBeetle will serve
+  # in one request — unlike batcher.max_batch_size's 8189, which counts
+  # 128-byte transfers. Anything above 2730 is rejected at startup, because
+  # TigerBeetle would refuse the query forever.
+  #
+  # It defaults to the ceiling because a window's cost is almost entirely
+  # per-window, not per-event: measured over 200,000 events on one partition,
+  # 100 gave ~19.5k events/sec, 1000 gave ~43k and 2730 gave ~104k. Lower it
+  # only to trade throughput for publication granularity — a window is
+  # published as a unit, so a smaller one puts fewer events behind the same
+  # acknowledgement.
+  batch_size: 2730
   # How long to wait before asking again when TigerBeetle has nothing new.
   poll_interval: 1s
   # Which field becomes the Kafka record key, and therefore which ordering a

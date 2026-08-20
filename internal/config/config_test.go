@@ -249,6 +249,9 @@ func TestLoadDefaultsCDC(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, cfg.CDC.Topic, "an absent cdc section leaves the job disabled")
 	require.Equal(t, DefaultCDCBatchSize, cfg.CDC.BatchSize)
+	require.Equal(t, 2730, cfg.CDC.BatchSize,
+		"the default is TigerBeetle's real change-event ceiling: a window's cost is almost"+
+			" entirely per-window, so the largest window is the cheapest per event")
 	require.Equal(t, DefaultCDCPollInterval, cfg.CDC.PollInterval)
 	require.Equal(t, PartitionKeyDebitAccountID, cfg.CDC.PartitionKey)
 }
@@ -290,11 +293,29 @@ cdc: {topic: ledger.events, partition_key: account}
 	require.ErrorContains(t, err, "cdc.partition_key")
 }
 
+// 2730 is the last cdc.batch_size TigerBeetle serves and 2731 is the first it
+// refuses. Bounding this by batcher.max_batch_size (8189) instead let a config
+// load cleanly and then never publish an event, so the boundary is pinned on
+// both sides and the message has to name the real limit — an operator reading
+// it should not have to know why a change event is not a transfer.
 func TestLoadRejectsOversizedCDCBatch(t *testing.T) {
 	_, err := Load(writeCfg(t, validCfg+`
-cdc: {topic: ledger.events, batch_size: 8190}
+cdc: {topic: ledger.events, batch_size: 2731}
 `))
 	require.ErrorContains(t, err, "cdc.batch_size")
+	require.ErrorContains(t, err, "2730", "the message must name the real ceiling")
+
+	_, err = Load(writeCfg(t, validCfg+`
+cdc: {topic: ledger.events, batch_size: 8189}
+`))
+	require.ErrorContains(t, err, "cdc.batch_size",
+		"batcher.max_batch_size is a transfer count and must not be accepted here")
+
+	cfg, err := Load(writeCfg(t, validCfg+`
+cdc: {topic: ledger.events, batch_size: 2730}
+`))
+	require.NoError(t, err, "exactly the ceiling is still accepted")
+	require.Equal(t, MaxCDCBatchSize, cfg.CDC.BatchSize)
 }
 
 func TestLoadRejectsNonPositiveCDCPollInterval(t *testing.T) {

@@ -33,12 +33,14 @@ type Publisher interface {
 	ProduceSync(ctx context.Context, rs ...*kgo.Record) kgo.ProduceResults
 }
 
-// escalateAfter is how many consecutive failures of the same window turn the
-// retry log line from WARN into ERROR. Below it the cause is almost always a
-// broker or a leader election settling down; above it the window is stuck on
-// something a retry cannot fix — a record over max.message.bytes, a topic
-// that cannot be auto-created — and a stuck stream looks exactly like an idle
-// one unless somebody says so.
+// escalateAfter is how many consecutive failures turn a retry log line from
+// WARN into ERROR. It governs both retryable paths — the change-events query
+// and the publication of a window — because they fail the same way: below the
+// threshold the cause is almost always a broker, a leader election or a
+// cluster blinking; above it the job is stuck on something a retry cannot fix
+// — a record over max.message.bytes, a topic that cannot be auto-created, a
+// cdc.batch_size above what TigerBeetle will serve — and a stuck stream looks
+// exactly like an idle one unless somebody says so.
 const escalateAfter = 5
 
 // Job streams TigerBeetle change events to Kafka.
@@ -131,6 +133,12 @@ func (j *Job) Run(ctx context.Context, checkpoint uint64) error {
 	// successful publication moves the cursor — so it counts failures of one
 	// window, which is what tells a stuck stream from a flaky broker.
 	stuck := 0
+	// queryStuck is the same idea for the other retryable path: how many times
+	// in a row the change-events query itself has failed. A query that can
+	// never succeed is retried just as forever as a window that can never be
+	// published, so it escalates on the same threshold — otherwise a
+	// permanently misconfigured job logs WARN and nothing else, indefinitely.
+	queryStuck := 0
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -140,8 +148,16 @@ func (j *Job) Run(ctx context.Context, checkpoint uint64) error {
 			Limit:        uint32(j.cfg.BatchSize),
 		})
 		if err != nil {
-			j.log.Warn("cdc: change events query failed, retrying",
+			queryStuck++
+			level, msg := slog.LevelWarn, "cdc: change events query failed, retrying"
+			if queryStuck >= escalateAfter {
+				level = slog.LevelError
+				msg = "cdc: the stream is stuck: the change events query keeps failing"
+			}
+			j.log.Log(ctx, level, msg,
 				slog.Uint64("checkpoint", checkpoint),
+				slog.Int("batch_size", j.cfg.BatchSize),
+				slog.Int("consecutive_failures", queryStuck),
 				slog.String("error", err.Error()), slog.Duration("in", delay))
 			if !sleep(ctx, j.jitter(delay)) {
 				return nil
@@ -149,6 +165,7 @@ func (j *Job) Run(ctx context.Context, checkpoint uint64) error {
 			delay = j.next(delay)
 			continue
 		}
+		queryStuck = 0
 		if len(events) == 0 {
 			if !sleep(ctx, j.cfg.PollInterval) {
 				return nil

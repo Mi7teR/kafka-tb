@@ -73,9 +73,36 @@ const (
 	PartitionKeyTransferID      = "transfer_id"
 )
 
+// MaxCDCBatchSize is the largest cdc.batch_size TigerBeetle will actually
+// serve, and it is deliberately *not* MaxBatchSize.
+//
+// Both ceilings come from the same ~1 MiB request body, but they divide it by
+// different element sizes. MaxBatchSize (8189) is a batch of types.Transfer,
+// which is 128 bytes. A types.ChangeEvent is 384 bytes — three times as large
+// — so a change-event window tops out at
+// floor((1 MiB - 128 B header) / 384) = 2730. Binary search against a live
+// cluster agrees exactly: Limit 2730 is served, 2731 is refused with "too much
+// data was sent or requested in this batch".
+//
+// Do not re-unify these two constants. Bounding cdc.batch_size by MaxBatchSize
+// is what let a config asking for 8189 events per window load cleanly and then
+// wedge the stream permanently: TigerBeetle refuses the query, the job retries
+// it forever, and no event is ever published.
+const MaxCDCBatchSize = 2730
+
 // Defaults for the CDC job, applied when the config file omits them.
 const (
-	DefaultCDCBatchSize    = 1000
+	// DefaultCDCBatchSize is MaxCDCBatchSize on purpose. Almost all of a
+	// window's cost is per-window rather than per-event — a 2,730-event
+	// GetChangeEvents is *cheaper* in wall clock than a 1,000-event one — so
+	// the largest window TigerBeetle serves is also the cheapest per event.
+	// Measured, 200,000 events, one partition: 100 -> ~19.5k events/sec,
+	// 1000 -> ~43k, 2730 -> ~104k. The only thing a larger window costs is
+	// latency granularity, because a window is published as a unit: on a
+	// dense backlog the last event waits ~26 ms rather than ~23 ms, and on a
+	// trickling stream it costs nothing at all, since the window is however
+	// many events have arrived.
+	DefaultCDCBatchSize    = MaxCDCBatchSize
 	DefaultCDCPollInterval = time.Second
 )
 
@@ -332,8 +359,12 @@ func (c *Config) validate() error {
 	// cdc.topic may be empty (the job is then disabled), but the knobs are
 	// checked either way: a bad value must be reported when it is written, not
 	// on the day someone adds the topic.
-	if c.CDC.BatchSize <= 0 || c.CDC.BatchSize > MaxBatchSize {
-		return fmt.Errorf("cdc.batch_size: want 1..%d, got %d", MaxBatchSize, c.CDC.BatchSize)
+	if c.CDC.BatchSize <= 0 || c.CDC.BatchSize > MaxCDCBatchSize {
+		return fmt.Errorf(
+			"cdc.batch_size: want 1..%d, got %d. A change event is 384 bytes, three times a"+
+				" transfer, so a change-event window's ceiling is %d and not"+
+				" batcher.max_batch_size's %d — TigerBeetle refuses anything above it, forever",
+			MaxCDCBatchSize, c.CDC.BatchSize, MaxCDCBatchSize, MaxBatchSize)
 	}
 	if c.CDC.PollInterval <= 0 {
 		return fmt.Errorf("cdc.poll_interval: must be > 0")

@@ -45,10 +45,18 @@ every `kafkatb run` replica.
 ```yaml
 cdc:
   topic: ledger.events          # empty or absent: the job is disabled
-  batch_size: 1000              # events per window
+  batch_size: 2730              # events per window; also the hard ceiling
   poll_interval: 1s             # wait after an empty answer
   partition_key: debit_account_id
 ```
+
+`batch_size` defaults to 2730, which is also the largest value accepted: a
+`ChangeEvent` is 384 bytes, so that is all TigerBeetle will return in one
+request. (`batcher.max_batch_size`'s 8189 counts 128-byte *transfers*; the two
+ceilings are not interchangeable, and a `cdc.batch_size` above 2730 is rejected
+at startup rather than left to wedge the stream.) It defaults to the ceiling
+because the cost of a window is almost entirely per-window: over 200,000
+events on one partition, 100 gave ~19.5k events/sec, 1000 ~43k and 2730 ~104k.
 
 `partition_key` is one of `debit_account_id` (default), `credit_account_id`,
 `ledger`, `transfer_id`. It decides which ordering a consumer of the topic

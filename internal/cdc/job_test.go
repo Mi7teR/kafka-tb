@@ -308,6 +308,74 @@ func TestJobEscalatesAWindowThatKeepsFailing(t *testing.T) {
 		strings.Count(out, "level=WARN msg=\"cdc: publication failed"))
 }
 
+// A query that can never succeed — cdc.batch_size above what TigerBeetle will
+// serve, the cluster gone — is retried forever, exactly like an unpublishable
+// window. It has to escalate for the same reason: at WARN, a permanently
+// wedged stream is indistinguishable from an idle one.
+func TestJobEscalatesAQueryThatKeepsFailing(t *testing.T) {
+	logs := &syncBuffer{}
+	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	src := &fakeSource{events: testEvents(3), err: errors.New("too much data was requested in this batch")}
+	j := New(testJobConfig(), testRetry(), src, newFakePublisher(), testRegistry(), log)
+	runJob(t, j, 0)
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(logs.String(), "level=ERROR")
+	}, 5*time.Second, 5*time.Millisecond, "a query failing forever must escalate past WARN")
+
+	out := logs.String()
+	require.Contains(t, out, "the change events query keeps failing")
+	require.Contains(t, out, "consecutive_failures=5")
+	require.Contains(t, out, "batch_size=3", "the line names the knob that is the usual cause")
+	require.Contains(t, out, "too much data was requested in this batch")
+
+	// Below the threshold it stays at WARN: a cluster blinking is not an incident.
+	require.Equal(t, escalateAfter-1,
+		strings.Count(out, "level=WARN msg=\"cdc: change events query failed"))
+}
+
+// A run of query failures that then clears must not leave the counter armed:
+// the next isolated failure is a blink, not an incident.
+func TestJobResetsQueryFailureCountOnSuccess(t *testing.T) {
+	logs := &syncBuffer{}
+	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	src := &flakySource{events: testEvents(3), failFirst: escalateAfter - 1}
+	pub := newFakePublisher()
+	j := New(testJobConfig(), testRetry(), src, pub, testRegistry(), log)
+	runJob(t, j, 0)
+
+	require.Eventually(t, func() bool { return len(pub.groups()) >= 2 },
+		5*time.Second, 5*time.Millisecond, "the window must publish once the query recovers")
+
+	out := logs.String()
+	require.NotContains(t, out, "level=ERROR",
+		"four failures then a success is a blink, and the fifth query never failed")
+	require.Equal(t, escalateAfter-1,
+		strings.Count(out, "level=WARN msg=\"cdc: change events query failed"))
+}
+
+// flakySource fails its first failFirst queries and then behaves.
+type flakySource struct {
+	mu        sync.Mutex
+	events    []types.ChangeEvent
+	failFirst int
+	calls     int
+}
+
+func (f *flakySource) GetChangeEvents(filter types.ChangeEventsFilter) ([]types.ChangeEvent, error) {
+	f.mu.Lock()
+	f.calls++
+	fail := f.calls <= f.failFirst
+	f.mu.Unlock()
+	if fail {
+		return nil, errors.New("cluster unavailable")
+	}
+	inner := &fakeSource{events: f.events}
+	return inner.GetChangeEvents(filter)
+}
+
 func publishedRecords(p *fakePublisher) []*kgo.Record {
 	var out []*kgo.Record
 	for _, g := range p.groups() {
