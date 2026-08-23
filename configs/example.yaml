@@ -41,6 +41,13 @@ sink:
   # them the enqueue blocks at a fraction of that number. Defaults to 1000,
   # clamped to the ceiling when the batcher is configured smaller.
   max_in_flight_per_partition: 1000
+  # How many Kafka records one poll may return. Deliberately its own knob
+  # rather than batcher.max_batch_size: that one counts events inside a single
+  # TigerBeetle request, this one counts records, and a record can carry many
+  # events. Sharing them meant a small TigerBeetle batch throttled the
+  # consumer — at max_batch_size 8 the sink could fetch no more than 8 records
+  # per poll interval, whatever the partition had ready.
+  poll_size: 8189
 # TigerBeetle -> Kafka change-data-capture job
 cdc:
   # Output topic. Empty (or absent) disables the job: `kafkatb run` then

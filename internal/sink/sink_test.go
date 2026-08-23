@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Mi7teR/kafka-tb/internal/codec"
+	"github.com/Mi7teR/kafka-tb/internal/config"
 	"github.com/Mi7teR/kafka-tb/internal/emit"
 	"github.com/Mi7teR/kafka-tb/internal/model"
 	"github.com/Mi7teR/kafka-tb/internal/obs"
@@ -1565,4 +1566,30 @@ func TestOnRevokedCommitsBeforeForget(t *testing.T) {
 	require.Len(t, cl.committed, 1, "commit must occur before Forget")
 	require.Equal(t, int64(1), cl.committed[0]["src"][0].Offset)
 	require.Empty(t, s.offsets.Commitable(), "partition is forgotten")
+}
+
+// Kafka records per poll and TigerBeetle events per request are unrelated
+// dimensions: a record can carry many events, so a small TigerBeetle batch must
+// not cap how many records a poll may return.
+func TestNewTakesPollSizeFromSinkConfig(t *testing.T) {
+	cfg := &config.Config{
+		Batcher:         config.Batcher{MaxBatchSize: 8, MaxQueue: 100},
+		Sink:            config.Sink{MaxInFlightPerPartition: 10, PollSize: 500},
+		ShutdownTimeout: time.Second,
+	}
+	s := New(cfg, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	require.Equal(t, 500, s.pollSize)
+}
+
+// New already defends the hand-built-config path for maxInFlight; a zero
+// shutdown timeout is the same class of mistake and has a worse outcome — an
+// already-expired context makes the final flush and commit fail every time, so
+// the whole last poll replays on every restart.
+func TestNewClampsZeroShutdownTimeout(t *testing.T) {
+	cfg := &config.Config{
+		Batcher: config.Batcher{MaxBatchSize: 8, MaxQueue: 100},
+		Sink:    config.Sink{MaxInFlightPerPartition: 10, PollSize: 500},
+	}
+	s := New(cfg, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	require.Equal(t, defaultShutdownTimeout, s.shutdownTimeout)
 }

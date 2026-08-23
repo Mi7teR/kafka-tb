@@ -123,6 +123,7 @@ func TestLoadDefaultsMaxInFlightPerPartition(t *testing.T) {
 func TestLoadClampsDefaultMaxInFlightToCeiling(t *testing.T) {
 	body := replace(validCfg, "max_batch_size: 8189", "max_batch_size: 500")
 	body = replace(body, "  max_queue: 1000", "  max_queue: 100")
+	body = replace(body, "max_events_per_message: 8189", "max_events_per_message: 500")
 	cfg, err := Load(writeCfg(t, body))
 	require.NoError(t, err)
 	require.Equal(t, 600, cfg.Sink.MaxInFlightPerPartition,
@@ -323,4 +324,65 @@ func TestLoadRejectsNonPositiveCDCPollInterval(t *testing.T) {
 cdc: {topic: ledger.events, poll_interval: 0s}
 `))
 	require.ErrorContains(t, err, "cdc.poll_interval")
+}
+
+// A message the decoder accepts must be one the batcher can accept too: the
+// batcher refuses a command larger than batcher.max_batch_size, and the sink
+// treats that refusal as poison, so a limit above the configured batch size
+// dead-letters legitimate messages.
+func TestLoadRejectsMaxEventsPerMessageAboveBatchSize(t *testing.T) {
+	body := replace(validCfg, "max_batch_size: 8189", "max_batch_size: 100")
+	_, err := Load(writeCfg(t, body))
+	require.ErrorContains(t, err, "max_events_per_message")
+	require.ErrorContains(t, err, "max_batch_size")
+}
+
+func TestLoadAcceptsMaxEventsPerMessageAtBatchSize(t *testing.T) {
+	body := replace(validCfg, "max_batch_size: 8189", "max_batch_size: 100")
+	body = replace(body, "max_events_per_message: 8189", "max_events_per_message: 100")
+	body = replace(body, "max_queue: 1000", "max_queue: 1000\n  # keep the ceiling wide")
+	_, err := Load(writeCfg(t, body))
+	require.NoError(t, err)
+}
+
+// batcher.linger is what makes a batch a batch: at zero the flush timer is
+// ready the moment it is created, so the worker sends whatever single command
+// it has and mean batch size collapses to ~1. An absent key must therefore
+// default, and an explicit zero must be rejected rather than silently obeyed.
+func TestLoadDefaultsBatcherLinger(t *testing.T) {
+	body := replace(validCfg, "  linger: 1ms\n", "")
+	cfg, err := Load(writeCfg(t, body))
+	require.NoError(t, err)
+	require.Equal(t, DefaultBatcherLinger, cfg.Batcher.Linger)
+}
+
+func TestLoadRejectsZeroBatcherLinger(t *testing.T) {
+	body := replace(validCfg, "linger: 1ms", "linger: 0s")
+	_, err := Load(writeCfg(t, body))
+	require.ErrorContains(t, err, "batcher.linger")
+}
+
+// Kafka records per poll and TigerBeetle events per request are different
+// dimensions — one record can carry many events — so poll size gets its own
+// key instead of borrowing batcher.max_batch_size.
+func TestLoadDefaultsPollSize(t *testing.T) {
+	cfg, err := Load(writeCfg(t, validCfg))
+	require.NoError(t, err)
+	require.Equal(t, DefaultPollSize, cfg.Sink.PollSize)
+}
+
+func TestLoadPollSizeIsIndependentOfMaxBatchSize(t *testing.T) {
+	body := replace(validCfg, "max_batch_size: 8189", "max_batch_size: 8")
+	body = replace(body, "max_events_per_message: 8189", "max_events_per_message: 8")
+	body = replace(body, "  max_queue: 1000", "  max_queue: 1000\nsink:\n  poll_size: 500")
+	cfg, err := Load(writeCfg(t, body))
+	require.NoError(t, err)
+	require.Equal(t, 500, cfg.Sink.PollSize,
+		"a small TigerBeetle batch must not throttle the Kafka poll")
+}
+
+func TestLoadRejectsNonPositivePollSize(t *testing.T) {
+	body := replace(validCfg, "  max_queue: 1000", "  max_queue: 1000\nsink:\n  poll_size: 0")
+	_, err := Load(writeCfg(t, body))
+	require.ErrorContains(t, err, "sink.poll_size")
 }

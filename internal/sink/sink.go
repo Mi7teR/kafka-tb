@@ -98,6 +98,17 @@ func New(
 	if maxInFlight <= 0 {
 		maxInFlight = config.DefaultMaxInFlightPerPartition
 	}
+	pollSize := cfg.Sink.PollSize
+	if pollSize <= 0 {
+		pollSize = config.DefaultPollSize
+	}
+	// A zero here is worse than a zero bound: context.WithTimeout(ctx, 0) is
+	// already expired, so the shutdown flush and the final commit fail on every
+	// stop and the whole last poll is replayed after each restart.
+	shutdownTimeout := cfg.ShutdownTimeout
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = defaultShutdownTimeout
+	}
 	return &Sink{
 		cl:              cl,
 		oc:              cl,
@@ -107,12 +118,12 @@ func New(
 		offsets:         NewOffsets(),
 		log:             log,
 		metrics:         metrics,
-		pollSize:        cfg.Batcher.MaxBatchSize,
+		pollSize:        pollSize,
 		maxInFlight:     maxInFlight,
 		commitPeriod:    defaultCommitPeriod,
 		retryPeriod:     defaultRetryPeriod,
 		batchBudget:     defaultBatchBudget,
-		shutdownTimeout: cfg.ShutdownTimeout,
+		shutdownTimeout: shutdownTimeout,
 	}
 }
 

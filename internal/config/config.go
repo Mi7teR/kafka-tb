@@ -22,6 +22,18 @@ const MaxBatchSize = 8189
 // is left unset.
 const DefaultMaxInFlightPerPartition = 1000
 
+// DefaultPollSize is used when sink.poll_size is left unset. It is the value
+// the sink used before poll size had a key of its own, where it was taken from
+// batcher.max_batch_size at its default — kept so that an existing config keeps
+// the behaviour it was measured with.
+const DefaultPollSize = MaxBatchSize
+
+// DefaultBatcherLinger is used when batcher.linger is left unset. Zero is not a
+// usable value there — the flush timer would be ready as soon as it is created,
+// so every batch would go out holding whatever single command happened to be in
+// hand — and an absent key must not mean zero.
+const DefaultBatcherLinger = time.Millisecond
+
 type Ledger struct {
 	ID    uint32 `yaml:"id"`
 	Scale int32  `yaml:"scale"`
@@ -55,6 +67,13 @@ type Sink struct {
 	// and on TransferExists/AccountExists being mapped to StatusOK, not on this
 	// number.
 	MaxInFlightPerPartition int `yaml:"max_in_flight_per_partition"`
+	// PollSize caps how many Kafka records one poll returns. It is deliberately
+	// not derived from batcher.max_batch_size: that bounds events in a single
+	// TigerBeetle request, while this bounds records, and one record can carry
+	// many events. Tying them together made a small TigerBeetle batch throttle
+	// the consumer — at max_batch_size 8 the sink could fetch no more than
+	// 8 records per poll interval.
+	PollSize int `yaml:"poll_size"`
 }
 
 type Topic struct {
@@ -220,6 +239,11 @@ func Load(path string, opts ...Option) (*Config, error) {
 	// from the file (see the clamp below). Registering it means an env
 	// override for it still works even when the file never mentions it.
 	v.SetDefault("sink.max_in_flight_per_partition", 0)
+	// batcher.linger may also be absent from an older file. Unlike the bound
+	// above it gets a real default rather than a sentinel: zero is a value
+	// validate rejects, so there is nothing to distinguish "unset" from.
+	v.SetDefault("batcher.linger", DefaultBatcherLinger)
+	v.SetDefault("sink.poll_size", DefaultPollSize)
 	// The CDC job's knobs are optional in the file — only cdc.topic decides
 	// whether the job runs at all — so they are defaulted here rather than
 	// left at Go's zero value, which validate would (rightly) reject.
@@ -341,6 +365,12 @@ func (c *Config) validate() error {
 	if c.Batcher.MaxQueue <= 0 {
 		return fmt.Errorf("batcher.max_queue: must be > 0")
 	}
+	// Zero linger is not a faster setting, it is a broken one: it defeats
+	// batching entirely and there is no error or metric that would name it as
+	// the cause, only a mean batch size of about one.
+	if c.Batcher.Linger <= 0 {
+		return fmt.Errorf("batcher.linger: must be > 0, got %s", c.Batcher.Linger)
+	}
 	// max_queue + max_batch_size is what a single partition, alone in the
 	// process, could ever get in flight: a job dequeued into the batch being
 	// assembled frees its queue slot while its caller stays parked for the whole
@@ -355,6 +385,9 @@ func (c *Config) validate() error {
 				" than batcher.max_queue + batcher.max_batch_size in flight, and with several"+
 				" partitions the shared batcher queue blocks the enqueue well below that; got %d",
 			ceiling, c.Sink.MaxInFlightPerPartition)
+	}
+	if c.Sink.PollSize <= 0 {
+		return fmt.Errorf("sink.poll_size: must be > 0, got %d", c.Sink.PollSize)
 	}
 	// cdc.topic may be empty (the job is then disabled), but the knobs are
 	// checked either way: a bad value must be reported when it is written, not
@@ -378,6 +411,19 @@ func (c *Config) validate() error {
 	}
 	if c.Limits.MaxEventsPerMessage <= 0 || c.Limits.MaxEventsPerMessage > MaxBatchSize {
 		return fmt.Errorf("limits.max_events_per_message: want 1..%d", MaxBatchSize)
+	}
+	// A message the decoder admits must be one the batcher can accept whole.
+	// The batcher refuses a command longer than batcher.max_batch_size, and the
+	// sink can only treat that refusal as poison — a retry would never help. So
+	// a limit above the configured batch size does not bound anything, it just
+	// routes legitimate messages to the DLQ under a reason code that means
+	// "broken producer".
+	if c.Limits.MaxEventsPerMessage > c.Batcher.MaxBatchSize {
+		return fmt.Errorf(
+			"limits.max_events_per_message: want 1..%d — a message longer than"+
+				" batcher.max_batch_size cannot be applied and would be dead-lettered"+
+				" as poison; got %d",
+			c.Batcher.MaxBatchSize, c.Limits.MaxEventsPerMessage)
 	}
 	if c.Limits.MaxMessageBytes <= 0 {
 		return fmt.Errorf("limits.max_message_bytes: must be > 0")
