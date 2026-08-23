@@ -88,7 +88,7 @@ type Batcher struct {
 	// They are grown by append rather than preallocated: a fixed
 	// cap(max_batch_size) buffer is 1 MiB for transfers whatever the batches
 	// actually hold, and that allocation, once per call, was 34% of everything the
-	// sink allocated (.superpowers/sdd/perf-pprof.md 2c).
+	// sink allocated, measured on a profiling run.
 	//
 	// The tradeoff is that whatever high-water mark a buffer grows to is held for the
 	// rest of the process's life — append never shrinks capacity back down. At
@@ -183,7 +183,7 @@ func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan S
 	// This ordering is what keeps the hot path off a process-wide channel. The
 	// previous shape — a goroutine per command selecting on j.done and the shared
 	// finished — made every waiter lock and unlock that one channel, which was 93%
-	// of all mutex delay in the sink (.superpowers/sdd/perf-pprof.md §2b).
+	// of all mutex delay in the sink, measured on a profiling run.
 	select {
 	case <-b.stop:
 		// Shutdown raced this submission: the drain may already be behind us, and

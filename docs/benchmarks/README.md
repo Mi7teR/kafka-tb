@@ -41,48 +41,46 @@ microbenchmarked code path changed in the sharding commits either.
 
 Five point-in-time measurements of the same code path (Kafka record in,
 TigerBeetle transfer applied, result published), each reproducing the prior
-run's method for comparability. Full detail and raw per-run numbers are in
-`.superpowers/sdd/perf-baseline.md`, `.superpowers/sdd/perf-after-pipelining.md`,
-`.superpowers/sdd/perf-final.md`, `.superpowers/sdd/perf-sharded.md`, and
-`.superpowers/sdd/perf-sink-after-batcher.md`.
+run's method for comparability. Full detail and raw per-run numbers were
+kept in each run's own working notes; what they concluded is summarised here.
 **What's measured vs. estimated:** every number in this table comes from a
 real run against the same containerized Redpanda/TigerBeetle stack as the
 load scenarios below — none of it is extrapolated or scaled up from a
 smaller run. All five are single-machine, few-run measurements (1 run for
 the baseline, 2 for pipelining, 3-4 for async publish, 2 for the headline
 sharding rows, 2 for the batcher-fixes rows — the shards/max-in-flight/linger
-sweeps in `perf-sharded.md` are single runs per value and flagged there as
-noisy) — order-of-magnitude, not an SLA; see each linked doc for the per-run
+sweeps in the sharding run are single runs per value and flagged there as
+noisy) — order-of-magnitude, not an SLA; see each run's notes for the per-run
 spread.
 
 **Hardware:** Apple M4 Pro, macOS, Docker via OrbStack, go1.26.3 darwin/arm64,
 for the first four columns. **The fifth column (batcher fixes) was measured
 on a different machine** — Docker Desktop on macOS, TigerBeetle running
 inside Docker Desktop's Linux VM rather than OrbStack's — see
-`perf-sink-after-batcher.md` for why that is called out rather than silently
+the batcher-fixes run for why that is called out rather than silently
 mixed in: absolute numbers across the two Docker backends are not
-guaranteed comparable, only the ratios within each report's own runs are.
+guaranteed comparable, only the ratios within each run are.
 **Config held constant across all five runs:** `batcher.linger=5ms`,
 `batcher.max_batch_size=8189`, `batcher.max_queue=1000`, 1 partition unless
 noted — the fifth column's scratch harness pins `linger=5ms` explicitly
 even though the shared test harness's own default moved to `1ms` after the
-`perf-sharded.md` linger sweep, precisely so this row stays comparable to
+the sharding run's linger sweep, precisely so this row stays comparable to
 the other four. `sink.max_in_flight_per_partition` did not exist before
 pipelining; it defaulted to 1000 from the "after pipelining" column onward.
 `batcher.shards` did not exist before sharding and does not exist after the
 revert — the sharding column uses the default (4) unless noted; see
-`perf-sharded.md` for the `shards=1/4/8/16` sweep. **The batcher-fixes
+the sharding run for the `shards=1/4/8/16` sweep. **The batcher-fixes
 column is the current state of the code** (`b21f2d4`): batcher sharding was
 implemented, measured, and reverted (see below) before the batcher/decode
 changes in that column landed, so it is not a sixth step after sharding —
 it is what replaced the sharding column as "current" once sharding was
 backed out.
 
-| Metric | Baseline (serial sink, pre-`ab2b47a`; no commit sha recorded in `perf-baseline.md`) | After pipelining (`ab2b47a`) | After async publish (`523ffd3`) | After batcher sharding (`173d712`, later reverted) | **After batcher fixes, sharding reverted (`b21f2d4`) — current** |
+| Metric | Baseline (serial sink, pre-`ab2b47a`; no commit sha recorded in the baseline run) | After pipelining (`ab2b47a`) | After async publish (`523ffd3`) | After batcher sharding (`173d712`, later reverted) | **After batcher fixes, sharding reverted (`b21f2d4`) — current** |
 |---|---|---|---|---|---|
 | Throughput, 1 partition (n=3,000) | 48.2 rec/sec | 4,494 rec/sec | 16,343 rec/sec (avg of 3 runs) | 16,459.5 rec/sec (avg of 2 runs) | **19,974.6 rec/sec** (avg of 2: 18,329.8 / 21,619.3) |
 | Per-record wall clock | 20.75 ms | 0.222 ms | 61.2 µs | 60.7 µs | **50.1 µs** |
-| Mean batch size TigerBeetle sees | 1.0000 | 750 | 428.7 | 514.5 (avg of 2: 600.2 / 428.7 — see `perf-sharded.md` on why 428.7 recurs exactly) | **750.2** (both runs identical, n=4 TB calls each) |
+| Mean batch size TigerBeetle sees | 1.0000 | 750 | 428.7 | 514.5 (avg of 2: 600.2 / 428.7 — see the sharding run on why 428.7 recurs exactly) | **750.2** (both runs identical, n=4 TB calls each) |
 | p99 batch size | n/a (all batches = 1) | 1,000 (capped by `max_in_flight_per_partition`) | ~594 | ~663-1,000 (2 runs) | **1,000** (both runs) |
 | Throughput, 12 partitions (n=3,000 or 1,500) | ~1.06x vs 1p (no effect) | 2.20x vs 1p (12p faster) | ~1.03x vs 1p (parity) | 1.36x vs 1p (12p faster again — avg 22,341.0 rec/sec) | **1.16x vs 1p** (avg 23,258.7 rec/sec — partition lever partially back, no sharding involved) |
 | Dominant cost | TigerBeetle round trip (51%) + linger wait (30%) | `emit.Results` synchronous `ProduceSync` (92%) | TigerBeetle round trip (~55%), serialized one batch at a time | TigerBeetle round trip, split across up to `shards` (4) concurrent batches | **TigerBeetle round trip, one batch at a time (no sharding), now ~36-44% of wall clock — see below** |
@@ -100,17 +98,17 @@ column's conclusion rather than just extending it:
   well short of pipelining's 2.20x, because the default caps concurrency at 4
   regardless of partition count and per-shard batches are smaller than the
   single-worker case was (mean ~300-333 at 12p vs ~429-600 at 1p — see
-  `perf-sharded.md` §2).
+  §2 of the sharding run).
 - **At 1 partition, sharding changes nothing — confirmed directly, not just
   inferred.** All of one partition's records share one ordering key, so
   `pickShard` always routes them to the same worker no matter how many
   shards exist: a direct `shards=1` vs `shards=4` check at 1 partition came
-  back 12,982.3 vs 12,983.5 rec/sec, a 0.01% difference (`perf-sharded.md`
+  back 12,982.3 vs 12,983.5 rec/sec, a 0.01% difference (the sharding run
   §3). This is the expected result of the routing design, not a null
   finding.
 - **The `shards` sweep itself (1/4/8/16 at 12 partitions) did not produce a
   clean ranking** in a single run per value — `shards=1` was actually
-  fastest in that run, ahead of the default `shards=4` (`perf-sharded.md`
+  fastest in that run, ahead of the default `shards=4` (the sharding run
   §4). Batch size shrank monotonically with more shards, as expected, but
   whether that nets out to more throughput at typical partition counts needs
   a repeated, sustained-load sweep this report does not have. What can be
@@ -121,12 +119,12 @@ column's conclusion rather than just extending it:
   Raising it from the default 1,000 to 4,000 gave 1.47x more throughput at 1
   partition (single run); 8,000 gave 1.38x, not further improvement over
   4,000 — plausibly a plateau, but only one run each, so not strong evidence
-  either way (`perf-sharded.md` §7).
+  either way (§7 of the sharding run).
 
 ### Decision: batcher sharding was reverted
 
 Sharding was implemented (`b9c4bfb`, `173d712`), measured (the fourth column
-above and `perf-sharded.md`), and then reverted. The measurements are left
+above and the sharding run), and then reverted. The measurements are left
 above exactly as they were taken; this section records what was concluded
 from them.
 
@@ -165,19 +163,19 @@ the revert is a response to absent evidence, not to evidence of harm.
 After the sharding revert, two more changes landed in `internal/tbx/batcher.go`:
 `SubmitAsync` no longer parks a goroutine on the process-wide `finished`
 channel in the common case (mutex delay 2,754.65 ms → 0 over
-`.superpowers/sdd/task-29-report.md`'s profiling window), and the per-send
+the batcher-fixes commit's own profiling window), and the per-send
 1 MiB slice became a reused worker-owned buffer (`sendTransfers` allocation
 121.31 MB → 2.5-4 MB, same window). Neither change touches the TigerBeetle
-round trip itself, which `perf-final.md` had already identified as the
+round trip itself, which the async-publish run had already identified as the
 dominant cost (55% of wall clock) and *waiting*, not CPU or allocation — so
 a small-to-nil throughput change was the expected outcome going in, and
-`task-29-report.md`'s own quick before/after readout found exactly that
+that commit's own quick before/after readout found exactly that
 (47,923 → 49,409 → 49,748/50,126 rec/s, a ~1.03-1.05x wobble its own text
 flags as too noisy — a different, faster measurement window than the one
 below — to read as a result).
 
-Measured properly (`.superpowers/sdd/perf-sink-after-batcher.md`, same
-warm-up/no-settle-tail method as `perf-final.md`/`perf-sharded.md`), the
+Measured properly (the batcher-fixes run, same warm-up/no-settle-tail
+method as the async-publish and sharding runs), the
 gain is real and larger than that quick check suggested: **~1.22x** at 1
 partition (16,343 → 19,974.6 rec/sec avg), and the 12-partition lever —
 flattened to parity by async publication — is **partially back** (1.16x,
@@ -185,17 +183,17 @@ short of pipelining's 2.20x or sharding's 1.36x, but repeatable across 2
 runs and achieved with *no* sharding in the build). The mechanism: cheaper
 dispatch (`SubmitAsync`'s removed contention) lets the batcher's own loop
 iterate faster and compose larger batches, which is visible directly in
-this column's own mean batch size (750.2 vs `perf-final.md`'s 428.7) and in
+this column's own mean batch size (750.2 vs the async-publish run's 428.7) and in
 TigerBeetle's share of wall clock dropping from ~55% to ~36-44% — not
 because the round trip got cheaper, but because everything around it did.
 
-The `sink.max_in_flight_per_partition` sweep (1,000 vs 8,000, `perf-final.md`
+The `sink.max_in_flight_per_partition` sweep (1,000 vs 8,000, the async-publish run
 §4's exact scenario) was re-run and **still shows a real gain — 1.23x
-(avg of 2 runs each), against `perf-final.md`'s 1.29-1.45x** — smaller than
+(avg of 2 runs each), against the async-publish run's 1.29-1.45x** — smaller than
 before, consistent with the ack-tail cost this knob amortizes now being a
 slightly smaller share of a smaller total. The finding still holds; the
 report does not recommend a specific new default (see
-`perf-sink-after-batcher.md` §4 for why — changing this knob trades
+§4 of the batcher-fixes run for why — changing this knob trades
 throughput against replay-tail cost on an ungraceful stop, a separate
 decision this task did not make).
 
@@ -206,8 +204,8 @@ TigerBeetle. Different unit of work, different database operation, different
 message size (867 bytes on the wire against 257 — see below). They are kept in a
 separate table for that reason.
 
-Full method and every scenario in `.superpowers/sdd/perf-cdc.md`; the profiling
-that explains these numbers is in `.superpowers/sdd/perf-pprof.md`.
+Full method and every scenario are in the CDC run's notes; the profiling
+that explains these numbers is in the profiling run's.
 
 **Hardware and stack:** Apple M4 Pro, 12 cores, macOS 26.5.2, go1.26.3
 darwin/arm64, Docker via OrbStack — the same machine as everything above. Same
@@ -281,7 +279,7 @@ run 2, mean per window):
 
 ### Where the CDC job's time and memory actually go
 
-From `.superpowers/sdd/perf-pprof.md`, over a 178,000-event profile window:
+From the profiling run, over a 178,000-event profile window:
 
 - **The job goroutine is blocked 73.5% of the time**, 52.3% of it inside
   `GetChangeEvents` — a single synchronous TigerBeetle round trip per window.
@@ -384,7 +382,7 @@ written against the serial sink, before pipelining, and is superseded by the
 re-run below — it is kept only for the historical record, not as current
 guidance.
 
-`.superpowers/sdd/perf-sharded.md` §5 re-ran the 1ms/5ms/50ms sweep against
+§5 of the sharding run re-ran the 1ms/5ms/50ms sweep against
 current code (1 partition, `shards=4`, `max_in_flight_per_partition=1000`,
 n=3,000, single run per value):
 
