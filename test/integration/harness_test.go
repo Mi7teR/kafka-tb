@@ -726,3 +726,54 @@ func withGroup(cfg *config.Config, suffix string) *config.Config {
 	clone.Kafka.Group = cfg.Kafka.Group + "." + suffix
 	return &clone
 }
+
+// createTopicsWithSourcePartitions is createTopics with the source topics
+// spread over n partitions. A rebalance scenario needs more than one: with a
+// single partition there is nothing for the group to split between two
+// consumers, so no partition ever migrates and the revoke path never runs.
+func createTopicsWithSourcePartitions(t *testing.T, cfg *config.Config, n int32) {
+	t.Helper()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(cfg.Kafka.Brokers...))
+	require.NoError(t, err)
+	defer cl.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	adm := kadm.NewClient(cl)
+
+	resp, err := adm.CreateTopics(ctx, 1, 1, nil, cfg.Kafka.DLQTopic, cfg.Kafka.ResultsTopic)
+	require.NoError(t, err)
+	for _, r := range resp {
+		require.NoError(t, r.Err, "create topic %s", r.Topic)
+	}
+
+	srcs := make([]string, 0, len(cfg.Kafka.Topics))
+	for _, tp := range cfg.Kafka.Topics {
+		srcs = append(srcs, tp.Name)
+	}
+	srcResp, err := adm.CreateTopics(ctx, n, 1, nil, srcs...)
+	require.NoError(t, err)
+	for _, r := range srcResp {
+		require.NoError(t, r.Err, "create topic %s", r.Topic)
+	}
+}
+
+// produceKeyed is produce with a record key, so the broker's partitioner
+// spreads the batch across partitions instead of parking it on one. Without a
+// key franz-go picks a single partition per batch, which would leave a
+// multi-partition topic effectively single-partition.
+func produceKeyed(t *testing.T, brokers []string, topic string, keys, payloads []string) {
+	t.Helper()
+	require.Len(t, keys, len(payloads))
+	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	require.NoError(t, err)
+	defer cl.Close()
+
+	recs := make([]*kgo.Record, len(payloads))
+	for i, p := range payloads {
+		recs[i] = &kgo.Record{Topic: topic, Key: []byte(keys[i]), Value: []byte(p)}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	require.NoError(t, cl.ProduceSync(ctx, recs...).FirstErr())
+}

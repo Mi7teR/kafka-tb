@@ -291,8 +291,10 @@ func TestSinkSurvivesRestart(t *testing.T) {
 	cfg := testConfig(t, brokers, startTigerBeetle(t))
 	// A small TigerBeetle batch size makes the sink advance in visible steps,
 	// so the restart really lands in the middle of the stream instead of
-	// after it.
+	// after it. The per-message limit follows it down: a message the batcher
+	// cannot take whole would be dead-lettered as poison.
 	cfg.Batcher.MaxBatchSize = 8
+	cfg.Limits.MaxEventsPerMessage = 8
 	createTopics(t, cfg)
 	tb := newTBClient(t, cfg)
 
@@ -341,8 +343,10 @@ func TestSinkSurvivesAbruptRestart(t *testing.T) {
 	cfg := testConfig(t, brokers, startTigerBeetle(t))
 	// A small TigerBeetle batch size makes the sink advance in visible steps,
 	// so the kill really lands in the middle of the stream instead of after
-	// it.
+	// it. The per-message limit follows it down: a message the batcher cannot
+	// take whole would be dead-lettered as poison.
 	cfg.Batcher.MaxBatchSize = 8
+	cfg.Limits.MaxEventsPerMessage = 8
 	createTopics(t, cfg)
 	tb := newTBClient(t, cfg)
 
@@ -428,4 +432,75 @@ func TestLinkedChainIsAtomic(t *testing.T) {
 		require.Equal(t, "0", header(t, rec, emit.HeaderSrcPartition))
 		require.Equal(t, "0", header(t, rec, emit.HeaderSrcOffset))
 	}
+}
+
+// 6c. Cooperative rebalance mid-stream. Everything the sink does about
+// partition migration — OnRevoked committing before Forget, the tombstone that
+// swallows a late Done from a worker that has not learned about the revoke, and
+// Track reviving a partition the group hands back — exists for this path and
+// for nothing else. Unit tests drive it through a stub client, which cannot
+// produce a real revoke; this drives it through a real group.
+//
+// The second consumer joins while records are still flowing, so the revoke
+// lands mid-stream rather than on an idle sink. The first consumer is then
+// stopped and a third wave is produced: only the second consumer is left, so
+// the wave can only be applied if the partitions genuinely migrated to it.
+func TestSinkSurvivesCooperativeRebalance(t *testing.T) {
+	const (
+		partitions = 4
+		wave       = 120
+	)
+
+	brokers := startRedpanda(t)
+	cfg := testConfig(t, brokers, startTigerBeetle(t))
+	// A small TigerBeetle batch makes the sink advance in visible steps, so the
+	// rebalance lands in the middle of a wave instead of after it. The
+	// per-message limit follows it: a message the batcher cannot take whole
+	// would be dead-lettered as poison.
+	cfg.Batcher.MaxBatchSize = 8
+	cfg.Limits.MaxEventsPerMessage = 8
+	createTopicsWithSourcePartitions(t, cfg, partitions)
+	tb := newTBClient(t, cfg)
+
+	debit, credit := seedAccounts(t, tb)
+	topic := cfg.Kafka.Topics[0].Name
+	var allIDs []string
+	produceWave := func() {
+		ids := make([]string, wave)
+		payloads := make([]string, wave)
+		for i := range ids {
+			ids[i] = uuid.NewString()
+			payloads[i] = transferJSON(ids[i], debit, credit, "1.00")
+		}
+		allIDs = append(allIDs, ids...)
+		produceKeyed(t, brokers, topic, ids, payloads)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	// One consumer, first wave. Waiting for a few records rather than all of
+	// them keeps the group busy when the second consumer arrives.
+	stopFirst := runSink(t, ctx, cfg, tb)
+	produceWave()
+	waitBalanceAtLeast(t, tb, credit, 300, applyTimeout)
+
+	// Second consumer joins mid-stream: the group rebalances while the first
+	// one is still processing, so some partitions are revoked under it.
+	runSink(t, ctx, cfg, tb)
+	produceWave()
+	requireBalance(t, tb, credit, "240.00", 5*time.Minute)
+
+	// First consumer leaves. Whatever it still owned migrates to the second
+	// one, which is now the only member: a wave produced now can only be
+	// applied if that migration actually happened.
+	stopFirst()
+	produceWave()
+	requireBalance(t, tb, credit, "360.00", 5*time.Minute)
+
+	// No loss: every id made it. No double-spend: the balance is exactly
+	// 3 * wave * 1.00, and a transfer applied twice would have overshot it —
+	// a revoke that committed an offset ahead of its record would undershoot.
+	require.Len(t, lookupTransfers(t, tb, allIDs), 3*wave)
+	dlqRecords(t, brokers, cfg.Kafka.DLQTopic, 0, applyTimeout)
 }
