@@ -601,8 +601,14 @@ func (s *Sink) prepare(ctx context.Context, rec *kgo.Record) (p prepared) {
 
 	ch, serr := s.sub.SubmitAsync(ctx, cmd)
 	if serr != nil {
+		// Both refusals are about the command itself, so no retry can help and
+		// the DLQ is the only way the partition keeps moving. Anything else the
+		// submitter reports here is infrastructural.
 		if errors.Is(serr, tbx.ErrCommandTooLarge) {
 			return prepared{poison: "command_too_large", detail: serr.Error()}
+		}
+		if errors.Is(serr, tbx.ErrEmptyCommand) {
+			return prepared{poison: "empty_command", detail: serr.Error()}
 		}
 		return prepared{err: serr}
 	}
@@ -662,11 +668,14 @@ func (s *Sink) finish(
 		return issuedPubs{}, p.err
 	}
 	if res.Err != nil {
-		// The real batcher rejects a too-large command right at
-		// submission, but a Submitter is entitled to report this as an outcome instead; we treat it
-		// the same regardless of where it came from.
+		// The real batcher rejects a too-large or empty command right at
+		// submission, but a Submitter is entitled to report either as an outcome instead; we treat them
+		// the same regardless of where they came from.
 		if errors.Is(res.Err, tbx.ErrCommandTooLarge) {
 			return s.emitPoison(ctx, rec, "command_too_large", res.Err.Error()), nil
+		}
+		if errors.Is(res.Err, tbx.ErrEmptyCommand) {
+			return s.emitPoison(ctx, rec, "empty_command", res.Err.Error()), nil
 		}
 		s.metrics.IncRecords("blocked")
 		return issuedPubs{}, res.Err

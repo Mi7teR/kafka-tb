@@ -18,7 +18,12 @@ var (
 	// ErrCommandTooLarge means the command does not fit into a batch whole.
 	// It cannot be cut: the atomicity of the linked chain matters more.
 	ErrCommandTooLarge = errors.New("command exceeds max batch size")
-	ErrClosed          = errors.New("batcher closed")
+	// ErrEmptyCommand means the command carries no events. Like
+	// ErrCommandTooLarge it is a data error and not an infrastructure one — no
+	// retry makes an empty command applicable — and the caller can only tell
+	// the two classes apart if this one is named.
+	ErrEmptyCommand = errors.New("empty command")
+	ErrClosed       = errors.New("batcher closed")
 )
 
 const linkedBit uint16 = 1
@@ -139,7 +144,7 @@ func (b *Batcher) Start(ctx context.Context) {
 // caller that abandons the channel without reading it does not block anyone.
 func (b *Batcher) SubmitAsync(ctx context.Context, cmd *model.Command) (<-chan SubmitResult, error) {
 	if cmd.Len() == 0 {
-		return nil, errors.New("empty command")
+		return nil, ErrEmptyCommand
 	}
 	if cmd.Len() > b.cfg.MaxBatchSize {
 		return nil, ErrCommandTooLarge
@@ -400,12 +405,13 @@ func (b *Batcher) sendTransfers(jobs []*job) error {
 
 	b.metrics.ObserveBatchSize(len(events))
 	start := time.Now()
-	results, err := b.call(func() (any, error) { return b.client.CreateTransfers(events) })
+	typed, err := call(b, func() ([]types.CreateTransferResult, error) {
+		return b.client.CreateTransfers(events)
+	})
 	b.metrics.ObserveTBLatency(string(model.OpCreateTransfers), time.Since(start))
 	if err != nil {
 		return err
 	}
-	typed, _ := results.([]types.CreateTransferResult)
 	for i, j := range jobs {
 		outcomes, mapErr := MapTransferResults(j.cmd, typed, offsets[i], len(events))
 		j.done <- SubmitResult{Outcomes: outcomes, Err: mapErr}
@@ -425,12 +431,13 @@ func (b *Batcher) sendAccounts(jobs []*job) error {
 
 	b.metrics.ObserveBatchSize(len(events))
 	start := time.Now()
-	results, err := b.call(func() (any, error) { return b.client.CreateAccounts(events) })
+	typed, err := call(b, func() ([]types.CreateAccountResult, error) {
+		return b.client.CreateAccounts(events)
+	})
 	b.metrics.ObserveTBLatency(string(model.OpCreateAccounts), time.Since(start))
 	if err != nil {
 		return err
 	}
-	typed, _ := results.([]types.CreateAccountResult)
 	for i, j := range jobs {
 		outcomes, mapErr := MapAccountResults(j.cmd, typed, offsets[i], len(events))
 		j.done <- SubmitResult{Outcomes: outcomes, Err: mapErr}
@@ -440,7 +447,12 @@ func (b *Batcher) sendAccounts(jobs []*job) error {
 
 // call retries the call until TigerBeetle responds or the batcher is stopped.
 // A call error is always infrastructural: business rejections arrive in the results.
-func (b *Batcher) call(fn func() (any, error)) (any, error) {
+// call retries fn until it succeeds or the batcher stops. It is a function
+// rather than a method so that it can carry the result type: routing the
+// result through `any` and asserting it back cost nothing at runtime but
+// turned a type mismatch into a count mismatch reported several steps later,
+// under the wrong cause.
+func call[T any](b *Batcher, fn func() (T, error)) (T, error) {
 	delay := b.retry.Initial
 	for attempt := 1; ; attempt++ {
 		res, err := fn()
@@ -454,7 +466,8 @@ func (b *Batcher) call(fn func() (any, error)) (any, error) {
 		// retries would otherwise spin forever, the batch never completes, the goroutine leaks.
 		select {
 		case <-b.stop:
-			return nil, ErrClosed
+			var zero T
+			return zero, ErrClosed
 		case <-time.After(b.jitter(delay)):
 		}
 		if delay < b.retry.Max {

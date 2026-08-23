@@ -1627,3 +1627,51 @@ func TestMetricsSeparateRecordAndEventUnits(t *testing.T) {
 	require.Equal(t, 2.0, testutil.ToFloat64(m.EventsTotal.WithLabelValues("ok")))
 	require.Equal(t, 1.0, testutil.ToFloat64(m.EventsTotal.WithLabelValues("rejected")))
 }
+
+// submitRefusingSubmitter refuses at submission, the way the real batcher
+// refuses a command it can never apply.
+type submitRefusingSubmitter struct{ err error }
+
+func (s *submitRefusingSubmitter) SubmitAsync(
+	context.Context, *model.Command,
+) (<-chan tbx.SubmitResult, error) {
+	return nil, s.err
+}
+
+// A command the batcher can never apply is a data error, and the only way out
+// is the DLQ: treating it as infrastructure wedges the partition forever —
+// retry, budget, rewind, re-read, same error. Reachable through any decoder
+// that can produce a zero-event command, which the JSON one cannot but a
+// future Protobuf or Avro one may.
+func TestHandleEmptyCommandIsPoisonNotInfrastructure(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := obs.NewMetrics(reg)
+
+	em := &recordingEmitter{}
+	s := newSink(t, stubDecoder{cmd: oneTransferCmd()},
+		&submitRefusingSubmitter{err: tbx.ErrEmptyCommand}, em)
+	s.metrics = m
+
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
+	require.NoError(t, err, "a data error must not be reported as an infrastructure failure")
+	require.True(t, done, "the record is finished — it goes to the DLQ and its offset advances")
+	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("poison")))
+	require.Equal(t, 1.0, testutil.ToFloat64(m.DLQTotal.WithLabelValues("poison", "empty_command")))
+}
+
+// The same two data errors may arrive as an outcome rather than at submission
+// — the interface allows it — and must be classified the same way there.
+func TestHandleEmptyCommandOutcomeIsPoison(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := obs.NewMetrics(reg)
+
+	em := &recordingEmitter{}
+	sub := &stubSubmitter{err: tbx.ErrEmptyCommand}
+	s := newSink(t, stubDecoder{cmd: oneTransferCmd()}, sub, em)
+	s.metrics = m
+
+	done, err := handleOne(t, s, &kgo.Record{Topic: "src"})
+	require.NoError(t, err)
+	require.True(t, done)
+	require.Equal(t, 1.0, testutil.ToFloat64(m.DLQTotal.WithLabelValues("poison", "empty_command")))
+}

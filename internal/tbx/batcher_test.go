@@ -768,3 +768,15 @@ func TestBatcherRecordsMetrics(t *testing.T) {
 	require.Equal(t, uint64(1), transferLatency.GetHistogram().GetSampleCount())
 	require.Equal(t, uint64(1), accountLatency.GetHistogram().GetSampleCount())
 }
+
+// An empty command is a data error, not an infrastructure one: no retry can
+// turn it into something applicable. The sink can only tell the two apart by
+// the error's identity, so it has to be a named error like ErrCommandTooLarge
+// rather than an anonymous one.
+func TestBatcherRejectsEmptyCommandWithNamedError(t *testing.T) {
+	fc := &fakeClient{}
+	b, _ := startBatcher(t, fc, 100, 5*time.Millisecond)
+
+	_, err := b.SubmitAsync(context.Background(), &model.Command{Op: model.OpCreateTransfers})
+	require.ErrorIs(t, err, ErrEmptyCommand)
+}
