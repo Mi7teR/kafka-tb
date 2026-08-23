@@ -725,20 +725,13 @@ func TestBatcherWatchLateAnswersLateEnqueueWithErrClosed(t *testing.T) {
 	}
 }
 
-func TestBatcherAccountsGoToSeparateBatches(t *testing.T) {
-	fc := &fakeClient{}
-	b, _ := startBatcher(t, fc, 100, 5*time.Millisecond)
-	acc := &model.Command{Op: model.OpCreateAccounts, Accounts: make([]types.Account, 2), IDs: []string{"a", "b"}}
-	_, err := b.Submit(context.Background(), acc)
-	require.NoError(t, err)
-	_, err = b.Submit(context.Background(), transferCmd(1, "c"))
-	require.NoError(t, err)
-
-	fc.mu.Lock()
-	defer fc.mu.Unlock()
-	require.Len(t, fc.accountBatches, 1)
-	require.Len(t, fc.transferBatches, 1)
-}
+// Accounts and transfers never sharing a request is covered by
+// TestBatcherMixedOpsNeverInFlightTogether in ordering_test.go, which submits
+// both asynchronously and holds them against a barrier — the only shape in
+// which the property can actually be violated. A test that submits them one at
+// a time with the blocking Submit cannot fail: each command flushes alone
+// because its caller waits for the outcome before the next one is enqueued,
+// and the client's API has a separate method per operation anyway.
 
 // TestBatcherRecordsMetrics verifies sendTransfers/sendAccounts actually
 // observe BatchSize and TBLatency on a real registry, not just that the

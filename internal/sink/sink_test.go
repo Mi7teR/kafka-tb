@@ -404,9 +404,17 @@ var _ emitterIface = (*resultsThenPanicOnceEmitter)(nil)
 type deferredEmitter struct {
 	mu        sync.Mutex
 	published []publication
-	resolve   []func(error)
+	resolve   []pendingResolve
 	// rejectAt holds offsets whose publication the broker will reject.
 	rejectAt map[int64]error
+}
+
+// pendingResolve carries the publication's kind next to its resolver. Keeping
+// the kind in a second slice indexed in lockstep worked only until something
+// removed from one of them.
+type pendingResolve struct {
+	kind string
+	fn   func(error)
 }
 
 func (d *deferredEmitter) pend(kind string, rec *kgo.Record) *emit.Publication {
@@ -416,7 +424,7 @@ func (d *deferredEmitter) pend(kind string, rec *kgo.Record) *emit.Publication {
 	d.published = append(d.published,
 		publication{kind: kind, partition: rec.Partition, offset: rec.Offset})
 	err := d.rejectAt[rec.Offset]
-	d.resolve = append(d.resolve, func(error) { resolve(err) })
+	d.resolve = append(d.resolve, pendingResolve{kind: kind, fn: func(error) { resolve(err) }})
 	return p
 }
 
@@ -441,7 +449,7 @@ func (d *deferredEmitter) releaseAll() int {
 	d.resolve = nil
 	d.mu.Unlock()
 	for i := len(pending) - 1; i >= 0; i-- {
-		pending[i](nil)
+		pending[i].fn(nil)
 	}
 	return len(pending)
 }
@@ -450,19 +458,17 @@ func (d *deferredEmitter) releaseAll() int {
 // matches, leaving the rest pending. Needed to prove that acknowledging one
 // of a record's publications alone is not enough to complete it while
 // another is still outstanding — releaseAll can't distinguish that from
-// "everything was awaited". Relies on d.resolve and d.published growing in
-// lockstep in pend(), which holds as long as this is the only kind of
-// partial release used against a given deferredEmitter.
+// "everything was awaited".
 func (d *deferredEmitter) releaseKind(kind string) int {
 	d.mu.Lock()
 	var toResolve []func(error)
 	remaining := d.resolve[:0:0]
-	for i, resolve := range d.resolve {
-		if d.published[i].kind == kind {
-			toResolve = append(toResolve, resolve)
+	for _, pending := range d.resolve {
+		if pending.kind == kind {
+			toResolve = append(toResolve, pending.fn)
 			continue
 		}
-		remaining = append(remaining, resolve)
+		remaining = append(remaining, pending)
 	}
 	d.resolve = remaining
 	d.mu.Unlock()
@@ -967,8 +973,17 @@ func TestProcessBatchAbandonsSlowSuccessfulBatch(t *testing.T) {
 		"batch must be abandoned before reaching the end")
 	cl := clientOf(t, s)
 	require.Len(t, cl.setOffsets, 1, "failed batch must be rewound")
-	require.Equal(t, int64(2), cl.setOffsets[0]["src"][0].Offset,
-		"rewind must start from the first unprocessed record")
+	// The exact record the budget stops on is a matter of timing — two fit in
+	// 50ms with 10ms to spare, so a loaded runner gets one — and pinning it
+	// would make this a test of the runner. What the test is actually about is
+	// that the rewind starts at the first record that was not processed:
+	// somewhere inside the batch, never at its start (nothing would have been
+	// done) and never past its end (records would be skipped).
+	rewound := cl.setOffsets[0]["src"][0].Offset
+	require.Greater(t, rewound, int64(0), "some records were processed before the budget ran out")
+	require.Less(t, rewound, int64(len(records)), "the batch was not processed to the end")
+	require.LessOrEqual(t, rewound, int64(sub.calls),
+		"a record can only be past the rewind point if it was submitted at all")
 	require.Zero(t, s.offsets.InFlight(), "failed partition is forgotten")
 }
 
@@ -1674,4 +1689,19 @@ func TestHandleEmptyCommandOutcomeIsPoison(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, done)
 	require.Equal(t, 1.0, testutil.ToFloat64(m.DLQTotal.WithLabelValues("poison", "empty_command")))
+}
+
+// releaseKind is what proves "one publication acknowledged is not enough while
+// another is outstanding", so it has to work for either kind first. It used to
+// index a parallel slice that only one of the two calls shortened, which made
+// the second call answer about the wrong publication.
+func TestDeferredEmitterReleaseKindIsOrderIndependent(t *testing.T) {
+	d := &deferredEmitter{}
+	rec := srcRec(0, 0)
+	d.Results(context.Background(), rec, nil)
+	d.DLQ(context.Background(), rec, emit.ReasonPoison, "decode", "bad json")
+
+	require.Equal(t, 1, d.releaseKind("results"))
+	require.Equal(t, 1, d.releaseKind("dlq"),
+		"releasing one kind must not disturb what is left of the other")
 }
