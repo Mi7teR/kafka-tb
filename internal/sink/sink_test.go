@@ -1593,3 +1593,37 @@ func TestNewClampsZeroShutdownTimeout(t *testing.T) {
 	s := New(cfg, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	require.Equal(t, defaultShutdownTimeout, s.shutdownTimeout)
 }
+
+// records_total counts records and events_total counts events. Mixing the two
+// under one metric made every ratio across its labels wrong by the average
+// events-per-message factor: a 3-transfer message that succeeded added 3 to
+// {result="ok"}, while the same message failing on infrastructure added 1 to
+// {result="blocked"}.
+func TestMetricsSeparateRecordAndEventUnits(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := obs.NewMetrics(reg)
+
+	cmd := &model.Command{
+		Op: model.OpCreateTransfers,
+		Transfers: []types.Transfer{
+			{ID: types.ToUint128(1)}, {ID: types.ToUint128(2)}, {ID: types.ToUint128(3)},
+		},
+		IDs: []string{"id-0", "id-1", "id-2"},
+	}
+	sub := &stubSubmitter{outcomes: []tbx.Outcome{
+		{Index: 0, ID: "id-0", Status: tbx.StatusOK},
+		{Index: 1, ID: "id-1", Status: tbx.StatusOK},
+		{Index: 2, ID: "id-2", Status: tbx.StatusRejected, Error: "exceeds_credits"},
+	}}
+	s := newSink(t, stubDecoder{cmd: cmd}, sub, &recordingEmitter{})
+	s.metrics = m
+	_, err := handleOne(t, s, &kgo.Record{Topic: "src"})
+	require.NoError(t, err)
+
+	require.Equal(t, 1.0, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("rejected")),
+		"one record in, one record counted — a record with any rejected event is rejected")
+	require.Zero(t, testutil.ToFloat64(m.RecordsTotal.WithLabelValues("ok")),
+		"the record is not both ok and rejected")
+	require.Equal(t, 2.0, testutil.ToFloat64(m.EventsTotal.WithLabelValues("ok")))
+	require.Equal(t, 1.0, testutil.ToFloat64(m.EventsTotal.WithLabelValues("rejected")))
+}

@@ -24,6 +24,12 @@ type partitionState struct {
 	// MarkCommitted; -1 means "nothing committed yet", so it is not
 	// confused with a legitimate first commit at offset 0.
 	committed int64
+	// lowest is the smallest offset passed to Track since this state was
+	// created. It is the baseline CommitLag uses while committed is still the
+	// sentinel: a partition resumed at offset 1,000,000 is one record behind on
+	// its first poll, not a million, and Forget drops committed, so a revived
+	// partition needs the same treatment as a freshly assigned one.
+	lowest int64
 	// highest is the largest offset ever passed to Track for this
 	// partition. Unlike committed, it never decreases and is never
 	// cleaned up: CommitLag would not be able to tell "the partition is fully
@@ -69,12 +75,16 @@ func (o *Offsets) Track(rec *kgo.Record) {
 			pending:   make(map[int64]int32),
 			done:      make(map[int64]int32),
 			committed: -1,
+			lowest:    -1,
 		}
 		o.p[k] = st
 	}
 	st.pending[rec.Offset] = rec.LeaderEpoch
 	if rec.Offset > st.highest {
 		st.highest = rec.Offset
+	}
+	if st.lowest < 0 || rec.Offset < st.lowest {
+		st.lowest = rec.Offset
 	}
 }
 
@@ -205,8 +215,9 @@ func (o *Offsets) Forget(topic string, partition int32) {
 // reconciled as (highest + 1) - committed rather than a bare subtraction —
 // otherwise a partition that has just fully caught up would report -1
 // instead of 0. Before the first commit, committed is the sentinel -1
-// (nothing committed yet, see partitionState.committed); treated as 0 here,
-// matching a partition whose committed position starts at the beginning.
+// (nothing committed yet, see partitionState.committed) and the baseline is
+// the lowest offset this consumer has tracked: what it is behind on is what
+// it has read, not everything that precedes it in the log.
 // Forgotten (revoked) partitions are excluded — there is nothing left for
 // this consumer to be behind on.
 func (o *Offsets) CommitLag() map[string]map[int32]int64 {
@@ -219,7 +230,9 @@ func (o *Offsets) CommitLag() map[string]map[int32]int64 {
 		}
 		committed := st.committed
 		if committed < 0 {
-			committed = 0
+			// Nothing committed yet. The baseline is where this consumer
+			// started reading the partition, not the beginning of the log.
+			committed = st.lowest
 		}
 		tp, ok := out[k.topic]
 		if !ok {

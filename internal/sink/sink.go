@@ -481,13 +481,22 @@ func (s *Sink) count(pub issuedPubs) {
 		s.metrics.IncDLQ(string(emit.ReasonPoison), pub.poison)
 		return
 	}
+	rejected := false
 	for _, o := range pub.outcomes {
 		if o.Status == tbx.StatusRejected {
 			s.metrics.IncDLQ(string(emit.ReasonReject), o.Error)
+			rejected = true
 		}
+		s.metrics.IncEvents(string(o.Status))
 	}
-	for _, o := range pub.outcomes {
-		s.metrics.IncRecords(string(o.Status))
+	// One record, one increment. The events inside it are counted separately:
+	// counting them here instead would make records_total{result="ok"} a count
+	// of transfers while records_total{result="blocked"} stayed a count of
+	// records, and any ratio between the two labels meaningless.
+	if rejected {
+		s.metrics.IncRecords(string(tbx.StatusRejected))
+	} else {
+		s.metrics.IncRecords(string(tbx.StatusOK))
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 type Metrics struct {
 	RecordsTotal *prometheus.CounterVec
 	DLQTotal     *prometheus.CounterVec
+	EventsTotal  *prometheus.CounterVec
 	BatchSize    prometheus.Histogram
 	TBLatency    *prometheus.HistogramVec
 	CommitLag    *prometheus.GaugeVec
@@ -28,7 +29,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	return &Metrics{
 		RecordsTotal: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "kafkatb_records_total",
-			Help: "Kafka records processed, by result (ok|rejected|poison|blocked).",
+			Help: "Kafka records processed, by result (ok|rejected|poison|blocked). One per record.",
+		}, []string{"result"}),
+		EventsTotal: f.NewCounterVec(prometheus.CounterOpts{
+			Name: "kafkatb_events_total",
+			Help: "Events applied to TigerBeetle, by result (ok|rejected). One per event, " +
+				"so a record carrying many transfers contributes many.",
 		}, []string{"result"}),
 		DLQTotal: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "kafkatb_dlq_total",
@@ -57,6 +63,16 @@ func (m *Metrics) IncRecords(result string) {
 		return
 	}
 	m.RecordsTotal.WithLabelValues(result).Inc()
+}
+
+// IncEvents increments EventsTotal for result. Unlike IncRecords this counts a
+// single event inside a command, so a record carrying many transfers calls it
+// many times. No-op on a nil *Metrics.
+func (m *Metrics) IncEvents(result string) {
+	if m == nil {
+		return
+	}
+	m.EventsTotal.WithLabelValues(result).Inc()
 }
 
 // IncDLQ increments DLQTotal for reason/error. No-op on a nil *Metrics.

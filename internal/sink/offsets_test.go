@@ -414,3 +414,35 @@ func TestCommitLagExcludesForgottenPartitions(t *testing.T) {
 
 	require.Empty(t, o.CommitLag())
 }
+
+// Lag is the backlog this consumer is behind on, not the partition's absolute
+// position. A group resuming a partition at a high offset has one record in
+// hand, not millions: the "nothing committed yet" sentinel must not be read as
+// "committed at 0", or every deploy reports a multi-million spike until the
+// first commit lands a second later.
+func TestCommitLagBeforeFirstCommitOnResumedPartition(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(1_000_000))
+
+	require.Equal(t, map[string]map[int32]int64{
+		"t": {0: 1},
+	}, o.CommitLag())
+}
+
+// Forget drops committed along with the rest of the state, so a partition
+// revived by Track is in exactly the same position as one that was just
+// assigned — and must not report its absolute offset as lag either.
+func TestCommitLagAfterForgetAndRevive(t *testing.T) {
+	o := NewOffsets()
+	o.Track(rec(1_000_000))
+	o.Done(rec(1_000_000))
+	o.MarkCommitted(o.Commitable())
+	o.Forget("t", 0)
+
+	o.Track(rec(1_000_001))
+	o.Track(rec(1_000_002))
+
+	require.Equal(t, map[string]map[int32]int64{
+		"t": {0: 2},
+	}, o.CommitLag())
+}

@@ -461,7 +461,10 @@ Before taking the above measurements, `cmd/loadgen` was run directly
 against the same containerized stack and confirmed:
 
 - `kafkatb_records_total{result="ok"}` increased by exactly 210 (200
-  transfers + 10 accounts), with no `rejected` or `poison` results.
+  transfers + 10 accounts), with no `rejected` or `poison` results. Every
+  message in this run carried exactly one event, so the per-record and
+  per-event counts coincided; `kafkatb_events_total` is the one that stays 210
+  when a message carries several transfers.
 - The DLQ topic's high-water mark stayed at 0 (no records at all).
 - A separate direct check — one `create_accounts` message for two fresh
   accounts, one `create_transfers` message for `10.00` between them, then a

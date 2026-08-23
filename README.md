@@ -124,7 +124,7 @@ resumes from there. `--timestamp-last` overrides it, and `--timestamp-last=0` re
 because the TigerBeetle client rejects them at connect time with a far less obvious error.
 
 Metrics and health live on `metrics_addr` (`:9464` by default): `/metrics`, `/healthz`, `/readyz`,
-and `kafkatb_records_total`, `kafkatb_dlq_total`, `kafkatb_tb_batch_size`,
+and `kafkatb_records_total`, `kafkatb_events_total`, `kafkatb_dlq_total`, `kafkatb_tb_batch_size`,
 `kafkatb_tb_latency_seconds`, `kafkatb_offset_commit_lag`. `pprof: true` adds `/debug/pprof/`; it
 is off by default because those endpoints are an exposure surface.
 
