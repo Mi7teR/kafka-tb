@@ -1,0 +1,8 @@
+.git
+.github
+.superpowers
+bin
+docs
+test
+*_test.go
+CODE_REVIEW.md

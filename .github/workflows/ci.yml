@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 # A newer push to the same branch makes the older run pointless.
@@ -124,3 +125,49 @@ jobs:
 
       - name: unit tests
         run: make test
+
+  image:
+    name: image (ghcr.io)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Only publish what already passed. A broken image on ghcr is worse than no
+    # image, because someone will pull it before the fix lands.
+    needs: [test, lint, integration]
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # linux/arm64 is built under emulation. Cross-compiling cgo would need a
+      # cross toolchain in the builder; QEMU is slower but keeps the build
+      # honest, and the TigerBeetle module ships a static library for both.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

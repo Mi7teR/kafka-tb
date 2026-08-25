@@ -154,8 +154,19 @@ rejected message.
 
 ## Quick start
 
-Requires Go 1.25+ and `CGO_ENABLED=1` (the TigerBeetle client is cgo, so cross-compilation is not
-available).
+```bash
+docker run --rm --security-opt seccomp=unconfined \
+  -v "$PWD/my-config.yaml:/etc/kafkatb/config.yaml" \
+  ghcr.io/mi7ter/kafka-tb:main sink
+```
+
+**`--security-opt seccomp=unconfined` is not optional.** The TigerBeetle client uses io_uring, and
+Docker's default seccomp profile blocks the `io_uring_*` syscalls, so without it the process dies
+at startup with `io_uring is not available`. A narrower custom profile that permits just those
+syscalls works too; the blanket flag is only the shortest way to say it here.
+
+Or from source. Requires Go 1.25+ and `CGO_ENABLED=1` — the TigerBeetle client is cgo, so
+cross-compilation is not available:
 
 ```bash
 make build
