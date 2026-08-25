@@ -1,7 +1,7 @@
 # kafka-tb
 
 [![CI](https://github.com/Mi7teR/kafka-tb/actions/workflows/ci.yml/badge.svg)](https://github.com/Mi7teR/kafka-tb/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/Mi7teR/kafka-tb/branch/main/graph/badge.svg)](https://codecov.io/gh/Mi7teR/kafka-tb)
+[![coverage](https://raw.githubusercontent.com/Mi7teR/kafka-tb/badges/coverage.svg)](https://github.com/Mi7teR/kafka-tb/actions/workflows/ci.yml)
 
 **Kafka → [TigerBeetle](https://tigerbeetle.com): a sink for applying financial commands from a
 stream — plus CDC back out.**

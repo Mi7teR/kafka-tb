@@ -91,17 +91,51 @@ jobs:
       - name: integration suite and merged coverage
         run: make coverage
 
-      # Tokenless upload: this repository is public, so no secret is required.
-      # CODECOV_TOKEN is passed through anyway so that adding it later raises
-      # the rate limit without another change here.
-      - name: upload coverage
-        uses: codecov/codecov-action@v5
-        with:
-          files: ./coverage.out
-          token: ${{ secrets.CODECOV_TOKEN }}
-          # Coverage is a report, not a gate. A Codecov outage must not fail a
-          # build whose tests all passed.
-          fail_ci_if_error: false
+      # The number goes in the run's own summary, so it is visible on every run
+      # and on every pull request without leaving GitHub.
+      - name: report coverage
+        id: cov
+        run: |
+          set -euo pipefail
+          pct=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$NF); print $NF}')
+          echo "pct=$pct" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Coverage: ${pct}%"
+            echo
+            echo "Unit and integration suites merged, generated code excluded."
+            echo "See \`scripts/coverage.sh\` for what is left out and why."
+            echo
+            echo '<details><summary>Per-package</summary>'
+            echo
+            echo '```'
+            go tool cover -func=coverage.out | awk '{print $1, $NF}' | sed 's|github.com/Mi7teR/kafka-tb/||' | column -t
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The badge is generated here and published to an orphan "badges" branch,
+      # which the workflow's own triggers deliberately exclude — pushing to it
+      # must not start another run. No third-party service is involved: Codecov
+      # was tried first and did not work.
+      - name: publish the coverage badge
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./scripts/coverage-badge.sh "${{ steps.cov.outputs.pct }}" /tmp/coverage.svg
+          tmp=$(mktemp -d)
+          cd "$tmp"
+          git init -q
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp /tmp/coverage.svg coverage.svg
+          printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ) ${{ github.sha }} ${{ steps.cov.outputs.pct }}%" > coverage.txt
+          git add coverage.svg coverage.txt
+          git commit -q -m "coverage: ${{ steps.cov.outputs.pct }}% at ${{ github.sha }}"
+          git push -q --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" \
+            HEAD:badges
 
   build-darwin:
     name: build (macOS)
