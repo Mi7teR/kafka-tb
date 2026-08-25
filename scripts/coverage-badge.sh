@@ -39,7 +39,7 @@ cat > "$out" <<SVG
     <rect x="${label_w}" width="${value_w}" height="20" fill="${colour}"/>
     <rect width="${total_w}" height="20" fill="url(#s)"/>
   </g>
-  <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11">
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="110">
     <text x="$(( label_w * 5 ))" y="150" fill="#010101" fill-opacity=".3" transform="scale(.1)" textLength="$(( (label_w - 10) * 10 ))">${label}</text>
     <text x="$(( label_w * 5 ))" y="140" transform="scale(.1)" textLength="$(( (label_w - 10) * 10 ))">${label}</text>
     <text x="$(( (label_w * 10 + value_w * 5) ))" y="150" fill="#010101" fill-opacity=".3" transform="scale(.1)" textLength="$(( (value_w - 10) * 10 ))">${value}</text>
