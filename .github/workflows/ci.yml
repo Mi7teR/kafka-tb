@@ -71,6 +71,11 @@ jobs:
   integration:
     name: integration (Redpanda + TigerBeetle) and coverage
     runs-on: ubuntu-latest
+    # contents: write is for pushing the badge to the orphan "badges" branch.
+    # The default GITHUB_TOKEN is read-only, which is why the first attempt got
+    # a 403 from github-actions[bot].
+    permissions:
+      contents: write
     # Containers are pulled and booted per test; locally the suite is ~3.5
     # minutes, and a cold runner is slower.
     timeout-minutes: 30
@@ -117,7 +122,11 @@ jobs:
       # which the workflow's own triggers deliberately exclude — pushing to it
       # must not start another run. No third-party service is involved: Codecov
       # was tried first and did not work.
+      # A badge is a report, not a gate. The first version of this step failed
+      # the whole job on a 403, which also skipped the image job through its
+      # needs: — so a cosmetic publish blocked a release. Never again.
       - name: publish the coverage badge
+        continue-on-error: true
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
