@@ -3,12 +3,20 @@
 [![CI](https://github.com/Mi7teR/kafka-tb/actions/workflows/ci.yml/badge.svg)](https://github.com/Mi7teR/kafka-tb/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/Mi7teR/kafka-tb/branch/main/graph/badge.svg)](https://codecov.io/gh/Mi7teR/kafka-tb)
 
-A two-way bridge between Kafka and [TigerBeetle](https://tigerbeetle.com).
+**Kafka → [TigerBeetle](https://tigerbeetle.com): a sink for applying financial commands from a
+stream — plus CDC back out.**
 
-TigerBeetle is a fast double-entry accounting database, and that is all it does. It speaks a
-binary protocol over cgo — not HTTP, not SQL — and its data model is 128-bit integers, bit-mask
-flags and numeric codes. There is no way to hand it an event from Kafka, and no way for the rest
-of your system to learn what it recorded. This service is the bridge across that gap.
+Streaming change events *out* of TigerBeetle is a solved problem: the project ships
+[`tigerbeetle amqp`](https://docs.tigerbeetle.com/operating/cdc/) for RabbitMQ, and Redpanda
+Connect has a [`tigerbeetle_cdc` input](https://docs.redpanda.com/redpanda-connect/components/inputs/tigerbeetle_cdc/).
+Applying a stream of commands *into* it is not, and that is the harder half: reading a change
+stream is mostly a matter of not losing your place, while writing means deciding what to do when a
+message is malformed, when TigerBeetle refuses the operation, and when TigerBeetle cannot be
+reached — three cases that must behave differently, because dead-lettering an outage loses money
+and retrying a malformed message forever stops the world.
+
+This service does that, and streams changes back out in the same vocabulary so one contract covers
+both directions.
 
 ```
 Kafka topic ──►  kafkatb sink  ──►  TigerBeetle     apply transfers
@@ -46,11 +54,14 @@ lot of use cases they are the right answer.
 | Broker → TigerBeetle | — | — | **yes** |
 | Downstream reach | one exchange | 300+ connectors, plus filtering, transforms, routing | one Kafka topic |
 | Delivery | at-least-once | at-least-once | at-least-once |
-| CDC progress | stateless, resumes from what the broker acked | external `progress_cache` resource | stateless, reads the output topic's own tail |
+| CDC progress | stateless, resumes from what the broker acked | external `progress_cache` resource (required) | stateless, reads the output topic's own tail |
 | Values on the wire | TigerBeetle's fields, long integers as JSON strings | JSON mirroring the change event | named ledgers and codes, decimal amount strings, UUID ids, named flags |
 | Write-side failure handling | n/a | n/a | poison / reject / infrastructure split, byte-identical DLQ payload with the reason in headers |
 | Write-side ordering | n/a | n/a | preserved within a Kafka partition, end to end |
 | Offset safety | n/a | n/a | committed only after TigerBeetle confirmed **and** the broker acked, contiguous prefix only |
+
+Their columns were read from the linked upstream docs in August 2026; if something there has moved
+since, the docs are right and this table is stale.
 
 ### When to pick one of the others
 
@@ -67,59 +78,12 @@ cache resource for progress, where this project reads its own output topic.
 **Pick neither** if you only read from TigerBeetle and never write into it from a stream. Half of
 this project would be dead weight.
 
-### What is actually different here
+### Where this is weaker, plainly
 
-The direction nobody else covers is *into* TigerBeetle, and that is where the hard problems live.
-Reading a change stream is mostly a matter of not losing your place. Applying a stream of financial
-commands means deciding what to do when a message is malformed, when TigerBeetle refuses the
-operation, and when TigerBeetle cannot be reached — and those three cases must behave differently,
-because dead-lettering an outage loses money and retrying a malformed message forever stops the
-world. That taxonomy, the offset rule behind it, and one vocabulary shared by both directions are
-what this project is for.
+It is one repository maintained by one person, its CDC job must run as a single instance with no
+leader election, it speaks JSON only so far, and its published numbers come from a laptop.
 
-Where it is weaker, plainly: it is one repository maintained by one person, its CDC job must run as
-a single instance with no leader election, it speaks JSON only so far, and its published numbers
-come from a laptop.
-
-## Quick start
-
-Requires Go 1.25+ and `CGO_ENABLED=1` (the TigerBeetle client is cgo, so cross-compilation is not
-available).
-
-```bash
-make build
-./bin/kafkatb sink --config configs/example.yaml
-```
-
-Subcommands: `sink` (consumer only), `cdc` (change stream only), `run` (both). `--config` is
-shared. Precedence is flags → `KAFKATB_*` environment → file → defaults.
-
-> **macOS:** build and test through `make` only. TigerBeetle ships a prebuilt static library whose
-> members are not 8-byte aligned, which Apple's current linker refuses; the Makefile passes
-> `-ld_classic` on Darwin. A bare `go build ./...` fails at link time. Linux is unaffected.
-
-## Message contract
-
-### Into the sink
-
-```json
-{
-  "operation": "create_transfers",
-  "transfers": [
-    {
-      "id": "0193f8a1-7c2e-7000-8000-000000000001",
-      "debit_account_id":  "0193f8a1-0000-7000-8000-000000000010",
-      "credit_account_id": "0193f8a1-0000-7000-8000-000000000020",
-      "amount": "12.34",
-      "ledger": "USD",
-      "code": "payment",
-      "flags": ["linked"]
-    }
-  ]
-}
-```
-
-### The value contract
+## The value contract
 
 TigerBeetle stores a ledger as a `uint32`, a code as a `uint16`, an amount as an integer number of
 minor units, and flags as a bitmask. Without a translation layer every producer has to know that
@@ -159,12 +123,12 @@ flag — `"balancing_debt"` is a typo that would otherwise change what a transfe
 importing requires caller-supplied event timestamps that this connector does not support — and
 hiding it on an already-imported record would misreport stored state.
 
-#### The same vocabulary in both directions
+### The same vocabulary in both directions
 
 The CDC job emits exactly this contract, so an event coming out reads with the same code that
 builds a message going in.
 
-#### An unknown name behaves differently by direction, deliberately
+### An unknown name behaves differently by direction, deliberately
 
 | | unknown ledger or code |
 |---|---|
@@ -187,6 +151,44 @@ is atomic within one message and is never split across TigerBeetle batches.
 One message carries operations of exactly one kind. Decoding is strict: an unknown field is a
 poison record, because `"amont"` silently becoming a zero amount on a money path is worse than a
 rejected message.
+
+## Quick start
+
+Requires Go 1.25+ and `CGO_ENABLED=1` (the TigerBeetle client is cgo, so cross-compilation is not
+available).
+
+```bash
+make build
+./bin/kafkatb sink --config configs/example.yaml
+```
+
+Subcommands: `sink` (consumer only), `cdc` (change stream only), `run` (both). `--config` is
+shared. Precedence is flags → `KAFKATB_*` environment → file → defaults.
+
+> **macOS:** build and test through `make` only. TigerBeetle ships a prebuilt static library whose
+> members are not 8-byte aligned, which Apple's current linker refuses; the Makefile passes
+> `-ld_classic` on Darwin. A bare `go build ./...` fails at link time. Linux is unaffected.
+
+## Message contract
+
+### Into the sink
+
+```json
+{
+  "operation": "create_transfers",
+  "transfers": [
+    {
+      "id": "0193f8a1-7c2e-7000-8000-000000000001",
+      "debit_account_id":  "0193f8a1-0000-7000-8000-000000000010",
+      "credit_account_id": "0193f8a1-0000-7000-8000-000000000020",
+      "amount": "12.34",
+      "ledger": "USD",
+      "code": "payment",
+      "flags": ["linked"]
+    }
+  ]
+}
+```
 
 ### Out of CDC
 
@@ -262,15 +264,9 @@ measured 6.13 µs/event floor on a full batch — so headroom remains. The cheap
 raising `sink.max_in_flight_per_partition` (measured 1.23x) and having producers put several
 transfers in one message.
 
-Re-measured against `1530614` (the commit under test) after two allocation fixes:
-`model.ParseAmount` going allocation-free (sink decode path) and the CDC job's `FormatAmount` fast
-path plus a JSON-encoder allocation cut (8 allocations → 1). **Read the two directions separately: the sink
-barely moved (~1.7% at 1 partition, ~9% at 12 — inside or just outside run-to-run noise), because
-`ParseAmount` was already nanoseconds against a TigerBeetle round trip measured in milliseconds.
-CDC moved substantially, ~1.37x (105,364/102,157 → 144,226/141,045 events/sec at `batch_size:
-2730`), because encoding — not waiting — was the cost those two fixes actually cut, and CDC's
-encode stage was a much larger share of its window than the sink's decode ever was of its own.**
-Full method, both runs, and the per-stage breakdown are in
+CDC gained about 1.37x from two allocation fixes; the sink barely moved from the same class of
+change, because its cost is the TigerBeetle round trip rather than encoding. Both runs, the
+per-stage breakdown and the reasoning are in
 [docs/benchmarks/README.md](docs/benchmarks/README.md).
 
 ### Hot-path microbenchmarks
