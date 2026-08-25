@@ -171,3 +171,7 @@ mid-window crash driven through the production publication seam.
 No API: reading balances over HTTP is not this service's job. No exactly-once. No business logic —
 who owes whom and why is the producer's decision. No import of historical transfers: the
 `imported` flag is surfaced on read and rejected on write.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
