@@ -207,6 +207,22 @@ func TestParseAmountMatchesBig(t *testing.T) {
 			strings.Repeat("9", 20),                                        // just above uint64, 20 digits
 			strings.Repeat("9", 19),                                        // just below it
 		}
+		// The overflow guard's own threshold, stated directly rather than
+		// through an already-scaled value: parseUint64 rejects an intPart
+		// once it exceeds MaxUint64/div, because that is the largest value it
+		// can still multiply by div without overflowing a uint64. Every entry
+		// above is built from minor units and never lands exactly here, so an
+		// off-by-one in the guard itself (e.g. "/div" mistakenly written
+		// "/div+1") would pass every one of them and only show up on this
+		// boundary.
+		boundary := new(big.Int).SetUint64(math.MaxUint64 / div)
+		for _, delta := range []int64{-1, 0, 1} {
+			b := new(big.Int).Add(boundary, big.NewInt(delta))
+			if b.Sign() < 0 {
+				continue
+			}
+			inputs = append(inputs, b.String())
+		}
 		// A fraction shorter than the scale is where the trailing-zero shift
 		// earns its keep: every truncated width from one digit to the full
 		// scale, on both sides of the uint64 boundary.

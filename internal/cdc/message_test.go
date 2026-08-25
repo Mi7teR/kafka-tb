@@ -393,3 +393,38 @@ func TestRecordBodyLargerThanScratch(t *testing.T) {
 	require.Equal(t, string(rec.Value), string(next.Value))
 	require.NotSame(t, &rec.Value[0], &next.Value[0])
 }
+
+// What the scratch replacement in marshal's spill branch guards against:
+// BuildBytes hands every chunk it walks, the scratch included, back to
+// easyjson's global sync.Pool via putBuf. That pool is shared with every
+// other easyjson user in the process — internal/emit, running on the sink
+// goroutine, is the other one — so if the encoder kept writing into the
+// scratch after a spill instead of replacing it, a later encode here and a
+// later encode in internal/emit could both draw that same pooled chunk and
+// silently overwrite each other's JSON. Nothing would crash; a downstream
+// consumer would just receive corrupted bytes. This pins that the scratch
+// actually becomes a fresh array once a spill happens, not merely a
+// same-array slice with a reset length.
+func TestSpillReplacesScratchArray(t *testing.T) {
+	long := strings.Repeat("l", scratchSize)
+	reg := model.NewRegistry(&config.Config{
+		Ledgers: map[string]config.Ledger{long: {ID: testLedgerID, Scale: testScale}},
+		Codes:   map[string]uint16{"payment": 7, "customer": 3, "merchant": 4},
+	})
+	log := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	enc := NewEncoder(config.CDC{Topic: "events"}, reg, log)
+
+	// The array backing the pre-spill scratch: what BuildBytes will walk and
+	// hand back to easyjson's pool once the encode below spills.
+	before := enc.scratch
+	beforeArray := &before[:cap(before)][0]
+
+	ev := sampleEvent(types.ChangeEventSinglePhase)
+	rec, err := enc.Record(ev, ev.Timestamp)
+	require.NoError(t, err)
+	require.Greater(t, len(rec.Value), scratchSize, "the message must actually spill for this test to mean anything")
+
+	afterArray := &enc.scratch[:cap(enc.scratch)][0]
+	require.NotSame(t, beforeArray, afterArray,
+		"scratch after a spill must be a fresh array, not the one BuildBytes walked and returned to easyjson's pool")
+}

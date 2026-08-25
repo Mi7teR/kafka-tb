@@ -137,6 +137,14 @@ type Encoder struct {
 // code and flag names and never chains a second chunk. A message that does
 // outgrow it still encodes correctly, just through easyjson's chunk chain;
 // see marshal.
+//
+// One caveat if a []byte field is ever added to Message: jwriter's
+// EnsureSpace silently allocates a 128 B chunk instead of the requested size
+// when a single call (e.g. jwriter.Writer.Base64Bytes) asks for more than
+// fits in the current, empty chunk — it does not consult the size actually
+// requested. That would only degrade this to more, smaller chunks per event;
+// it self-heals on the very next spill and never corrupts anything, so it is
+// not worth guarding against, just worth knowing about.
 const scratchSize = 2048
 
 func NewEncoder(cfg config.CDC, reg *model.Registry, log *slog.Logger) *Encoder {
