@@ -1,7 +1,12 @@
 # The TigerBeetle client is cgo: it links a prebuilt static library shipped in
 # the Go module (native/libtb_client_*.a). That rules out CGO_ENABLED=0 and it
 # rules out a scratch image — the binary still needs libc for -ldl and -lm.
-FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS build
+# Deliberately NOT --platform=$BUILDPLATFORM. Pinning the builder to the build
+# platform would need GOARCH cross-compilation, and cgo cannot cross-compile
+# without a cross toolchain — the result is an amd64 binary inside an arm64
+# image, which fails at exec with "Dynamic loader not found". Letting buildx run
+# this stage under emulation per target architecture is slower and correct.
+FROM golang:1.25-bookworm AS build
 
 WORKDIR /src
 
@@ -12,11 +17,9 @@ RUN go mod download
 
 COPY . .
 
-# TARGETARCH comes from buildx. Cross-compiling cgo needs a cross toolchain, so
-# this image is built per-architecture under emulation rather than cross-built;
-# BUILDPLATFORM above keeps the toolchain native while the target stays honest.
-ARG TARGETOS
-ARG TARGETARCH
+# No GOOS/GOARCH here on purpose: this stage already runs on the target
+# architecture, so the native toolchain produces the right binary and cgo links
+# the matching TigerBeetle static library.
 ENV CGO_ENABLED=1
 RUN go build -trimpath -ldflags="-s -w" -o /out/kafkatb ./cmd/kafkatb
 

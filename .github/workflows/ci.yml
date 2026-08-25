@@ -171,3 +171,18 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # v0.1.0 shipped an arm64 image containing an amd64 binary: the build
+      # succeeded, the manifest listed both architectures, and the job passed.
+      # Nothing executed what was built. Pull each advertised platform back and
+      # run it, so a manifest that lies fails here instead of on a user's host.
+      - name: the published image runs on every architecture it advertises
+        run: |
+          set -euo pipefail
+          tag=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          for platform in linux/amd64 linux/arm64; do
+            echo "::group::$platform"
+            docker run --rm --platform "$platform" "$tag" --help > /dev/null
+            echo "$platform ok"
+            echo "::endgroup::"
+          done
