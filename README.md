@@ -31,6 +31,53 @@ A panic while handling one message becomes a poison record, not a dead process.
 TigerBeetle confirmed the operation *and* the broker acknowledged the dead-letter/results write,
 and only as a contiguous prefix — one unfinished record holds the line.
 
+## How this compares
+
+Three things stream TigerBeetle data today. Two of them are more mature than this one, and for a
+lot of use cases they are the right answer.
+
+| | [`tigerbeetle amqp`](https://docs.tigerbeetle.com/operating/cdc/) | [`tigerbeetle_cdc`](https://docs.redpanda.com/redpanda-connect/components/inputs/tigerbeetle_cdc/) + Redpanda Connect | kafka-tb |
+|---|---|---|---|
+| Maintained by | TigerBeetle, first-party | community tier, not Redpanda-supported | this repo |
+| TigerBeetle → broker | RabbitMQ | anywhere Redpanda Connect can write | Kafka |
+| Broker → TigerBeetle | — | — | **yes** |
+| Downstream reach | one exchange | 300+ connectors, plus filtering, transforms, routing | one Kafka topic |
+| Delivery | at-least-once | at-least-once | at-least-once |
+| CDC progress | stateless, resumes from what the broker acked | external `progress_cache` resource | stateless, reads the output topic's own tail |
+| Values on the wire | TigerBeetle's fields, long integers as JSON strings | JSON mirroring the change event | named ledgers and codes, decimal amount strings, UUID ids, named flags |
+| Write-side failure handling | n/a | n/a | poison / reject / infrastructure split, byte-identical DLQ payload with the reason in headers |
+| Write-side ordering | n/a | n/a | preserved within a Kafka partition, end to end |
+| Offset safety | n/a | n/a | committed only after TigerBeetle confirmed **and** the broker acked, contiguous prefix only |
+
+### When to pick one of the others
+
+**Pick `tigerbeetle amqp`** if you are on RabbitMQ, or if you want the thing the TigerBeetle team
+itself ships and supports. It is first-party, it is the reference implementation of this pattern,
+and nothing here is a reason to run a third-party job instead.
+
+**Pick `tigerbeetle_cdc` with Redpanda Connect** if what you need is TigerBeetle *out* — especially
+out to somewhere that is not Kafka. You get a mature stream-processing runtime, filtering and
+transformation before the data lands, and a few hundred destinations for free. If your pipeline is
+already Redpanda Connect, adding one input beats adding one service. Note it needs an external
+cache resource for progress, where this project reads its own output topic.
+
+**Pick neither** if you only read from TigerBeetle and never write into it from a stream. Half of
+this project would be dead weight.
+
+### What is actually different here
+
+The direction nobody else covers is *into* TigerBeetle, and that is where the hard problems live.
+Reading a change stream is mostly a matter of not losing your place. Applying a stream of financial
+commands means deciding what to do when a message is malformed, when TigerBeetle refuses the
+operation, and when TigerBeetle cannot be reached — and those three cases must behave differently,
+because dead-lettering an outage loses money and retrying a malformed message forever stops the
+world. That taxonomy, the offset rule behind it, and one vocabulary shared by both directions are
+what this project is for.
+
+Where it is weaker, plainly: it is one repository maintained by one person, its CDC job must run as
+a single instance with no leader election, it speaks JSON only so far, and its published numbers
+come from a laptop.
+
 ## Quick start
 
 Requires Go 1.25+ and `CGO_ENABLED=1` (the TigerBeetle client is cgo, so cross-compilation is not
