@@ -147,6 +147,35 @@ measured 6.13 µs/event floor on a full batch — so headroom remains. The cheap
 raising `sink.max_in_flight_per_partition` (measured 1.23x) and having producers put several
 transfers in one message.
 
+### Hot-path microbenchmarks
+
+Apple M4 Pro, Go 1.26.3, median of 6 runs. Raw output in
+[docs/benchmarks/6c461be.txt](docs/benchmarks/6c461be.txt).
+
+| | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `ParseAmount` — decimal string → u128 minor units | 11.4 | 0 | **0** |
+| `FormatAmount` — u128 → decimal string | 16.3 | 8 | 1 |
+| `ParseID` — UUID → u128 | 13.5 | 0 | **0** |
+| decode a 1-transfer message | 699 | 608 | 11 |
+| decode a 10-transfer message | 6,162 | 9,104 | 69 |
+| decode a 100-transfer message | 57,546 | 80,432 | 612 |
+| encode one CDC event (whole record) | 1,224 | 2,224 | 35 |
+| ↳ its JSON serialisation alone | 555 | 1,152 | 1 |
+| ↳ the same via plain `easyjson.Marshal` | 783 | 2,467 | 8 |
+| map a full 8,189-event TigerBeetle reply | 106,939 | 526,256 | 83 |
+
+Money and identifier conversion is allocation-free on the parse side and one allocation — the
+returned string — on the format side. Both are on the sink's per-transfer path, so the allocation
+that is not there is the point rather than the nanoseconds.
+
+The CDC encoder keeps one allocation per event for the JSON body, down from eight. That last one
+cannot go while franz-go retains `Record.Value` until the broker acknowledges it, so a pooled body
+would have to be released on the produce callback — reasoned about, deliberately not built.
+
+The full-reply mapping works out to about 13 ns per event, so it does not register against the
+TigerBeetle round trip it follows.
+
 ## Configuration
 
 [configs/example.yaml](configs/example.yaml) documents every field, including the reasoning behind
