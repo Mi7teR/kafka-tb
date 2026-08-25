@@ -386,3 +386,22 @@ func TestLoadRejectsNonPositivePollSize(t *testing.T) {
 	_, err := Load(writeCfg(t, body))
 	require.ErrorContains(t, err, "sink.poll_size")
 }
+
+// The shipped example is the default value of --config, so it is the first
+// thing anyone runs. Nothing else in the suite loads it, which means an edit to
+// the file — a new field, a typo in a comment block, a value that trips
+// validation — would ship broken and only fail on someone else's machine.
+func TestShippedExampleConfigLoads(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "configs", "example.yaml"))
+	require.NoError(t, err)
+
+	// Spot-check the registries rather than every field: they are the part a
+	// reader is most likely to edit, and an empty one would still load.
+	require.NotEmpty(t, cfg.Ledgers)
+	require.NotEmpty(t, cfg.Codes)
+	usd, ok := cfg.LedgerByName("USD")
+	require.True(t, ok, "the example is referenced by cmd/loadgen and the integration harness, which expect USD")
+	require.Equal(t, int32(2), usd.Scale)
+	_, ok = cfg.CodeByName("payment")
+	require.True(t, ok, "the example is referenced by cmd/loadgen and the integration harness, which expect payment")
+}

@@ -116,6 +116,67 @@ shared. Precedence is flags → `KAFKATB_*` environment → file → defaults.
 }
 ```
 
+### The value contract
+
+TigerBeetle stores a ledger as a `uint32`, a code as a `uint16`, an amount as an integer number of
+minor units, and flags as a bitmask. Without a translation layer every producer has to know that
+USD is `1`, that `payment` is `718`, and that `12.34` must be written as `1234` — knowledge that
+then spreads across every service writing to the bus.
+
+Two config tables replace it:
+
+```yaml
+ledgers:
+  USD: {id: 1, scale: 2}
+  # JPY: {id: 3, scale: 0}   # no minor unit at all
+  # BTC: {id: 4, scale: 8}   # satoshi
+codes:
+  payment: 1
+```
+
+`scale` is the ledger's decimal places, and it is what turns the string into minor units. At scale
+2, `"12.34"` is `1234`; on a scale-8 ledger the same string is `1234000000`; on a scale-0 ledger it
+is rejected, because that ledger has no fractional part.
+
+**Amounts travel as strings**, never as JSON numbers — a JSON number is a `float64`, which cannot
+represent decimal fractions exactly. Internally they are `big.Int` and integers; `float64` is
+banned anywhere near money.
+
+**More decimals than the ledger's scale is a rejection, not rounding.** `"12.345"` on a scale-2
+ledger is a poison message. Silently rounding somebody else's money is worse than dead-lettering
+the record that asked for it.
+
+**Flags travel as names**, not as a mask: `linked`, `pending`, `post_pending_transfer`,
+`void_pending_transfer`, `balancing_debit`, `balancing_credit`, `closing_debit`, `closing_credit`
+for transfers; `linked`, `debits_must_not_exceed_credits`, `credits_must_not_exceed_debits`,
+`history`, `closed` for accounts. An unrecognised name is poison rather than a silently ignored
+flag — `"balancing_debt"` is a typo that would otherwise change what a transfer means.
+
+`imported` is the one asymmetric flag: it is reported on read but refused on write, because
+importing requires caller-supplied event timestamps that this connector does not support — and
+hiding it on an already-imported record would misreport stored state.
+
+#### The same vocabulary in both directions
+
+The CDC job emits exactly this contract, so an event coming out reads with the same code that
+builds a message going in.
+
+#### An unknown name behaves differently by direction, deliberately
+
+| | unknown ledger or code |
+|---|---|
+| sink, writing | **poison** — dead-lettered |
+| cdc, reading | published as the **raw number**, amounts **unscaled**, warned once per id |
+
+Writing with a guessed value would put wrong data into the ledger, so refusing is the safe move.
+But on the way out the event has already happened and the money has already moved; dropping a real
+financial event because the config lagged behind reality would lose the record of it. So it goes
+out honestly, as a number rather than a name.
+
+The warning is logged once per unknown id, not once per event: a gap in the registry is a static
+condition affecting every event on that ledger, and a line per occurrence would flood the log at
+full stream rate while telling the operator nothing the first line did not.
+
 `create_accounts` and `create_transfers` are supported, including two-phase transfers
 (`pending` / `post_pending_transfer` / `void_pending_transfer`) and atomic `linked` chains. A chain
 is atomic within one message and is never split across TigerBeetle batches.

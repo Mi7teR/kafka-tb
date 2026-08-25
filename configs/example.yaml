@@ -88,12 +88,36 @@ limits:
   max_message_bytes: 1048576
   max_events_per_message: 8189
   max_json_depth: 32
-# Ledger name -> TigerBeetle ledger id/scale mapping
+# Ledger names. TigerBeetle stores a ledger as a uint32 and an amount as an
+# integer number of minor units; this table is what lets a producer write "USD"
+# and "12.34" instead of 1 and 1234.
+#
+# scale is how many decimal places the ledger has, and therefore how a decimal
+# string becomes minor units: at scale 2, "12.34" is 1234; at scale 8 the same
+# string is 1234000000; at scale 0 it is rejected outright, because that ledger
+# has no fractional part.
+#
+# An amount carrying more decimals than the ledger's scale is a poison message,
+# not a rounding opportunity — silently rounding somebody else's money is worse
+# than dead-lettering the record that asked for it.
+#
+# These names are the vocabulary in both directions: what the sink accepts is
+# what the CDC job emits. An unknown name is poison on the way in, because
+# guessing would write wrong data into the ledger; on the way out the event is
+# published with the raw numeric value instead, because the money has already
+# moved and dropping the event would lose the record of it.
 ledgers:
   USD: {id: 1, scale: 2}
-# Transfer code name -> TigerBeetle code mapping
+  # EUR: {id: 2, scale: 2}
+  # JPY: {id: 3, scale: 0}   # no minor unit at all
+  # BTC: {id: 4, scale: 8}   # satoshi
+
+# Transfer and account code names, mapped to TigerBeetle's uint16 code. Same
+# rules as ledgers: unknown name in, poison; unknown code out, raw number.
 codes:
   payment: 1
+  # refund: 2
+  # fee: 3
 # Retry policy for TigerBeetle operations
 retry: {initial: 100ms, max: 30s, jitter: true}
 # Graceful shutdown timeout
