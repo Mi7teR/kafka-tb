@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -121,7 +120,7 @@ func runSubcommandAndSIGTERM(t *testing.T, subcommand string, hooks subcommandHo
 	if hooks.before != nil {
 		args = append(args, hooks.before(cfg)...)
 	}
-	cmd := exec.Command(sharedBinary, args...)
+	cmd := kafkatbCommand(args...)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	require.NoError(t, cmd.Start())
@@ -210,7 +209,7 @@ func TestSubcommandCDCRefusesWithoutATopic(t *testing.T) {
 	body := strings.Replace(subcommandConfigYAML(name, metricsAddr), name+".cdc", "", 1)
 	require.NoError(t, os.WriteFile(cfgPath, []byte(body), 0o600))
 
-	cmd := exec.Command(sharedBinary, "cdc", "--config", cfgPath)
+	cmd := kafkatbCommand("cdc", "--config", cfgPath)
 	out, err := cmd.CombinedOutput()
 	require.Error(t, err)
 	require.Contains(t, string(out), "cdc.topic")

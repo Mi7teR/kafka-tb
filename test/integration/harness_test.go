@@ -107,6 +107,12 @@ func run(m *testing.M) int {
 // isn't 8-byte aligned, which the modern linker rejects; Makefile works
 // around that with the classic linker, and this does the same directly since
 // exec'ing make from here would just build the same thing a second time.
+//
+// When KAFKATB_COVERDIR is set the binary is built with coverage
+// instrumentation. cmd/kafkatb has no tests of its own and is only ever
+// exercised the way an operator exercises it -- as a subprocess, over a real
+// signal -- so this is the only way its coverage can be counted at all.
+// See kafkatbCommand for why the variable is ours rather than GOCOVERDIR.
 func buildKafkatbBinary(ctx context.Context) (string, func(), error) {
 	dir, err := os.MkdirTemp("", "kafkatb-bin-*")
 	cleanup := func() { _ = os.RemoveAll(dir) }
@@ -116,6 +122,10 @@ func buildKafkatbBinary(ctx context.Context) (string, func(), error) {
 
 	bin := filepath.Join(dir, "kafkatb")
 	args := []string{"build", "-o", bin}
+	if os.Getenv("KAFKATB_COVERDIR") != "" {
+		args = append(args, "-cover", "-covermode=atomic",
+			"-coverpkg=github.com/Mi7teR/kafka-tb/...")
+	}
 	if runtime.GOOS == "darwin" {
 		args = append(args, "-ldflags=-extldflags=-Wl,-ld_classic")
 	}
@@ -129,6 +139,23 @@ func buildKafkatbBinary(ctx context.Context) (string, func(), error) {
 		return "", func() {}, fmt.Errorf("go build: %w: %s", err, out)
 	}
 	return bin, cleanup, nil
+}
+
+// kafkatbCommand builds the command for one run of the kafkatb binary.
+//
+// When coverage is being collected it points the child's GOCOVERDIR at the
+// suite's own directory. That has to be done explicitly: "go test" sets
+// GOCOVERDIR itself, to a temporary directory it throws away once the run has
+// been given -test.gocoverdir, so a child that simply inherited the variable
+// would write its counters where nothing ever reads them -- and cmd/kafkatb
+// would keep reporting 0% while actually being exercised. The coverage
+// runtime flushes on exit, including the non-zero exits these tests assert on.
+func kafkatbCommand(args ...string) *exec.Cmd {
+	cmd := exec.Command(sharedBinary, args...)
+	if dir := os.Getenv("KAFKATB_COVERDIR"); dir != "" {
+		cmd.Env = append(os.Environ(), "GOCOVERDIR="+dir)
+	}
+	return cmd
 }
 
 // TigerBeetle needs its data file formatted before the replica can start, so

@@ -8,7 +8,7 @@ ifeq ($(shell uname -s),Darwin)
 GO_LDFLAGS := -ldflags=-extldflags=-Wl,-ld_classic
 endif
 
-.PHONY: build test lint bench integration generate
+.PHONY: build test lint bench integration generate coverage
 
 build:
 	go build $(GO_LDFLAGS) -o bin/kafkatb ./cmd/kafkatb
@@ -31,6 +31,12 @@ integration:
 
 bench:
 	go test ./... -run=^$$ -bench=. -benchmem $(GO_LDFLAGS)
+
+# Merged unit + integration coverage, with generated code filtered out.
+# Needs Docker, because it runs the integration suite. See scripts/coverage.sh
+# for what is excluded from the number and why.
+coverage:
+	./scripts/coverage.sh
 
 lint:
 	golangci-lint run
