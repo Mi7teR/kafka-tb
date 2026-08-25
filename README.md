@@ -132,20 +132,32 @@ An unknown key in the config file fails startup and names the key.
 
 ## Performance
 
-Measured on Docker Desktop on macOS with TigerBeetle inside a Linux VM, so treat the ratios as
-more portable than the absolutes. Full method and history in
+Measured on Docker for macOS (OrbStack for this table's numbers; some earlier rows in the linked
+history used Docker Desktop instead) with TigerBeetle inside a Linux VM either way, so treat the
+ratios as more portable than the absolutes. Full method and history in
 [docs/benchmarks/README.md](docs/benchmarks/README.md).
 
 | | throughput | mean TigerBeetle batch |
 |---|---|---|
-| sink, 1 partition | ~20,000 records/sec | 750 events |
-| sink, 12 partitions | ~23,000 records/sec | |
-| cdc | ~104,000 events/sec | |
+| sink, 1 partition | ~20,300 records/sec | 1,000 events |
+| sink, 12 partitions | ~25,300 records/sec | |
+| cdc | ~142,600 events/sec | |
 
-The sink is bounded by the TigerBeetle round trip at roughly 20 µs/event amortised, against a
+The sink is bounded by the TigerBeetle round trip at roughly 17 µs/event amortised, against a
 measured 6.13 µs/event floor on a full batch — so headroom remains. The cheapest untaken wins are
 raising `sink.max_in_flight_per_partition` (measured 1.23x) and having producers put several
 transfers in one message.
+
+Re-measured against `1530614` (the commit under test) after two allocation fixes:
+`model.ParseAmount` going allocation-free (sink decode path) and the CDC job's `FormatAmount` fast
+path plus a JSON-encoder allocation cut (8 allocations → 1). **Read the two directions separately: the sink
+barely moved (~1.7% at 1 partition, ~9% at 12 — inside or just outside run-to-run noise), because
+`ParseAmount` was already nanoseconds against a TigerBeetle round trip measured in milliseconds.
+CDC moved substantially, ~1.37x (105,364/102,157 → 144,226/141,045 events/sec at `batch_size:
+2730`), because encoding — not waiting — was the cost those two fixes actually cut, and CDC's
+encode stage was a much larger share of its window than the sink's decode ever was of its own.**
+Full method, both runs, and the per-stage breakdown are in
+[docs/benchmarks/README.md](docs/benchmarks/README.md).
 
 ### Hot-path microbenchmarks
 

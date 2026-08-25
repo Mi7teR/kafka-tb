@@ -37,53 +37,56 @@ see the four-way table below). Again within run-to-run noise of both prior
 files (e.g. `BenchmarkDecodeJSON/n=1` ~2.02µs here too): none of the
 microbenchmarked code path changed in the sharding commits either.
 
-## Sink throughput: baseline → pipelining → async publish → batcher sharding (reverted) → batcher fixes
+## Sink throughput: baseline → pipelining → async publish → batcher sharding (reverted) → batcher fixes → ParseAmount fast path
 
-Five point-in-time measurements of the same code path (Kafka record in,
+Six point-in-time measurements of the same code path (Kafka record in,
 TigerBeetle transfer applied, result published), each reproducing the prior
 run's method for comparability. Full detail and raw per-run numbers were
 kept in each run's own working notes; what they concluded is summarised here.
 **What's measured vs. estimated:** every number in this table comes from a
 real run against the same containerized Redpanda/TigerBeetle stack as the
 load scenarios below — none of it is extrapolated or scaled up from a
-smaller run. All five are single-machine, few-run measurements (1 run for
+smaller run. All six are single-machine, few-run measurements (1 run for
 the baseline, 2 for pipelining, 3-4 for async publish, 2 for the headline
-sharding rows, 2 for the batcher-fixes rows — the shards/max-in-flight/linger
-sweeps in the sharding run are single runs per value and flagged there as
-noisy) — order-of-magnitude, not an SLA; see each run's notes for the per-run
-spread.
+sharding rows, 2 for the batcher-fixes rows, 2 for the ParseAmount rows —
+the shards/max-in-flight/linger sweeps in the sharding run are single runs
+per value and flagged there as noisy) — order-of-magnitude, not an SLA; see
+each run's notes for the per-run spread.
 
 **Hardware:** Apple M4 Pro, macOS, Docker via OrbStack, go1.26.3 darwin/arm64,
-for the first four columns. **The fifth column (batcher fixes) was measured
-on a different machine** — Docker Desktop on macOS, TigerBeetle running
-inside Docker Desktop's Linux VM rather than OrbStack's — see
+for every column except the fifth. **The fifth column (batcher fixes) was
+measured on a different machine** — Docker Desktop on macOS, TigerBeetle
+running inside Docker Desktop's Linux VM rather than OrbStack's — see
 the batcher-fixes run for why that is called out rather than silently
 mixed in: absolute numbers across the two Docker backends are not
-guaranteed comparable, only the ratios within each run are.
-**Config held constant across all five runs:** `batcher.linger=5ms`,
+guaranteed comparable, only the ratios within each run are. **The sixth
+column (ParseAmount fast path) returns to OrbStack** — the same backend as
+the first four columns and as the CDC table below — so it is directly
+comparable to those, and only loosely so to the fifth.
+**Config held constant across all six runs:** `batcher.linger=5ms`,
 `batcher.max_batch_size=8189`, `batcher.max_queue=1000`, 1 partition unless
-noted — the fifth column's scratch harness pins `linger=5ms` explicitly
-even though the shared test harness's own default moved to `1ms` after the
-the sharding run's linger sweep, precisely so this row stays comparable to
-the other four. `sink.max_in_flight_per_partition` did not exist before
-pipelining; it defaulted to 1000 from the "after pipelining" column onward.
-`batcher.shards` did not exist before sharding and does not exist after the
-revert — the sharding column uses the default (4) unless noted; see
-the sharding run for the `shards=1/4/8/16` sweep. **The batcher-fixes
-column is the current state of the code** (`b21f2d4`): batcher sharding was
-implemented, measured, and reverted (see below) before the batcher/decode
-changes in that column landed, so it is not a sixth step after sharding —
-it is what replaced the sharding column as "current" once sharding was
-backed out.
+noted — the fifth and sixth columns' scratch harnesses both pin
+`linger=5ms` explicitly even though the shared test harness's own default
+moved to `1ms` after the sharding run's linger sweep, precisely so these
+rows stay comparable to the other four. `sink.max_in_flight_per_partition`
+did not exist before pipelining; it defaulted to 1000 from the "after
+pipelining" column onward. `batcher.shards` did not exist before sharding
+and does not exist after the revert. **The sixth column is the current
+state of the code** (`1530614`): the only change on top of the fifth
+column's `b21f2d4` that touches the sink's hot path at all is
+`model.ParseAmount` going allocation-free (94.7 ns / 3 allocs → 11.3 ns / 0
+allocs) — `internal/codec/jsonc`'s decode path calls `ParseAmount`, not
+`FormatAmount`, so the CDC-side `FormatAmount` and encoder fixes landed in
+the same window are not exercised by the sink at all.
 
-| Metric | Baseline (serial sink, pre-`ab2b47a`; no commit sha recorded in the baseline run) | After pipelining (`ab2b47a`) | After async publish (`523ffd3`) | After batcher sharding (`173d712`, later reverted) | **After batcher fixes, sharding reverted (`b21f2d4`) — current** |
-|---|---|---|---|---|---|
-| Throughput, 1 partition (n=3,000) | 48.2 rec/sec | 4,494 rec/sec | 16,343 rec/sec (avg of 3 runs) | 16,459.5 rec/sec (avg of 2 runs) | **19,974.6 rec/sec** (avg of 2: 18,329.8 / 21,619.3) |
-| Per-record wall clock | 20.75 ms | 0.222 ms | 61.2 µs | 60.7 µs | **50.1 µs** |
-| Mean batch size TigerBeetle sees | 1.0000 | 750 | 428.7 | 514.5 (avg of 2: 600.2 / 428.7 — see the sharding run on why 428.7 recurs exactly) | **750.2** (both runs identical, n=4 TB calls each) |
-| p99 batch size | n/a (all batches = 1) | 1,000 (capped by `max_in_flight_per_partition`) | ~594 | ~663-1,000 (2 runs) | **1,000** (both runs) |
-| Throughput, 12 partitions (n=3,000 or 1,500) | ~1.06x vs 1p (no effect) | 2.20x vs 1p (12p faster) | ~1.03x vs 1p (parity) | 1.36x vs 1p (12p faster again — avg 22,341.0 rec/sec) | **1.16x vs 1p** (avg 23,258.7 rec/sec — partition lever partially back, no sharding involved) |
-| Dominant cost | TigerBeetle round trip (51%) + linger wait (30%) | `emit.Results` synchronous `ProduceSync` (92%) | TigerBeetle round trip (~55%), serialized one batch at a time | TigerBeetle round trip, split across up to `shards` (4) concurrent batches | **TigerBeetle round trip, one batch at a time (no sharding), now ~36-44% of wall clock — see below** |
+| Metric | Baseline (serial sink, pre-`ab2b47a`; no commit sha recorded in the baseline run) | After pipelining (`ab2b47a`) | After async publish (`523ffd3`) | After batcher sharding (`173d712`, later reverted) | After batcher fixes, sharding reverted (`b21f2d4`) | **After `ParseAmount` fast path (`1530614`) — current** |
+|---|---|---|---|---|---|---|
+| Throughput, 1 partition (n=3,000) | 48.2 rec/sec | 4,494 rec/sec | 16,343 rec/sec (avg of 3 runs) | 16,459.5 rec/sec (avg of 2 runs) | 19,974.6 rec/sec (avg of 2: 18,329.8 / 21,619.3) | **20,317.7 rec/sec** (avg of 2: 19,856.6 / 20,778.8) |
+| Per-record wall clock | 20.75 ms | 0.222 ms | 61.2 µs | 60.7 µs | 50.1 µs | **49.2 µs** |
+| Mean batch size TigerBeetle sees | 1.0000 | 750 | 428.7 | 514.5 (avg of 2: 600.2 / 428.7 — see the sharding run on why 428.7 recurs exactly) | 750.2 (both runs identical, n=4 TB calls each) | **1,000.0** (both runs, n=3 TB calls each — see below on why this recurs at exactly `max_in_flight_per_partition`) |
+| p99 batch size | n/a (all batches = 1) | 1,000 (capped by `max_in_flight_per_partition`) | ~594 | ~663-1,000 (2 runs) | 1,000 (both runs) | **1,000** (both runs) |
+| Throughput, 12 partitions (n=3,000 or 1,500) | ~1.06x vs 1p (no effect) | 2.20x vs 1p (12p faster) | ~1.03x vs 1p (parity) | 1.36x vs 1p (12p faster again — avg 22,341.0 rec/sec) | 1.16x vs 1p (avg 23,258.7 rec/sec) | **1.25x vs 1p** (avg 25,341.2 rec/sec: 25,633.2 / 25,049.2) |
+| Dominant cost | TigerBeetle round trip (51%) + linger wait (30%) | `emit.Results` synchronous `ProduceSync` (92%) | TigerBeetle round trip (~55%), serialized one batch at a time | TigerBeetle round trip, split across up to `shards` (4) concurrent batches | TigerBeetle round trip, one batch at a time (no sharding), ~36-44% of wall clock | **TigerBeetle round trip, unchanged in kind — still the dominant cost** |
 
 Three results worth calling out because they reverse or qualify the previous
 column's conclusion rather than just extending it:
@@ -158,7 +161,7 @@ mechanism (how full a batch gets while the previous one is in flight) that
 sharding was meant to exploit. Anyone revisiting this should run that first;
 the revert is a response to absent evidence, not to evidence of harm.
 
-### Batcher fixes, measured after the revert (current column)
+### Batcher fixes, measured after the revert
 
 After the sharding revert, two more changes landed in `internal/tbx/batcher.go`:
 `SubmitAsync` no longer parks a goroutine on the process-wide `finished`
@@ -197,12 +200,59 @@ report does not recommend a specific new default (see
 throughput against replay-tail cost on an ungraceful stop, a separate
 decision this task did not make).
 
-**Do not compare these numbers to the sink table.** They measure the other
-direction of the bridge: one *change event* read out of TigerBeetle, encoded and
-published to Kafka, versus one *Kafka record* decoded and applied to
-TigerBeetle. Different unit of work, different database operation, different
-message size (867 bytes on the wire against 257 — see below). They are kept in a
-separate table for that reason.
+### `ParseAmount` fast path, sink re-measured (`1530614`) — current
+
+The only change on top of the batcher-fixes column (`b21f2d4`) that touches
+anything the sink's hot path runs is `c2a0141`: `model.ParseAmount` gained a
+`uint64` fast path (94.7 ns / 3 allocs → 11.3 ns / 0 allocs, per the
+microbenchmark table above). The sink's decode path
+(`internal/codec/jsonc`) calls `ParseAmount` once per transfer amount, so
+this is on the hot path in a way `FormatAmount`'s CDC-side fix (below) is
+not.
+
+Measured with the same instrumented-decorator method and warm-up/no-settle-
+tail discipline as the batcher-fixes run (two runs each, this table's own
+Docker-via-OrbStack environment): **1 partition moved from 19,974.6 to
+20,317.7 rec/sec, a ~1.7% change** — inside the run-to-run spread both
+columns already show on their own (18,329.8-21,619.3 then, 19,856.6-20,778.8
+now). **12 partitions moved from 23,258.7 to 25,341.2 rec/sec, ~9%,
+partially outside that noise band but still a small effect next to
+pipelining's 2.20x or the batcher fixes' own 1.22x.** This is the expected
+result, not a surprising one: `perf-sink-after-batcher.md` had already found
+the sink bounded by the TigerBeetle round trip and ack wait (13-19 ms each),
+not CPU or allocation, and 11.3 ns saved once per transfer cannot move a
+millisecond-scale bottleneck. **The honest reading is that this fix does
+essentially nothing for sink throughput** — it was worth taking for the
+allocation profile (0 allocs on the parse side, see the microbenchmark
+table), not for records/sec.
+
+One number moved for a reason unrelated to the code change: mean TigerBeetle
+batch size in this run's own two 1-partition runs landed on **1,000.0**
+(both runs, `n=3` `CreateTransfers` calls each — the batcher-fixes run
+landed on 750.2, `n=4` calls each). This is the same phenomenon the
+batcher-fixes run's own note and the sharding run's before it both flagged:
+at this burst-produced, 1-partition, 5ms-linger shape, mean batch size is a
+deterministic function of exactly how the test producer's single
+`ProduceSync` call interleaves with the sink's pipelined passes, and it can
+differ between two runs of a scratch harness that are otherwise identical in
+every configured knob. It is not evidence of a behavioral change, and the
+amortized-cost calculation below accounts for it directly rather than
+assuming it away.
+
+Amortized cost against the 6.13 µs/event floor (mean TB RTT / mean batch
+size): 1 partition, 17.32 µs/event (run 1) and 16.49 µs/event (run 2), avg
+**16.9 µs/event (2.76x the floor)** — down from the batcher-fixes run's 3.2x,
+almost entirely because this run's larger mean batch (1,000 vs 750.2)
+amortizes the same TigerBeetle round trip over more events, not because the
+round trip itself changed. 12 partitions: 13.76 / 15.36 µs/event, avg
+**14.6 µs/event (2.37x the floor)**, same mechanism.
+
+**Do not compare the CDC numbers below to the sink table above.** They
+measure the other direction of the bridge: one *change event* read out of
+TigerBeetle, encoded and published to Kafka, versus one *Kafka record*
+decoded and applied to TigerBeetle. Different unit of work, different
+database operation, different message size (867 bytes on the wire against
+257 — see below). They are kept in a separate table for that reason.
 
 Full method and every scenario are in the CDC run's notes; the profiling
 that explains these numbers is in the profiling run's.
@@ -266,6 +316,77 @@ run 2, mean per window):
   a 100-event window, 3.3% at 1,000, **1.7% at 2,730**. It is not worth
   attacking at any sensible window size. On a *trickling* stream it is a
   different story — see below.
+
+### Re-measured at `2730` after the `FormatAmount`/encoder fixes (`1530614`) — current
+
+`2730` is no longer a swept alternative: `config.DefaultCDCBatchSize` now
+*is* `config.MaxCDCBatchSize` (2730), so this is the shipped default, and
+two code changes landed on top of the sweep above that are squarely on the
+CDC job's hot path: `7a6eaed` gave `model.FormatAmount` a fast path (12.3x
+per the microbenchmark table, and per the profiling run it had been **69.5%
+of every allocation the CDC job made** — nine formatted amounts per event,
+the transfer plus four balance fields on each side), and `9355f53` cut the
+encoder's JSON serialisation from 8 allocations to 1. Both are inside the
+"encode" stage this report's own method isolates by subtraction, not inside
+`GetChangeEvents` — so the prediction going in was that the wait-dominated
+61% `GetChangeEvents` share would be untouched and the ~20% encode share
+would shrink.
+
+Measured with the same instrumented-decorator method, same warm-up
+(discard the first three windows), same no-settle-tail discipline, same
+200,000-event seed, two independent container lifetimes:
+
+| | Run 1 | Run 2 |
+|---|---|---|
+| **Throughput** | **144,226.2 events/sec** | **141,044.5 events/sec** |
+| Per-event wall clock | 6.93 µs | 7.09 µs |
+| Windows (measured) | 71 | 71 |
+| Mean / p99 / max window size | 2,701.5 / 2,730 / 2,730 | 2,701.5 / 2,730 / 2,730 |
+
+**vs the original `2730` baseline (105,364 / 102,157 events/sec): ~1.37x
+(avg 142,635 vs avg 103,761).** This is a real, repeatable move, not noise —
+both new runs land 34-37% above both old runs, no overlap. Per-stage split
+confirms the predicted mechanism exactly:
+
+| Stage | mean, old baseline (r1 only) | mean, this run (r1 / r2) | change |
+|---|---|---|---|
+| `GetChangeEvents` | 12.08 ms | 11.65 / 12.37 ms | flat, as predicted — this stage does no encoding |
+| encode (window minus closing) | 8.92 ms | 3.70 / 3.42 ms | **~2.5x cheaper** |
+| `ProduceSync #1` | 4.16 ms | 3.07 / 3.05 ms | smaller, consistent with less to serialize per call |
+| encode (closing record) | not published | 7.3 / 6.5 µs | no old figure to compare against |
+| `ProduceSync #2` | 0.43 ms | 306 / 312 µs | smaller |
+
+(`perf-cdc.md` §2b's mean-per-window table only reports Run 1's per-stage
+breakdown at `batch_size: 2730`, and it does not include the closing-record
+encode row at all — only the headline `batch_size: 1000` table does. Run
+2's per-stage numbers, and the closing-record encode figure at 2730, were
+never published for the old baseline; only its throughput and µs/event
+figures exist for both runs.)
+
+**Reading it: the fix landed exactly where the profiling said it would.**
+Encoding — working, not waiting — shrank by roughly the ratio
+`FormatAmount`'s own microbenchmark predicted, and `GetChangeEvents` — the
+TigerBeetle round trip, unrelated to either fix — did not move outside its
+own run-to-run noise (12.08 ms old vs 11.65/12.37 ms new). Because encode
+shrank sharply and the wait stage did not move at all, `GetChangeEvents`'s
+*share* of the window rose substantially: summing the old baseline's own
+published stages (12.08 + 8.92 + 4.16 + 0.43 = 25.59 ms) puts it at **~47%**
+of the old `batch_size: 2730` window, against **~62-65%** of this run's
+smaller window (11.65-12.37 ms of an 18.7-19.2 ms total) — the arithmetic of
+a fixed-in-kind cost becoming relatively more dominant once the cost next to
+it shrinks, not a regression in either stage. **This is the larger of the
+two optimisations measured in this round**, unlike the sink-side
+`ParseAmount` fix above, because it landed on a cost this job's own
+profiling had already identified as its single
+biggest *working* expense — where the sink's bottleneck was never CPU or
+allocation to begin with.
+
+Not re-run here: the `batch_size: 100`/`1000`/`8189` sweep points, the
+partition-count sweep, the trickle scenarios, and cursor recovery. Nothing
+in this round's data suggests any of those would behave differently — the
+fixes measured here are on the encode stage only, which those scenarios did
+not identify as their bottleneck either — but that is an inference, not a
+re-measurement, and is stated as such.
 
 ### Other CDC scenarios
 
