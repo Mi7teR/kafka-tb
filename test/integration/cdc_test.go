@@ -723,3 +723,42 @@ func eventTypes(events []cdcEvent) []string {
 	}
 	return out
 }
+
+// Cursor recovery against a topic that has no progress in it. The unit tests
+// cover this against an in-process fake broker, which is exactly where the
+// fidelity is questionable: what "this topic does not exist" and "this
+// partition is empty" look like on the wire is the broker's choice, and
+// Resume distinguishes them by matching an error code and by comparing start
+// against end offsets. A fake that answers differently from Redpanda would
+// let a real regression through, so the two shapes are pinned here as well,
+// against the broker the connector actually meets.
+//
+// Both must recover zero rather than fail: a job pointed at a topic it has
+// never written to has to start, and start from the beginning.
+func TestResumeAgainstARealBrokerWithoutProgress(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	t.Run("topic that does not exist", func(t *testing.T) {
+		cfg := testConfig(t, sharedBrokers, sharedTBAddr)
+		// Deliberately not created: the CDC topic is the one topic the job
+		// creates for itself on first publish.
+		cfg.CDC.Topic = kafkaName(t.Name()) + "-never-created-" + uuid.NewString()
+
+		ts, err := cdc.Resume(ctx, cfg.Kafka.Brokers, cfg.CDC.Topic, cdcLogger())
+		require.NoError(t, err, "a topic that was never written to must not fail the start")
+		require.Zero(t, ts, "nothing has been published, so nothing may be skipped")
+	})
+
+	t.Run("topic that exists but is empty", func(t *testing.T) {
+		cfg := testConfig(t, sharedBrokers, sharedTBAddr)
+		createTopicsWithCDCPartitions(t, cfg, 3)
+
+		ts, err := cdc.Resume(ctx, cfg.Kafka.Brokers, cfg.CDC.Topic, cdcLogger())
+		require.NoError(t, err)
+		require.Zero(t, ts,
+			"every partition is empty, so the scan must finish rather than "+
+				"block waiting for a tail record that does not exist")
+	})
+}
