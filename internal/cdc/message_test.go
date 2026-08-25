@@ -8,8 +8,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mailru/easyjson"
 	"github.com/stretchr/testify/require"
 	types "github.com/tigerbeetle/tigerbeetle-go"
+	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/Mi7teR/kafka-tb/internal/config"
 	"github.com/Mi7teR/kafka-tb/internal/model"
@@ -299,4 +301,95 @@ func TestZeroOptionalFieldsAreOmitted(t *testing.T) {
 	require.NotContains(t, transfer, "user_data_128")
 	require.NotContains(t, transfer, "timeout")
 	require.NotContains(t, body["debit_account"].(map[string]any), "user_data_128")
+}
+
+// The reused writer must be invisible in the output: the same bytes
+// easyjson.Marshal produced before it existed, for every event type and
+// whichever chunk path the message takes.
+func TestRecordBodyMatchesEasyjsonMarshal(t *testing.T) {
+	enc, _ := testEncoder(t, "")
+	for _, typ := range []types.ChangeEventType{
+		types.ChangeEventSinglePhase,
+		types.ChangeEventTwoPhasePending,
+		types.ChangeEventTwoPhasePosted,
+		types.ChangeEventTwoPhaseVoided,
+		types.ChangeEventTwoPhaseExpired,
+	} {
+		ev := sampleEvent(typ)
+		rec, err := enc.Record(ev, ev.Timestamp)
+		require.NoError(t, err)
+
+		var msg Message
+		require.NoError(t, easyjson.Unmarshal(rec.Value, &msg))
+		want, err := easyjson.Marshal(msg)
+		require.NoError(t, err)
+		require.Equal(t, string(want), string(rec.Value))
+	}
+}
+
+// The hazard the scratch buffer exists to avoid. franz-go retains
+// kgo.Record.Value until the broker acknowledges the record, so a body handed
+// to one record must not be touched by the next event. This encodes a batch
+// the way the job does — holding every record — and then checks that nothing
+// was rewritten under it.
+func TestRecordBodiesDoNotAliasAcrossEvents(t *testing.T) {
+	enc, _ := testEncoder(t, "")
+	const n = 64
+	recs := make([]*kgo.Record, 0, n)
+	want := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		ev := sampleEvent(types.ChangeEventSinglePhase)
+		// Vary the length so a later, longer message would overwrite an
+		// earlier, shorter one if they shared a buffer.
+		ev.Timestamp = uint64(1745328372192037030 + i)
+		ev.TransferAmount = u128(int64(1 + i*7919))
+		ev.TransferID = idOf(int64(1000 + i))
+		rec, err := enc.Record(ev, ev.Timestamp)
+		require.NoError(t, err)
+		recs = append(recs, rec)
+		want = append(want, string(append([]byte(nil), rec.Value...)))
+	}
+	for i, rec := range recs {
+		require.Equal(t, want[i], string(rec.Value), "record %d was rewritten by a later event", i)
+	}
+	// Distinct backing arrays, not merely equal contents at the end.
+	seen := map[*byte]int{}
+	for i, rec := range recs {
+		p := &rec.Value[0]
+		if prev, ok := seen[p]; ok {
+			t.Fatalf("records %d and %d share a backing array", prev, i)
+		}
+		seen[p] = i
+	}
+}
+
+// A message larger than the scratch chunk has to come out identical too:
+// that path leaves easyjson to chain and concatenate its own chunks, and it
+// must not keep the scratch, which easyjson returns to its pool.
+func TestRecordBodyLargerThanScratch(t *testing.T) {
+	long := strings.Repeat("l", scratchSize)
+	reg := model.NewRegistry(&config.Config{
+		Ledgers: map[string]config.Ledger{long: {ID: testLedgerID, Scale: testScale}},
+		Codes:   map[string]uint16{"payment": 7, "customer": 3, "merchant": 4},
+	})
+	log := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	enc := NewEncoder(config.CDC{Topic: "events"}, reg, log)
+
+	ev := sampleEvent(types.ChangeEventSinglePhase)
+	rec, err := enc.Record(ev, ev.Timestamp)
+	require.NoError(t, err)
+	require.Greater(t, len(rec.Value), scratchSize)
+
+	var msg Message
+	require.NoError(t, easyjson.Unmarshal(rec.Value, &msg))
+	want, err := easyjson.Marshal(msg)
+	require.NoError(t, err)
+	require.Equal(t, string(want), string(rec.Value))
+	require.Equal(t, long, decode(t, rec.Value)["ledger"])
+
+	// The encoder must still be usable, and still not alias, afterwards.
+	next, err := enc.Record(ev, ev.Timestamp)
+	require.NoError(t, err)
+	require.Equal(t, string(rec.Value), string(next.Value))
+	require.NotSame(t, &rec.Value[0], &next.Value[0])
 }

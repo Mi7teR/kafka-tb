@@ -16,7 +16,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/mailru/easyjson"
+	"github.com/mailru/easyjson/jwriter"
 	types "github.com/tigerbeetle/tigerbeetle-go"
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -123,14 +123,35 @@ type Encoder struct {
 	// occurrence floods the log at the full event rate and tells the operator
 	// nothing the first line did not.
 	warned map[gap]bool
+	// w and scratch are the JSON serialization buffer, kept across events
+	// rather than rebuilt per event. Same single-goroutine argument as
+	// warned: nothing locks them because nothing shares them. See marshal
+	// for why the record body is still allocated fresh every time.
+	w       jwriter.Writer
+	scratch []byte
 }
+
+// scratchSize is the reused serialization buffer's capacity. A fully
+// populated message — every optional id present, flags on both accounts — is
+// 1,062 bytes, so this holds one whole message with room for long ledger,
+// code and flag names and never chains a second chunk. A message that does
+// outgrow it still encodes correctly, just through easyjson's chunk chain;
+// see marshal.
+const scratchSize = 2048
 
 func NewEncoder(cfg config.CDC, reg *model.Registry, log *slog.Logger) *Encoder {
 	key := cfg.PartitionKey
 	if key == "" {
 		key = config.PartitionKeyDebitAccountID
 	}
-	return &Encoder{topic: cfg.Topic, partitionKey: key, reg: reg, log: log, warned: map[gap]bool{}}
+	return &Encoder{
+		topic:        cfg.Topic,
+		partitionKey: key,
+		reg:          reg,
+		log:          log,
+		warned:       map[gap]bool{},
+		scratch:      make([]byte, 0, scratchSize),
+	}
 }
 
 // first reports whether this kind/value pair is being seen for the first
@@ -192,7 +213,7 @@ func (e *Encoder) Record(ev types.ChangeEvent, checkpoint uint64) (*kgo.Record, 
 			Timestamp:      strconv.FormatUint(ev.CreditAccountTimestamp, 10),
 		},
 	}
-	body, err := easyjson.Marshal(msg)
+	body, err := e.marshal(&msg)
 	if err != nil {
 		return nil, fmt.Errorf("marshal change event %d: %w", ev.Timestamp, err)
 	}
@@ -209,6 +230,56 @@ func (e *Encoder) Record(ev types.ChangeEvent, checkpoint uint64) (*kgo.Record, 
 			{Key: HeaderTimestamp, Value: []byte(msg.Timestamp)},
 		},
 	}, nil
+}
+
+// marshal renders msg as JSON, byte for byte what easyjson.Marshal produces,
+// reusing the encoder's writer and scratch chunk instead of building a fresh
+// pair per event.
+//
+// The copy at the end is the point of the whole function and must not be
+// optimised away. The slice returned here becomes kgo.Record.Value, and
+// franz-go retains that memory until the broker acknowledges the record — so
+// it cannot be a buffer the next event overwrites. Handing out the scratch
+// would corrupt records still in flight silently: no crash, no error, just
+// garbage arriving at a consumer. What is reused is everything up to the
+// body; what is fresh, every time, is the body.
+func (e *Encoder) marshal(msg *Message) ([]byte, error) {
+	e.w.Buffer.Buf = e.scratch[:0]
+	msg.MarshalEasyJSON(&e.w)
+	if e.w.Error != nil {
+		// The writer may be holding chained chunks that only BuildBytes or
+		// DumpTo would release, and neither runs on this path. Drop the
+		// whole thing rather than carry half a message into the next event.
+		err := e.w.Error
+		e.w = jwriter.Writer{}
+		e.scratch = make([]byte, 0, scratchSize)
+		return nil, err
+	}
+	n := e.w.Size()
+	if n == len(e.w.Buffer.Buf) {
+		// The message fit in the scratch chunk, which is the common case and
+		// the reason the scratch exists: one allocation for the body, none
+		// for the serialization.
+		body := make([]byte, n)
+		copy(body, e.w.Buffer.Buf)
+		e.scratch = e.w.Buffer.Buf[:0]
+		e.w.Buffer.Buf = nil
+		return body, nil
+	}
+	// The message outgrew the scratch, so easyjson chained its own pooled
+	// chunks behind it. BuildBytes concatenates them into a fresh slice and
+	// hands every chunk it walked back to easyjson's pool — the scratch
+	// included, which is why the scratch cannot be kept here. Replace it with
+	// one that fits, so this happens once per size increase and not per
+	// event.
+	body, err := e.w.BuildBytes()
+	if err != nil {
+		e.w = jwriter.Writer{}
+		e.scratch = make([]byte, 0, scratchSize)
+		return nil, err
+	}
+	e.scratch = make([]byte, 0, 2*n)
+	return body, nil
 }
 
 // key picks the record key per cdc.partition_key. The key decides which
