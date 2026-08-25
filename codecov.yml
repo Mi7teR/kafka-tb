@@ -1,0 +1,26 @@
+# The uploaded profile is already merged (unit + integration) and filtered by
+# scripts/coverage.sh. These ignores repeat that filtering so the badge stays
+# honest even if a profile ever reaches Codecov by another route.
+ignore:
+  # Generated easyjson marshalers. Exercised through the real API by the
+  # hand-written codec, cdc and emit tests; testing them directly would
+  # measure easyjson rather than this project.
+  - "**/*_easyjson.go"
+  # A synthetic load generator for benchmarking, not part of the connector.
+  - "cmd/loadgen/**"
+
+coverage:
+  status:
+    project:
+      default:
+        # Report the change, do not block on it. The number is a signal about
+        # where tests are thin, and a hard gate on it rewards tests written to
+        # move the number rather than to catch anything.
+        informational: true
+    patch:
+      default:
+        informational: true
+
+comment:
+  layout: "condensed_header, diff, files"
+  require_changes: true

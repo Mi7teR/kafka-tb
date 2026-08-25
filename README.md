@@ -1,5 +1,8 @@
 # kafka-tb
 
+[![CI](https://github.com/Mi7teR/kafka-tb/actions/workflows/ci.yml/badge.svg)](https://github.com/Mi7teR/kafka-tb/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Mi7teR/kafka-tb/branch/main/graph/badge.svg)](https://codecov.io/gh/Mi7teR/kafka-tb)
+
 A two-way bridge between Kafka and [TigerBeetle](https://tigerbeetle.com).
 
 TigerBeetle is a fast double-entry accounting database, and that is all it does. It speaks a
@@ -310,6 +313,7 @@ values that were chosen from measurement rather than taste.
 ```bash
 make test          # unit tests, -race
 make integration   # end-to-end against real Redpanda and TigerBeetle containers (needs Docker)
+make coverage      # merged unit + integration coverage, prints the total (needs Docker)
 make bench         # benchmarks
 make lint
 make generate      # regenerate easyjson marshalers
@@ -318,6 +322,22 @@ make generate      # regenerate easyjson marshalers
 The integration suite boots both containers itself. It covers idempotent replay, garbage
 interleaved with valid records, crash-and-restart, linked-chain atomicity, and — for CDC — a
 mid-window crash driven through the production publication seam.
+
+### What the coverage number means
+
+The badge is the unit and integration suites merged into one profile, which is the only way it
+says anything true: `cmd/kafkatb` is exercised solely by the integration suite, which runs the
+real binary as a subprocess and stops it with a real `SIGTERM`, while most of `internal/` is
+exercised solely by the unit suite. Measuring either alone reports large parts of the project as
+untested when they are not. `scripts/coverage.sh` produces the profile and names its two
+exclusions — the generated `*_easyjson.go` marshalers, which the hand-written codec, CDC and emit
+tests drive through the real API, and `cmd/loadgen`, a benchmarking tool rather than part of the
+connector.
+
+The number is reported, not enforced. A threshold that gates merges rewards tests written to move
+the number, and a test that raises coverage without being able to fail is worse than no test: it
+manufactures confidence and hides the gap it appears to close. New tests here are checked by
+mutation instead — break the behaviour, watch the test fail, put it back.
 
 ## Not in scope
 

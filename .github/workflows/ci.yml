@@ -68,7 +68,7 @@ jobs:
           make lint
 
   integration:
-    name: integration (Redpanda + TigerBeetle)
+    name: integration (Redpanda + TigerBeetle) and coverage
     runs-on: ubuntu-latest
     # Containers are pulled and booted per test; locally the suite is ~3.5
     # minutes, and a cold runner is slower.
@@ -81,10 +81,26 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # testcontainers starts TigerBeetle privileged because it needs io_uring.
-      # GitHub's Linux runners allow that; a hardened self-hosted runner may not.
-      - name: integration suite
-        run: make integration
+      # "make coverage" runs the integration suite -- testcontainers starts
+      # TigerBeetle privileged because it needs io_uring, which GitHub's Linux
+      # runners allow and a hardened self-hosted runner may not -- and the unit
+      # suite alongside it, merging both into one profile. The two have to be
+      # measured together: cmd/kafkatb is only ever exercised by the
+      # integration suite, and most of internal/ only by the unit suite.
+      - name: integration suite and merged coverage
+        run: make coverage
+
+      # Tokenless upload: this repository is public, so no secret is required.
+      # CODECOV_TOKEN is passed through anyway so that adding it later raises
+      # the rate limit without another change here.
+      - name: upload coverage
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.out
+          token: ${{ secrets.CODECOV_TOKEN }}
+          # Coverage is a report, not a gate. A Codecov outage must not fail a
+          # build whose tests all passed.
+          fail_ci_if_error: false
 
   build-darwin:
     name: build (macOS)
