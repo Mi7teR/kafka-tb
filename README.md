@@ -132,9 +132,12 @@ An unknown key in the config file fails startup and names the key.
 
 ## Performance
 
-Measured on Docker for macOS (OrbStack for this table's numbers; some earlier rows in the linked
-history used Docker Desktop instead) with TigerBeetle inside a Linux VM either way, so treat the
-ratios as more portable than the absolutes. Full method and history in
+All figures below were measured on a **MacBook Pro with an Apple M4 Pro (12 cores) and 24 GB of
+RAM**, on Docker for macOS (OrbStack for this table's numbers; some earlier rows in the linked
+history used Docker Desktop instead), with TigerBeetle running inside a Linux VM either way —
+macOS has no io_uring, which TigerBeetle needs. That VM boundary is inside every absolute number
+here, so **treat the ratios as portable and the absolutes as indicative**; a Linux host would very
+likely produce different figures, and possibly a different bottleneck. Full method and history in
 [docs/benchmarks/README.md](docs/benchmarks/README.md).
 
 | | throughput | mean TigerBeetle batch |
@@ -161,7 +164,8 @@ Full method, both runs, and the per-stage breakdown are in
 
 ### Hot-path microbenchmarks
 
-Apple M4 Pro, Go 1.26.3, median of 6 runs. Raw output in
+MacBook Pro, Apple M4 Pro (12 cores), 24 GB RAM, macOS 26.5.2, Go 1.26.3; median of 6 runs.
+These run in-process and do not touch the VM. Raw output in
 [docs/benchmarks/6c461be.txt](docs/benchmarks/6c461be.txt).
 
 | | ns/op | B/op | allocs/op |

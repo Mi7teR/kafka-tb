@@ -5,7 +5,7 @@
 Raw output: [`99ebf66.txt`](./99ebf66.txt), produced by `./scripts/bench.sh`
 (`go test ./... -bench=. -benchmem -count=6`) at commit `99ebf66`, on:
 
-- Apple M4 Pro, macOS 26.5.2, go1.26.3 darwin/arm64
+- MacBook Pro, Apple M4 Pro (12 cores), 24 GB RAM, macOS 26.5.2, go1.26.3 darwin/arm64
 
 Headline numbers (median of 6 runs):
 
@@ -53,7 +53,7 @@ the shards/max-in-flight/linger sweeps in the sharding run are single runs
 per value and flagged there as noisy) — order-of-magnitude, not an SLA; see
 each run's notes for the per-run spread.
 
-**Hardware:** Apple M4 Pro, macOS, Docker via OrbStack, go1.26.3 darwin/arm64,
+**Hardware:** MacBook Pro, Apple M4 Pro (12 cores), 24 GB RAM, macOS, Docker via OrbStack, go1.26.3 darwin/arm64,
 for every column except the fifth. **The fifth column (batcher fixes) was
 measured on a different machine** — Docker Desktop on macOS, TigerBeetle
 running inside Docker Desktop's Linux VM rather than OrbStack's — see
@@ -257,7 +257,7 @@ database operation, different message size (867 bytes on the wire against
 Full method and every scenario are in the CDC run's notes; the profiling
 that explains these numbers is in the profiling run's.
 
-**Hardware and stack:** Apple M4 Pro, 12 cores, macOS 26.5.2, go1.26.3
+**Hardware and stack:** MacBook Pro, Apple M4 Pro, 12 cores, 24 GB RAM, macOS 26.5.2, go1.26.3
 darwin/arm64, Docker via OrbStack — the same machine as everything above. Same
 `redpanda:v25.2.4` and `tigerbeetle:0.17.9` containers as the integration
 suite. **TigerBeetle needs io_uring, which macOS does not have, so it runs
