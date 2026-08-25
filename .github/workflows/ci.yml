@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The TigerBeetle client is cgo. Nothing here builds without it, and no
+  # cross-compilation is available.
+  CGO_ENABLED: "1"
+
+jobs:
+  test:
+    name: build and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: make build
+
+      - name: unit tests
+        run: make test
+
+      - name: go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      # The easyjson marshalers are committed, so a struct edited without
+      # regenerating them would compile and silently keep the old wire shape.
+      - name: generated marshalers are current
+        run: |
+          go install "github.com/mailru/easyjson/...@$(go list -m -f '{{.Version}}' github.com/mailru/easyjson)"
+          go install golang.org/x/tools/cmd/goimports@latest
+          make generate
+          git diff --exit-code
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Installed directly rather than through the action: this pins the exact
+      # binary the project is verified against, and the config uses the v2
+      # schema, which not every action major understands.
+      - name: lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+          make lint
+
+  integration:
+    name: integration (Redpanda + TigerBeetle)
+    runs-on: ubuntu-latest
+    # Containers are pulled and booted per test; locally the suite is ~3.5
+    # minutes, and a cold runner is slower.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # testcontainers starts TigerBeetle privileged because it needs io_uring.
+      # GitHub's Linux runners allow that; a hardened self-hosted runner may not.
+      - name: integration suite
+        run: make integration
+
+  build-darwin:
+    name: build (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # macOS only, and only a build. TigerBeetle ships a prebuilt static
+      # library whose members are not 8-byte aligned, which Apple's current
+      # linker refuses; the Makefile passes -ld_classic on Darwin to work around
+      # it. That workaround is invisible on Linux, so without this job it would
+      # rot unnoticed until the next person on a Mac hit the link error.
+      - name: build
+        run: make build
+
+      - name: unit tests
+        run: make test
